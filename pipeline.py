@@ -143,18 +143,51 @@ def build_features(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray
 # =============================================================================
 
 def add_naive_forecast(feature_array: np.ndarray, prices: np.ndarray) -> np.ndarray:
-    """Add naive forecast to feature array."""
+    """Add naive forecast to feature array using past-only windows."""
     forecaster = NaiveForecaster()
     forecast_col_start = 60 * 5 + 5 + 15 + 5  # ohlcv + returns + ta + micro
+    enriched = feature_array.copy()
 
     for i in range(60, len(prices)):
         price_window = prices[max(0, i - 60):i]
         if len(price_window) > 1:
             forecast, uncertainty = forecaster.predict(price_window)
-            feature_array[i, forecast_col_start:forecast_col_start + 12] = forecast
-            feature_array[i, forecast_col_start + 12] = uncertainty
+            enriched[i, forecast_col_start:forecast_col_start + 12] = forecast
+            enriched[i, forecast_col_start + 12] = uncertainty
 
-    return feature_array
+    return enriched
+
+
+def _compute_data_ranges(
+    total_len: int,
+    test_ratio: float = 0.20,
+    validation_ratio_within_train: float = 0.10,
+) -> dict[str, tuple[int, int]]:
+    """Return exclusive [start, end) ranges for train/validation/test."""
+    total_len = max(int(total_len), 0)
+    if total_len <= 2:
+        return {
+            "train": (0, total_len),
+            "validation": (0, total_len),
+            "test": (0, total_len),
+        }
+
+    test_ratio = float(np.clip(test_ratio, 0.05, 0.45))
+    validation_ratio_within_train = float(np.clip(validation_ratio_within_train, 0.05, 0.40))
+
+    test_len = max(int(round(total_len * test_ratio)), 1)
+    test_len = min(test_len, total_len - 2)
+    train_val_end = total_len - test_len
+
+    validation_len = max(int(round(train_val_end * validation_ratio_within_train)), 1)
+    validation_len = min(validation_len, train_val_end - 1)
+
+    train_end = max(train_val_end - validation_len, 1)
+    return {
+        "train": (0, train_end),
+        "validation": (train_end, train_val_end),
+        "test": (train_val_end, total_len),
+    }
 
 
 # =============================================================================
@@ -218,6 +251,12 @@ def train_rl_agent(
 
     # Trading params — ใช้ค่าเดียวกันทั้ง Env และ BacktestRunner
     trading_config = config.get("trading", {})
+    validation_config = training_config.get("validation", {})
+    ranges = _compute_data_ranges(
+        len(prices),
+        test_ratio=validation_config.get("holdout_test_ratio", 0.20),
+        validation_ratio_within_train=validation_config.get("validation_ratio_within_train", 0.10),
+    )
 
     # OHLCV data สำหรับ realistic intra-candle simulation
     ohlcv_data = config.get("_ohlcv_data")  # passed from pipeline
@@ -234,10 +273,27 @@ def train_rl_agent(
         maintenance_margin=trading_config.get("maintenance_margin", 0.005),
         monthly_server_cost_usd=trading_config.get("monthly_server_cost_usd", 100.0),
         periods_per_day=trading_config.get("periods_per_day", 96),
+        opportunity_threshold=rl_config.get("opportunity_threshold", 0.0010),
+        missed_move_penalty_scale=rl_config.get("missed_move_penalty_scale", 160.0),
+        server_cost_reward_multiplier=rl_config.get("server_cost_reward_multiplier", 25.0),
+        flat_penalty_after_steps=rl_config.get("flat_penalty_after_steps", 8),
+        flat_penalty_scale=rl_config.get("flat_penalty_scale", 0.015),
+        train_range=ranges["train"],
+        eval_range=ranges["validation"],
+        test_range=ranges["test"],
     )
 
     logger.info(f"Training {algo}: {total_timesteps} steps, lr={learning_rate}, "
                 f"batch={batch_size}, n_steps={n_steps}")
+    logger.info(
+        "Data split: train=[%d:%d) validation=[%d:%d) test=[%d:%d)",
+        ranges["train"][0],
+        ranges["train"][1],
+        ranges["validation"][0],
+        ranges["validation"][1],
+        ranges["test"][0],
+        ranges["test"][1],
+    )
 
     _log_gpu_memory()
 
@@ -248,6 +304,8 @@ def train_rl_agent(
         batch_size=batch_size,
         n_epochs=n_epochs,
         ent_coef=rl_config.get("ent_coef", 0.02),
+        eval_every_steps=rl_config.get("eval_every_steps", 50000),
+        eval_episodes=rl_config.get("eval_episodes", 4),
     )
 
     _log_gpu_memory()
@@ -283,12 +341,16 @@ def backtest_with_model(
     *** ใช้ last 200K steps สำหรับ eval (ไม่ต้องรัน 3.2M ทั้งหมด) ***
     """
     trading_config = (config or {}).get("trading", {})
+    validation_config = (config or {}).get("training", {}).get("validation", {})
     min_trade = trading_config.get("min_trade_pct", 0.05)
-
-    # Subsample for eval speed
-    eval_len = min(200_000, len(prices))
-    fa_eval = feature_array[-eval_len:]
-    pr_eval = prices[-eval_len:]
+    ranges = _compute_data_ranges(
+        len(prices),
+        test_ratio=validation_config.get("holdout_test_ratio", 0.20),
+        validation_ratio_within_train=validation_config.get("validation_ratio_within_train", 0.10),
+    )
+    test_start, test_end = ranges["test"]
+    fa_eval = feature_array[test_start:test_end]
+    pr_eval = prices[test_start:test_end]
 
     n = len(pr_eval)
     signals = np.zeros(n)
@@ -346,11 +408,17 @@ def backtest_with_model(
     )
     runner = BacktestRunner(bt_config)
     result = runner.run(pr_eval, signals)
-    logger.info(f"Backtest on last {eval_len:,} candles ({eval_len/1440:.0f} days)")
+    logger.info(
+        "Backtest on held-out test range [%d:%d) -> %d candles",
+        test_start,
+        test_end,
+        n,
+    )
 
     return {
         "backtest_metrics": result.metrics,
         "n_trades": len(result.trades),
+        "test_range": [test_start, test_end],
     }
 
 
@@ -1063,23 +1131,25 @@ def _aggregate_ohlcv_15m(df: pd.DataFrame, period: int = 15) -> pd.DataFrame:
     """Aggregate 1m OHLCV → 15m OHLCV (proper aggregation, not just close)."""
     n = len(df)
     n_candles = n // period
+    if n_candles <= 0:
+        return pd.DataFrame(columns=["open_time", "open", "high", "low", "close", "volume"])
 
-    opens = df["open"].values
-    highs = df["high"].values
-    lows = df["low"].values
-    closes = df["close"].values
-    volumes = df["volume"].values
+    trim_n = n_candles * period
+    opens = df["open"].to_numpy(dtype=np.float64, copy=False)[:trim_n].reshape(n_candles, period)
+    highs = df["high"].to_numpy(dtype=np.float64, copy=False)[:trim_n].reshape(n_candles, period)
+    lows = df["low"].to_numpy(dtype=np.float64, copy=False)[:trim_n].reshape(n_candles, period)
+    closes = df["close"].to_numpy(dtype=np.float64, copy=False)[:trim_n].reshape(n_candles, period)
+    volumes = df["volume"].to_numpy(dtype=np.float64, copy=False)[:trim_n].reshape(n_candles, period)
 
-    agg_open = np.array([opens[i * period] for i in range(n_candles)])
-    agg_high = np.array([highs[i * period:(i + 1) * period].max() for i in range(n_candles)])
-    agg_low = np.array([lows[i * period:(i + 1) * period].min() for i in range(n_candles)])
-    agg_close = np.array([closes[(i + 1) * period - 1] for i in range(n_candles)])
-    agg_volume = np.array([volumes[i * period:(i + 1) * period].sum() for i in range(n_candles)])
+    agg_open = opens[:, 0]
+    agg_high = highs.max(axis=1)
+    agg_low = lows.min(axis=1)
+    agg_close = closes[:, -1]
+    agg_volume = volumes.sum(axis=1)
 
-    # Timestamps
     if "open_time" in df.columns:
-        ts = pd.to_datetime(df["open_time"].values)
-        agg_ts = [ts[i * period] for i in range(n_candles)]
+        ts = pd.to_datetime(df["open_time"].values[:trim_n])
+        agg_ts = ts[::period]
     else:
         agg_ts = range(n_candles)
 
@@ -1105,6 +1175,7 @@ def run_training_pipeline(config_path: str | None = None, no_cache: bool = False
     config = load_config(config_path)
     data_config = config["data"]
     trading_config = config.get("trading", {})
+    validation_config = config.get("training", {}).get("validation", {})
     pipeline_start = time.time()
 
     # GPU info
@@ -1256,6 +1327,21 @@ def run_training_pipeline(config_path: str | None = None, no_cache: bool = False
 
         # Step 4: Baseline
         bh_return = float(prices[-1] / prices[0] - 1)
+        ranges = _compute_data_ranges(
+            len(prices),
+            test_ratio=validation_config.get("holdout_test_ratio", 0.20),
+            validation_ratio_within_train=validation_config.get("validation_ratio_within_train", 0.10),
+        )
+        logger.info(
+            "Dataset split for %s: train=[%d:%d) validation=[%d:%d) test=[%d:%d)",
+            symbol,
+            ranges["train"][0],
+            ranges["train"][1],
+            ranges["validation"][0],
+            ranges["validation"][1],
+            ranges["test"][0],
+            ranges["test"][1],
+        )
         dash.update(bh_return=bh_return, bh_full_return=bh_return)
 
         # Step 5: RL Training
@@ -1284,6 +1370,9 @@ def run_training_pipeline(config_path: str | None = None, no_cache: bool = False
             server_cost_reward_multiplier=rl_config.get("server_cost_reward_multiplier", 25.0),
             flat_penalty_after_steps=rl_config.get("flat_penalty_after_steps", 8),
             flat_penalty_scale=rl_config.get("flat_penalty_scale", 0.015),
+            train_range=ranges["train"],
+            eval_range=ranges["validation"],
+            test_range=ranges["test"],
         )
         trainer._dashboard = dash  # pass dashboard to trainer callback
 

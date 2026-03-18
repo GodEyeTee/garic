@@ -119,5 +119,11 @@ class RiskManager:
     def update_pnl(self, pnl: float):
         self._daily_pnl += pnl
 
+    def set_position(self, symbol: str, notional: float):
+        if abs(notional) <= 1e-9:
+            self._open_positions.pop(symbol, None)
+        else:
+            self._open_positions[symbol] = float(notional)
+
     def reset_daily(self):
         self._daily_pnl = 0.0

@@ -53,6 +53,8 @@ class CryptoFuturesEnv(gym.Env):
         server_cost_reward_multiplier: float = 25.0,
         flat_penalty_after_steps: int = 8,
         flat_penalty_scale: float = 0.015,
+        segment_start: int = 0,
+        segment_end: int | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -74,6 +76,9 @@ class CryptoFuturesEnv(gym.Env):
         self.flat_penalty_after_steps = flat_penalty_after_steps
         self.flat_penalty_scale = flat_penalty_scale
         self.total_len = n
+        self.segment_start = max(0, int(segment_start))
+        resolved_segment_end = n if segment_end is None else int(segment_end)
+        self.segment_end = min(max(self.segment_start + 1, resolved_segment_end), n)
 
         if ohlcv_data is not None and ohlcv_data.shape[1] >= 4:
             self.highs = ohlcv_data[:, 1].astype(np.float64)
@@ -91,8 +96,11 @@ class CryptoFuturesEnv(gym.Env):
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        max_start = max(0, self.total_len - self.max_episode_steps - 1)
-        self._start = self.np_random.integers(0, max(max_start, 1))
+        latest_start = max(self.segment_start, self.segment_end - self.max_episode_steps - 1)
+        if latest_start <= self.segment_start:
+            self._start = self.segment_start
+        else:
+            self._start = int(self.np_random.integers(self.segment_start, latest_start + 1))
         self._step = 0
         self.position = 0.0  # start flat
         self.entry_price = 0.0
@@ -286,7 +294,7 @@ class CryptoFuturesEnv(gym.Env):
         self.equity_curve.append(self.balance)
 
         self._step += 1
-        done = self._step >= self.max_episode_steps or self._idx >= self.total_len - 1
+        done = self._step >= self.max_episode_steps or self._idx >= self.segment_end - 1
         trunc = self.balance <= 0
         if trunc:
             reward = -10.0

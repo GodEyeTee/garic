@@ -70,9 +70,18 @@ training:
     n_epochs: 5               # ลดจาก 10 เพื่อความเร็ว
 
     ent_coef: 0.02
+    eval_every_steps: 5000
+    eval_episodes: 2
+    opportunity_threshold: 0.0010
+    missed_move_penalty_scale: 160.0
+    server_cost_reward_multiplier: 25.0
+    flat_penalty_after_steps: 8
+    flat_penalty_scale: 0.015
 
   # Validation params
   validation:
+    holdout_test_ratio: 0.20
+    validation_ratio_within_train: 0.10
     cpcv_splits: 4            # ลดจาก 6 เพื่อความเร็ว
     embargo_pct: 0.01
     n_trials_dsr: 1           # จำนวน strategy ที่ทดสอบ

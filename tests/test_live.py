@@ -61,6 +61,24 @@ class TestDashboardData:
         assert metrics["n_records"] == 100
 
 
+class TestLiveAdapter:
+    def test_candle_aggregator_returns_closed_candle(self):
+        from data.adapters.live import CandleAggregator
+
+        agg = CandleAggregator(timeframe_seconds=60)
+        agg.on_trade(100.0, 1.0, 0)
+        agg.on_trade(101.0, 2.0, 30_000)
+        agg.on_trade(102.0, 3.0, 60_000)
+
+        assert agg.candle_closed
+        candle = agg.consume_closed_candle()
+        assert candle is not None
+        assert candle.timestamp == 0
+        assert candle.open == 100.0
+        assert candle.high == 101.0
+        assert candle.close == 101.0
+
+
 class TestTradingEngine:
     def test_engine_init_paper(self):
         from execution.live.trading_engine import TradingEngine

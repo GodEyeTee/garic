@@ -64,6 +64,22 @@ class TestRLEnvironment:
         assert isinstance(reward, float)
         assert "balance" in info
 
+    def test_segment_range_limits_reset(self):
+        from models.rl.environment import CryptoFuturesEnv
+        n = 200
+        features = np.random.randn(n, 346).astype(np.float32)
+        prices = 100 + np.cumsum(np.random.randn(n) * 0.5)
+        env = CryptoFuturesEnv(
+            features,
+            prices,
+            max_episode_steps=20,
+            segment_start=120,
+            segment_end=160,
+        )
+        env.reset(seed=7)
+        assert 120 <= env._start < 160
+        assert env.segment_end == 160
+
 
 class TestRiskManager:
     def test_reject_on_drawdown(self):
@@ -87,6 +103,15 @@ class TestRiskManager:
         )
         assert decision.approved
         assert decision.size > 0
+
+    def test_daily_reset_and_position_tracking(self):
+        from risk.manager import RiskManager
+        rm = RiskManager(max_open_positions=1)
+        rm.update_pnl(-500.0)
+        rm.set_position("BTCUSDT", 2500.0)
+        rm.reset_daily()
+        assert rm._daily_pnl == 0.0
+        assert "BTCUSDT" in rm._open_positions
 
 
 class TestBacktest:

@@ -36,6 +36,9 @@ class RLTrainer:
         max_episode_steps: int = 2000,
         monthly_server_cost_usd: float = 100.0,
         periods_per_day: int = 96,
+        train_range: tuple[int, int] | None = None,
+        eval_range: tuple[int, int] | None = None,
+        test_range: tuple[int, int] | None = None,
         **kwargs,
     ):
         self.feature_arrays = feature_arrays
@@ -54,9 +57,24 @@ class RLTrainer:
         self.monthly_server_cost_usd = monthly_server_cost_usd
         self.periods_per_day = periods_per_day
         self.env_kwargs = dict(kwargs)
+        self.total_len = len(self.price_series)
+        self.train_range = self._normalize_range(train_range)
+        self.eval_range = self._normalize_range(eval_range or self.train_range)
+        self.test_range = self._normalize_range(test_range or self.eval_range)
 
-    def create_env(self, feature_arrays=None, price_series=None, ohlcv_data=None):
+    def _normalize_range(self, segment_range: tuple[int, int] | None) -> tuple[int, int]:
+        if self.total_len <= 0:
+            return (0, 0)
+        if segment_range is None:
+            return (0, self.total_len)
+        start, end = int(segment_range[0]), int(segment_range[1])
+        start = max(0, min(start, self.total_len - 1))
+        end = max(start + 1, min(end, self.total_len))
+        return (start, end)
+
+    def create_env(self, feature_arrays=None, price_series=None, ohlcv_data=None, segment_range=None):
         from models.rl.environment import CryptoFuturesEnv
+        segment_start, segment_end = self._normalize_range(segment_range)
         return CryptoFuturesEnv(
             feature_arrays=feature_arrays if feature_arrays is not None else self.feature_arrays,
             price_series=price_series if price_series is not None else self.price_series,
@@ -70,6 +88,8 @@ class RLTrainer:
             max_episode_steps=self.max_episode_steps,
             monthly_server_cost_usd=self.monthly_server_cost_usd,
             periods_per_day=self.periods_per_day,
+            segment_start=segment_start,
+            segment_end=segment_end,
             **self.env_kwargs,
         )
 
@@ -91,7 +111,7 @@ class RLTrainer:
         except ImportError:
             return {"error": "stable-baselines3 not installed"}
 
-        env = self.create_env()
+        env = self.create_env(segment_range=self.train_range)
         n_feat = env.observation_space.shape[0]
 
         # *** PPO config ที่ทำงานจริง ***
@@ -136,6 +156,24 @@ class RLTrainer:
             self.min_trade_pct,
             self.monthly_server_cost_usd,
             self.periods_per_day,
+        )
+        logger.info(
+            "Reward shaping: opportunity_threshold=%.6f missed_move_penalty_scale=%.2f "
+            "server_cost_reward_multiplier=%.2f flat_penalty_after_steps=%d flat_penalty_scale=%.4f",
+            float(self.env_kwargs.get("opportunity_threshold", 0.0)),
+            float(self.env_kwargs.get("missed_move_penalty_scale", 0.0)),
+            float(self.env_kwargs.get("server_cost_reward_multiplier", 0.0)),
+            int(self.env_kwargs.get("flat_penalty_after_steps", 0)),
+            float(self.env_kwargs.get("flat_penalty_scale", 0.0)),
+        )
+        logger.info(
+            "Dataset ranges: train=[%d:%d) validation=[%d:%d) test=[%d:%d)",
+            self.train_range[0],
+            self.train_range[1],
+            self.eval_range[0],
+            self.eval_range[1],
+            self.test_range[0],
+            self.test_range[1],
         )
 
         # Custom callback: update dashboard + checkpoint
@@ -256,6 +294,7 @@ class RLTrainer:
                     metrics = trainer_self._eval_multi_episode(
                         self.model,
                         n_episodes=self.eval_eps,
+                        segment_range=trainer_self.eval_range,
                         log_episodes=False,
                     )
                     score = trainer_self._selection_score(metrics)
@@ -300,7 +339,7 @@ class RLTrainer:
         logger.info(f"Saved model -> {final_path}")
 
         # === Multi-episode eval ===
-        metrics = self._eval_multi_episode(model, n_episodes=10)
+        metrics = self._eval_multi_episode(model, n_episodes=10, segment_range=self.test_range)
         logger.info(f"Eval ({10} episodes avg): {metrics}")
 
         # === Save chart ===
@@ -316,7 +355,13 @@ class RLTrainer:
         gross_return = float(metrics.get("gross_total_return", 0.0))
         return alpha + (gross_return * 0.5) + min(avg_trades, 8.0) * 0.01 - flat_ratio * 0.25
 
-    def _eval_multi_episode(self, model, n_episodes: int = 10, log_episodes: bool = True) -> dict:
+    def _eval_multi_episode(
+        self,
+        model,
+        n_episodes: int = 10,
+        segment_range: tuple[int, int] | None = None,
+        log_episodes: bool = True,
+    ) -> dict:
         """Run multiple episodes, aggregate metrics."""
         all_metrics = []
         total_equity = []
@@ -325,9 +370,10 @@ class RLTrainer:
         missed_moves = []
         reward_sums = []
         total_action_counts = {0: 0, 1: 0, 2: 0}
+        active_range = self._normalize_range(segment_range or self.test_range)
 
         for ep in range(n_episodes):
-            env = self.create_env()
+            env = self.create_env(segment_range=active_range)
             obs, _ = env.reset()
             action_counts = {0: 0, 1: 0, 2: 0}
             rewards = []
@@ -401,10 +447,15 @@ class RLTrainer:
         avg["eval_flat_actions"] = float(total_action_counts.get(1, 0))
         avg["eval_long_actions"] = float(total_action_counts.get(2, 0))
         avg["eval_episodes"] = n_episodes
+        avg["eval_range_start"] = int(active_range[0])
+        avg["eval_range_end"] = int(active_range[1])
+        avg["eval_range_len"] = int(active_range[1] - active_range[0])
         logger.info(
-            "Eval aggregate: net=%.4f gross=%.4f dd=%.4f trades=%d win_rate=%.2f%% "
+            "Eval aggregate [%d:%d): net=%.4f gross=%.4f dd=%.4f trades=%d win_rate=%.2f%% "
             "flat_ratio=%.2f%% pos_ratio=%.2f%% avg_server_cost=$%.2f total_server_cost=$%.2f "
             "avg_missed_moves=%.4f bh_eval=%.4f alpha=%.4f",
+            int(active_range[0]),
+            int(active_range[1]),
             float(avg.get("total_return", 0.0)),
             float(avg.get("gross_total_return", 0.0)),
             float(avg.get("max_drawdown", 0.0)),
@@ -428,7 +479,7 @@ class RLTrainer:
             import matplotlib.pyplot as plt
 
             # Run one deterministic episode for chart
-            env = self.create_env()
+            env = self.create_env(segment_range=self.test_range)
             obs, _ = env.reset()
             positions = []
             while True:

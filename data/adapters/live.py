@@ -29,6 +29,7 @@ class CandleAggregator:
     def __init__(self, timeframe_seconds: int = 900):  # default 15m
         self.timeframe_seconds = timeframe_seconds
         self._current_candle: OHLCV | None = None
+        self._last_closed_candle: OHLCV | None = None
         self._candle_closed = False
         self._lock = Lock()
 
@@ -59,6 +60,14 @@ class CandleAggregator:
 
             if candle_open > self._current_candle.timestamp:
                 # แท่งเทียนเก่าปิดแล้ว → signal!
+                self._last_closed_candle = OHLCV(
+                    timestamp=self._current_candle.timestamp,
+                    open=self._current_candle.open,
+                    high=self._current_candle.high,
+                    low=self._current_candle.low,
+                    close=self._current_candle.close,
+                    volume=self._current_candle.volume,
+                )
                 self._candle_closed = True
                 self._start_new_candle(price, volume, candle_open)
                 return
@@ -97,6 +106,10 @@ class CandleAggregator:
             if not self._candle_closed:
                 return None
             self._candle_closed = False
+            candle = self._last_closed_candle
+            self._last_closed_candle = None
+            if candle is not None:
+                return candle
             # Return copy ของ candle ก่อนหน้า (ที่ปิดแล้ว)
             # Note: _current_candle ตอนนี้คือแท่งใหม่แล้ว
             # ต้องเก็บ previous candle ไว้

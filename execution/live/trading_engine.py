@@ -15,14 +15,16 @@ import logging
 import time
 import signal
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 
 from data.adapters.live import LiveAdapter
-from monitoring.live.drift_detector import DriftDetector, AlertManager
-from monitoring.live.dashboard import DashboardData
 from execution.live.order_manager import OrderManager
+from monitoring.live.dashboard import DashboardData
+from monitoring.live.drift_detector import DriftDetector, AlertManager
+from risk.manager import RiskManager
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +42,9 @@ class TradingEngine:
         api_secret: str = "",
         telegram_token: str = "",
         telegram_chat_id: str = "",
+        max_drawdown: float = 0.15,
+        daily_loss_limit: float = 0.03,
+        max_open_positions: int = 5,
     ):
         self.symbol = symbol
         self.paper_mode = paper_mode
@@ -58,6 +63,11 @@ class TradingEngine:
         self.drift_detector = DriftDetector()
         self.alert_manager = AlertManager(telegram_token, telegram_chat_id)
         self.dashboard_data = DashboardData()
+        self.risk_manager = RiskManager(
+            max_drawdown=max_drawdown,
+            daily_loss_limit=daily_loss_limit,
+            max_open_positions=max_open_positions,
+        )
 
         # Model (load if path provided)
         self._model = None
@@ -70,6 +80,11 @@ class TradingEngine:
         self._paused = False
         self._flat_steps = 0
         self._pos_steps = 0
+        self._entry_price = 0.0
+        self._trade_returns: list[float] = []
+        self._last_reset_day: str | None = None
+        self._last_equity: float | None = None
+        self._peak_equity: float | None = None
 
     def _load_model(self, path: str):
         """Load trained RL model."""
@@ -79,6 +94,84 @@ class TradingEngine:
             logger.info(f"Model loaded: {path}")
         except Exception as e:
             logger.error(f"Model load failed: {e}")
+
+    def _maybe_reset_daily(self, timestamp_ms: int):
+        day_key = datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d")
+        if self._last_reset_day is None:
+            self._last_reset_day = day_key
+            return
+        if day_key != self._last_reset_day:
+            self.risk_manager.reset_daily()
+            self._last_reset_day = day_key
+            logger.info("RiskManager daily state reset for UTC day %s", day_key)
+
+    def _estimate_equity(self, price: float) -> float:
+        balance = self._estimate_equity(price)
+        if self.paper_mode:
+            return float(balance + (self.order_manager.get_position(self.symbol) * price))
+        return float(balance)
+
+    def _update_risk_state(self, timestamp_ms: int, price: float):
+        self._maybe_reset_daily(timestamp_ms)
+        equity = self._estimate_equity(price)
+        if self._last_equity is None:
+            self._last_equity = equity
+            self._peak_equity = equity
+        else:
+            self.risk_manager.update_pnl(equity - self._last_equity)
+            self._last_equity = equity
+            self._peak_equity = max(self._peak_equity or equity, equity)
+        return equity
+
+    def _current_drawdown(self, equity: float) -> float:
+        peak = max(self._peak_equity or equity, equity, 1e-9)
+        return max((peak - equity) / peak, 0.0)
+
+    def _trade_stats(self) -> tuple[float, float, float]:
+        if not self._trade_returns:
+            return 0.5, 0.02, 0.01
+        wins = [r for r in self._trade_returns if r > 0]
+        losses = [-r for r in self._trade_returns if r < 0]
+        win_rate = len(wins) / max(len(self._trade_returns), 1)
+        avg_win = float(np.mean(wins)) if wins else 0.02
+        avg_loss = float(np.mean(losses)) if losses else 0.01
+        return float(win_rate), avg_win, avg_loss
+
+    def _estimate_atr_pct(self, features) -> float:
+        ohlcv = np.asarray(features.ohlcv, dtype=np.float64)
+        if ohlcv.ndim != 2 or ohlcv.shape[0] == 0:
+            return 0.02
+        recent = ohlcv[-min(len(ohlcv), 14):]
+        closes = np.maximum(recent[:, 3], 1e-9)
+        return float(np.mean((recent[:, 1] - recent[:, 2]) / closes))
+
+    def _evaluate_risk(self, direction: float, features, price: float, equity: float):
+        win_rate, avg_win, avg_loss = self._trade_stats()
+        uncertainty = float(getattr(features, "forecast_uncertainty", 0.0))
+        model_confidence = 0.5 if uncertainty <= 0 else float(np.clip(1.0 - uncertainty, 0.1, 1.0))
+        current_drawdown = self._current_drawdown(equity)
+        decision = self.risk_manager.evaluate(
+            symbol=self.symbol,
+            direction=direction,
+            equity=equity,
+            model_confidence=model_confidence,
+            win_rate=win_rate,
+            avg_win=avg_win,
+            avg_loss=avg_loss,
+            atr_value=self._estimate_atr_pct(features),
+            current_drawdown=current_drawdown,
+            is_major=self.symbol.upper() in {"BTCUSDT", "ETHUSDT"},
+        )
+        if not decision.approved:
+            logger.warning("Risk rejected trade: %s", decision.reject_reason)
+        return decision
+
+    def _record_closed_trade(self, direction: float, price: float):
+        if direction == 0 or self._entry_price <= 0:
+            return
+        trade_return = direction * ((price / self._entry_price) - 1.0)
+        self._trade_returns.append(float(trade_return))
+        self._trade_returns = self._trade_returns[-200:]
 
     def on_trade(self, price: float, volume: float, timestamp_ms: int):
         """Callback จาก WebSocket — accumulate แต่ไม่ action."""
@@ -109,6 +202,9 @@ class TradingEngine:
             logger.info(f"Warmup: {e}")
             return
 
+        price = float(features.ohlcv[-1, 3])
+        equity = self._update_risk_state(timestamp_ms, price)
+
         # 2. Model prediction
         action = self._predict_action(feature_array)
 
@@ -131,11 +227,11 @@ class TradingEngine:
 
         # 4. Execute (ถ้า action เปลี่ยน)
         if abs(action - self._last_action) > 0.05:  # minimum change threshold
-            self._execute_action(action, features)
+            self._execute_action(action, features, timestamp_ms, equity)
             self._last_action = action
 
         # 5. Update dashboard
-        balance = self.order_manager.get_balance()
+        balance = self._estimate_equity(price)
         self.dashboard_data.add_record(
             timestamp=timestamp_ms,
             balance=balance,
@@ -182,32 +278,71 @@ class TradingEngine:
             return 1.0
         return 0.0
 
-    def _execute_action(self, action: float, features):
-        """Execute trade based on action."""
-        balance = self.order_manager.get_balance()
-        current_pos = self.order_manager.get_position(self.symbol)
-
-        # Target position in units
-        target_pos_ratio = action
-        pos_change = target_pos_ratio - (current_pos / max(balance, 1))
-
-        if abs(pos_change) < 0.01:
+    def _execute_action(self, action: float, features, timestamp_ms: int, equity: float):
+        """Execute trade based on action with risk approval."""
+        price = float(features.ohlcv[-1, 3])
+        if price <= 0:
             return
 
-        # Determine side and amount
-        side = "buy" if pos_change > 0 else "sell"
-        amount = abs(pos_change) * balance
+        current_qty = float(self.order_manager.get_position(self.symbol))
+        current_direction = float(np.sign(current_qty))
+        desired_direction = float(np.sign(action))
 
-        # Use last close as price reference
-        price = features.ohlcv[-1, 3]  # last close
+        self.risk_manager.set_position(self.symbol, abs(current_qty) * price)
 
-        if amount > 0 and price > 0:
+        if desired_direction == 0.0:
+            if current_qty == 0.0:
+                return
+            self._record_closed_trade(current_direction, price)
+            side = "sell" if current_qty > 0 else "buy"
             self.order_manager.place_order(
                 symbol=self.symbol,
                 side=side,
-                amount=amount / price,  # convert to quantity
+                amount=abs(current_qty),
                 current_price=price,
             )
+            self._entry_price = 0.0
+            self.risk_manager.set_position(self.symbol, 0.0)
+            self._last_equity = self._estimate_equity(price)
+            self._peak_equity = max(self._peak_equity or self._last_equity, self._last_equity)
+            return
+
+        if current_direction == desired_direction and current_qty != 0.0:
+            self.risk_manager.set_position(self.symbol, abs(current_qty) * price)
+            return
+
+        if current_direction != 0.0 and current_direction != desired_direction:
+            self._record_closed_trade(current_direction, price)
+            close_side = "sell" if current_qty > 0 else "buy"
+            self.order_manager.place_order(
+                symbol=self.symbol,
+                side=close_side,
+                amount=abs(current_qty),
+                current_price=price,
+            )
+            current_qty = 0.0
+            current_direction = 0.0
+            self._entry_price = 0.0
+            self.risk_manager.set_position(self.symbol, 0.0)
+            equity = self._estimate_equity(price)
+
+        decision = self._evaluate_risk(desired_direction, features, price, equity)
+        if not decision.approved or decision.size <= 0:
+            return
+
+        quantity = float(decision.size / price)
+        side = "buy" if desired_direction > 0 else "sell"
+        result = self.order_manager.place_order(
+            symbol=self.symbol,
+            side=side,
+            amount=quantity,
+            current_price=price,
+        )
+        if result.status == "filled":
+            self._entry_price = price
+            self.risk_manager.set_position(self.symbol, decision.size)
+            self._last_equity = self._estimate_equity(price)
+            self._peak_equity = max(self._peak_equity or self._last_equity, self._last_equity)
 
     def start(self):
         """Start trading engine with WebSocket."""

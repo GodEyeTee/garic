@@ -39,6 +39,8 @@ training:
     flat_penalty_scale: 0.015
 
   validation:
+    holdout_test_ratio: 0.20
+    validation_ratio_within_train: 0.10
     cpcv_splits: 4
     embargo_pct: 0.01
     n_trials_dsr: 1
