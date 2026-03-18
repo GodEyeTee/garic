@@ -1,0 +1,44 @@
+# RTX 2060 6GB — Full Training config
+# ใช้ data ทั้งหมด แต่ training steps พอประมาณ
+# ประมาณ 30-60 นาที บน RTX 2060
+
+data:
+  pairs:
+    - BTCUSDT
+    # เทรน BTC ก่อน (ETH เพิ่มทีหลังถ้า BTC OK)
+
+  # ไม่ subsample — ใช้ data เต็ม 3.2M rows
+  # subsample_rows: ไม่ต้องตั้ง
+
+trading:
+  leverage: 1
+  maintenance_margin: 0.005
+  min_trade_pct: 0.02
+  monthly_server_cost_usd: 100.0
+  periods_per_day: 96
+
+training:
+  checkpoint_interval: 600   # checkpoint ทุก 10 นาที
+  device: "cpu"              # PPO MlpPolicy เร็วกว่าบน CPU (SB3 official recommendation)
+  seed: 42
+
+  rl:
+    algo: "PPO"
+    total_timesteps: 600000   # Give PPO enough coverage to avoid late flat-policy collapse
+    learning_rate: 0.0003
+    n_steps: 2000             # = max_episode_steps (PPO เห็นจบ episode ทุก rollout)
+    batch_size: 250           # clean divisor of 2000, more stable than implicit fallback to 50
+    n_epochs: 15
+    ent_coef: 0.03
+    eval_every_steps: 50000
+    eval_episodes: 4
+    opportunity_threshold: 0.0010
+    missed_move_penalty_scale: 160.0
+    server_cost_reward_multiplier: 25.0
+    flat_penalty_after_steps: 8
+    flat_penalty_scale: 0.015
+
+  validation:
+    cpcv_splits: 4
+    embargo_pct: 0.01
+    n_trials_dsr: 1

@@ -1,0 +1,78 @@
+# RTX 2060 6GB — Lightweight config สำหรับทดสอบทั้งระบบ
+# ใช้ข้อมูลน้อยลง + timesteps น้อยลง เพื่อ validate logic ก่อน deploy cloud
+
+project:
+  name: garic
+  version: 0.1.0
+
+data:
+  pairs:
+    - BTCUSDT
+    # ทดสอบแค่ BTC ก่อนเพื่อความเร็ว (เพิ่ม ETHUSDT ใน full run)
+  start_date: "2020-01-01"
+  end_date: "2026-03-15"
+  base_timeframe: "1m"
+  timeframes:
+    - "1m"
+
+  # Subsample: ใช้แค่ 200K rows (จาก 3.2M) สำหรับ test
+  # ครอบคลุมข้อมูลล่าสุด ~4.5 เดือน
+  subsample_rows: 200000
+
+  paths:
+    raw: "data/raw"
+    clean: "data/clean"
+
+  quality:
+    zscore_threshold: 3.0
+    max_gap_forward_fill: 300
+    min_exchanges_validation: 3
+    divergence_threshold: 0.005
+
+  binance:
+    asset_class: "um"
+    base_url: "https://data.binance.vision"
+    api_base: "https://fapi.binance.com"
+    funding_rate_limit: 1000
+
+  sentiment:
+    fear_greed_url: "https://api.alternative.me/fng/?limit=0&format=json"
+
+  onchain:
+    defillama_base: "https://api.llama.fi"
+
+trading:
+  candle_timeframe: "15m"
+  max_position_pct:
+    major: 0.05
+    alt: 0.02
+  kelly_fraction: 0.25
+  risk_per_trade: 0.02
+  leverage: 1              # 1x สำหรับ test (conservative), production ใช้ 3-5x
+  maintenance_margin: 0.005  # 0.5% Binance BTC default
+  min_trade_pct: 0.02       # 2% position change (test: agent มีแค่ 10K steps ยังปรับเล็ก)
+
+  monthly_server_cost_usd: 100.0
+  periods_per_day: 96
+
+training:
+  checkpoint_interval: 300   # 5 นาที (เร็วกว่า full run)
+  device: "cuda"
+  seed: 42
+
+  # RTX 2060 optimized RL params
+  rl:
+    algo: "PPO"
+    total_timesteps: 10000    # เร็วพอสำหรับ test (full: 500K+)
+    learning_rate: 0.0003
+    n_steps: 512              # ลดจาก 2048 เพื่อ VRAM
+    batch_size: 32            # ลดจาก 64 เพื่อ VRAM
+    n_epochs: 5               # ลดจาก 10 เพื่อความเร็ว
+
+    ent_coef: 0.02
+
+  # Validation params
+  validation:
+    cpcv_splits: 4            # ลดจาก 6 เพื่อความเร็ว
+    embargo_pct: 0.01
+    n_trials_dsr: 1           # จำนวน strategy ที่ทดสอบ

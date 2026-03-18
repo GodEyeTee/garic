@@ -1,0 +1,81 @@
+# GARIC Default Configuration — Full Training (Cloud GPU)
+
+project:
+  name: garic
+  version: 0.1.0
+
+data:
+  pairs:
+    - BTCUSDT
+    - ETHUSDT
+  start_date: "2020-01-01"  # Binance Futures bulk data เริ่ม Jan 2020
+  end_date: "2026-03-15"    # อัพเดทเมื่อต้องการข้อมูลใหม่
+  base_timeframe: "1m"    # ดาวน์โหลดที่ 1m แล้ว aggregate เป็น timeframe อื่น
+  timeframes:
+    - "1m"
+    - "5m"
+    - "15m"
+    - "1h"
+    - "4h"
+    - "1d"
+
+  paths:
+    raw: "data/raw"
+    clean: "data/clean"
+
+  quality:
+    zscore_threshold: 3.0           # outlier > 3σ
+    max_gap_forward_fill: 300       # forward-fill gap < 5 นาที (วินาที)
+    min_exchanges_validation: 3     # cross-validate ต้อง 3+ exchange
+    divergence_threshold: 0.005     # flag >0.5% divergence
+
+  binance:
+    asset_class: "um"               # USDT-M futures
+    base_url: "https://data.binance.vision"
+    api_base: "https://fapi.binance.com"
+    funding_rate_limit: 1000        # records per request
+
+  sentiment:
+    fear_greed_url: "https://api.alternative.me/fng/?limit=0&format=json"
+
+  onchain:
+    defillama_base: "https://api.llama.fi"
+
+trading:
+  candle_timeframe: "15m"           # timeframe หลักสำหรับ decision
+  max_position_pct:
+    major: 0.05                     # 5% equity สำหรับ BTC/ETH
+    alt: 0.02                       # 2% equity สำหรับ altcoin
+  kelly_fraction: 0.25              # Quarter Kelly
+  risk_per_trade: 0.02              # 2% max risk per trade
+  leverage: 1                       # 1x default (เปลี่ยนเป็น 3-5x สำหรับ production)
+  maintenance_margin: 0.005         # 0.5% Binance BTC
+  min_trade_pct: 0.02              # 2% minimum position change
+  monthly_server_cost_usd: 100.0    # fixed infra cost charged against equity
+  periods_per_day: 96               # 15m candles per day
+
+training:
+  checkpoint_interval: 900          # 15 นาที
+  device: "cuda"
+  seed: 42
+
+  rl:
+    algo: "PPO"
+    total_timesteps: 400000         # More coverage to reduce flat-policy collapse
+    learning_rate: 0.0003
+    n_steps: 2000
+    batch_size: 250
+    n_epochs: 15
+    ent_coef: 0.03
+    eval_every_steps: 50000
+    eval_episodes: 4
+    opportunity_threshold: 0.0010
+    missed_move_penalty_scale: 160.0
+    server_cost_reward_multiplier: 25.0
+    flat_penalty_after_steps: 8
+    flat_penalty_scale: 0.015
+
+  validation:
+    cpcv_splits: 6
+    embargo_pct: 0.01
+    n_trials_dsr: 5

@@ -1,0 +1,48 @@
+# Virtual environments
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local agent / editor folders
+.claude/
+
+# Environment / local overrides
+.env
+
+# Logs
+*.log
+
+# Runtime outputs
+dashboard.log
+pipeline.log
+dash_err.log
+
+# Checkpoints and generated training artifacts
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.zip
+*.npz
+*.npy
+
+# Downloaded / generated datasets only
+data/raw/
+data/clean/
+data/cache/
+data/dashboard_history.parquet
+data/**/*.parquet
+data/**/*.csv
+data/**/*.jsonl
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+
+# Markdown policy: keep only README public
+*.md
+!README.md

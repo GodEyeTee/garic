@@ -1,0 +1,26 @@
+# Core
+numpy>=1.24
+pandas>=2.0
+pyarrow>=14.0
+pyyaml>=6.0
+requests>=2.31
+scipy>=1.11
+
+# Data
+ccxt>=4.0
+pytrends>=4.9
+websocket-client>=1.6
+
+# ML/DL
+torch>=2.4
+stable-baselines3>=2.3
+gymnasium>=0.29
+
+# Monitoring
+wandb>=0.16
+evidently>=0.4
+streamlit>=1.30
+plotly>=5.18
+
+# Testing
+pytest>=7.0
