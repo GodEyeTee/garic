@@ -72,9 +72,26 @@ class RLTrainer:
         end = max(start + 1, min(end, self.total_len))
         return (start, end)
 
-    def create_env(self, feature_arrays=None, price_series=None, ohlcv_data=None, segment_range=None):
+    @staticmethod
+    def _saved_model_path(base_path: Path | str) -> Path:
+        path = Path(base_path)
+        return path if path.suffix == ".zip" else path.with_suffix(".zip")
+
+    def create_env(
+        self,
+        feature_arrays=None,
+        price_series=None,
+        ohlcv_data=None,
+        segment_range=None,
+        balanced_sampling=None,
+    ):
         from models.rl.environment import CryptoFuturesEnv
         segment_start, segment_end = self._normalize_range(segment_range)
+        env_kwargs = dict(self.env_kwargs)
+        if balanced_sampling is None:
+            balanced_sampling = env_kwargs.pop("balanced_sampling", False)
+        else:
+            env_kwargs.pop("balanced_sampling", None)
         return CryptoFuturesEnv(
             feature_arrays=feature_arrays if feature_arrays is not None else self.feature_arrays,
             price_series=price_series if price_series is not None else self.price_series,
@@ -90,7 +107,8 @@ class RLTrainer:
             periods_per_day=self.periods_per_day,
             segment_start=segment_start,
             segment_end=segment_end,
-            **self.env_kwargs,
+            balanced_sampling=balanced_sampling,
+            **env_kwargs,
         )
 
     def train(
@@ -102,7 +120,7 @@ class RLTrainer:
         n_epochs: int = 10,
         ent_coef: float = 0.02,
         eval_every_steps: int = 50_000,
-        eval_episodes: int = 4,
+        eval_episodes: int = 8,
         **kwargs,
     ) -> dict:
         try:
@@ -111,7 +129,9 @@ class RLTrainer:
         except ImportError:
             return {"error": "stable-baselines3 not installed"}
 
-        env = self.create_env(segment_range=self.train_range)
+        env_kwargs = dict(self.env_kwargs)
+        balanced_sampling_enabled = bool(env_kwargs.pop("balanced_sampling", False))
+        env = self.create_env(segment_range=self.train_range, balanced_sampling=balanced_sampling_enabled)
         n_feat = env.observation_space.shape[0]
 
         # *** PPO config ที่ทำงานจริง ***
@@ -159,12 +179,21 @@ class RLTrainer:
         )
         logger.info(
             "Reward shaping: opportunity_threshold=%.6f missed_move_penalty_scale=%.2f "
-            "server_cost_reward_multiplier=%.2f flat_penalty_after_steps=%d flat_penalty_scale=%.4f",
+            "server_cost_reward_multiplier=%.2f flat_penalty_after_steps=%d flat_penalty_scale=%.4f "
+            "alpha_reward_weight=%.2f net_pnl_reward_weight=%.2f same_position_penalty_after_steps=%d "
+            "same_position_penalty_scale=%.4f inactive_episode_penalty=%.2f "
+            "static_position_episode_penalty=%.2f",
             float(self.env_kwargs.get("opportunity_threshold", 0.0)),
             float(self.env_kwargs.get("missed_move_penalty_scale", 0.0)),
             float(self.env_kwargs.get("server_cost_reward_multiplier", 0.0)),
             int(self.env_kwargs.get("flat_penalty_after_steps", 0)),
             float(self.env_kwargs.get("flat_penalty_scale", 0.0)),
+            float(self.env_kwargs.get("alpha_reward_weight", 0.0)),
+            float(self.env_kwargs.get("net_pnl_reward_weight", 0.0)),
+            int(self.env_kwargs.get("same_position_penalty_after_steps", 0)),
+            float(self.env_kwargs.get("same_position_penalty_scale", 0.0)),
+            float(self.env_kwargs.get("inactive_episode_penalty", 0.0)),
+            float(self.env_kwargs.get("static_position_episode_penalty", 0.0)),
         )
         logger.info(
             "Dataset ranges: train=[%d:%d) validation=[%d:%d) test=[%d:%d)",
@@ -174,6 +203,16 @@ class RLTrainer:
             self.eval_range[1],
             self.test_range[0],
             self.test_range[1],
+        )
+        sampling_stats = getattr(env, "sampling_stats", {})
+        logger.info(
+            "Train sampler: mode=%s threshold=%.4f candidates=%d buckets={down:%d, flat:%d, up:%d}",
+            sampling_stats.get("mode", "unknown"),
+            float(sampling_stats.get("threshold", 0.0)),
+            int(sampling_stats.get("total_candidates", 0)),
+            int(sampling_stats.get("down_count", 0)),
+            int(sampling_stats.get("flat_count", 0)),
+            int(sampling_stats.get("up_count", 0)),
         )
 
         # Custom callback: update dashboard + checkpoint
@@ -195,6 +234,7 @@ class RLTrainer:
                 self._last_eval_step = 0
                 self.best_score = -np.inf
                 self.best_path = None
+                self.best_base_path = None
 
             def _on_step(self) -> bool:
                 # Update more frequently to catch intra-episode stats before reset!
@@ -300,7 +340,7 @@ class RLTrainer:
                     score = trainer_self._selection_score(metrics)
                     logger.info(
                         "Checkpoint eval step=%d score=%.4f alpha=%.4f net=%.4f gross=%.4f "
-                        "trades=%.1f flat_ratio=%.2f%%",
+                        "trades=%.1f flat_ratio=%.2f%% action_entropy=%.3f dominant_ratio=%.2f%%",
                         self.num_timesteps,
                         float(score),
                         float(metrics.get("outperformance_vs_bh", 0.0)),
@@ -308,11 +348,14 @@ class RLTrainer:
                         float(metrics.get("gross_total_return", 0.0)),
                         float(metrics.get("n_trades", 0.0)),
                         float(metrics.get("flat_ratio", 0.0) * 100.0),
+                        float(metrics.get("eval_action_entropy", 0.0)),
+                        float(metrics.get("eval_dominant_action_ratio", 0.0) * 100.0),
                     )
                     if score > self.best_score:
                         self.best_score = score
-                        self.best_path = self.save_path / "rl_agent_best"
-                        self.model.save(str(self.best_path))
+                        self.best_base_path = self.save_path / "rl_agent_best"
+                        self.model.save(str(self.best_base_path))
+                        self.best_path = trainer_self._saved_model_path(self.best_base_path)
                         logger.info(
                             "New best checkpoint at step=%d -> %s (score=%.4f)",
                             self.num_timesteps,
@@ -348,12 +391,31 @@ class RLTrainer:
         return metrics
 
     def _selection_score(self, metrics: dict) -> float:
-        """Prefer alpha, but penalize policies that collapse to flat."""
+        """Prefer positive alpha and penalize action-collapse policies."""
         alpha = float(metrics.get("outperformance_vs_bh", 0.0))
+        net_return = float(metrics.get("total_return", 0.0))
         flat_ratio = float(metrics.get("flat_ratio", 1.0))
+        position_ratio = float(metrics.get("position_ratio", 0.0))
         avg_trades = float(metrics.get("avg_trades_per_episode", 0.0))
-        gross_return = float(metrics.get("gross_total_return", 0.0))
-        return alpha + (gross_return * 0.5) + min(avg_trades, 8.0) * 0.01 - flat_ratio * 0.25
+        action_entropy = float(metrics.get("eval_action_entropy", 0.0))
+        dominant_action_ratio = float(metrics.get("eval_dominant_action_ratio", 1.0))
+
+        collapse_penalty = max(dominant_action_ratio - 0.85, 0.0) * 1.75
+        collapse_penalty += max(position_ratio - 0.90, 0.0) * 1.00
+        collapse_penalty += max(flat_ratio - 0.95, 0.0) * 0.75
+
+        trade_bonus = min(avg_trades, 12.0) * 0.005
+        trade_floor_penalty = max(2.0 - avg_trades, 0.0) * 0.05
+        loss_penalty = max(-net_return, 0.0) * 4.0
+        return (
+            alpha * 5.0
+            + net_return * 3.0
+            + action_entropy * 0.10
+            + trade_bonus
+            - collapse_penalty
+            - trade_floor_penalty
+            - loss_penalty
+        )
 
     def _eval_multi_episode(
         self,
@@ -373,7 +435,7 @@ class RLTrainer:
         active_range = self._normalize_range(segment_range or self.test_range)
 
         for ep in range(n_episodes):
-            env = self.create_env(segment_range=active_range)
+            env = self.create_env(segment_range=active_range, balanced_sampling=False)
             obs, _ = env.reset()
             action_counts = {0: 0, 1: 0, 2: 0}
             rewards = []
@@ -450,10 +512,28 @@ class RLTrainer:
         avg["eval_range_start"] = int(active_range[0])
         avg["eval_range_end"] = int(active_range[1])
         avg["eval_range_len"] = int(active_range[1] - active_range[0])
+        total_actions = float(sum(total_action_counts.values()))
+        if total_actions > 0:
+            action_probs = np.array([
+                total_action_counts.get(0, 0),
+                total_action_counts.get(1, 0),
+                total_action_counts.get(2, 0),
+            ], dtype=np.float64) / total_actions
+            nonzero_probs = action_probs[action_probs > 0]
+            entropy = float(-np.sum(nonzero_probs * np.log(nonzero_probs)) / np.log(3.0))
+            dominant_idx = int(np.argmax(action_probs))
+            dominant_ratio = float(np.max(action_probs))
+        else:
+            entropy = 0.0
+            dominant_idx = 1
+            dominant_ratio = 1.0
+        avg["eval_action_entropy"] = entropy
+        avg["eval_dominant_action"] = float(dominant_idx)
+        avg["eval_dominant_action_ratio"] = dominant_ratio
         logger.info(
             "Eval aggregate [%d:%d): net=%.4f gross=%.4f dd=%.4f trades=%d win_rate=%.2f%% "
             "flat_ratio=%.2f%% pos_ratio=%.2f%% avg_server_cost=$%.2f total_server_cost=$%.2f "
-            "avg_missed_moves=%.4f bh_eval=%.4f alpha=%.4f",
+            "avg_missed_moves=%.4f bh_eval=%.4f alpha=%.4f action_entropy=%.3f dominant_action=%d dominant_ratio=%.2f%%",
             int(active_range[0]),
             int(active_range[1]),
             float(avg.get("total_return", 0.0)),
@@ -468,6 +548,9 @@ class RLTrainer:
             float(avg.get("missed_moves", 0.0)),
             float(avg.get("bh_eval_return", 0.0)),
             float(avg.get("outperformance_vs_bh", 0.0)),
+            float(avg.get("eval_action_entropy", 0.0)),
+            int(avg.get("eval_dominant_action", 1)),
+            float(avg.get("eval_dominant_action_ratio", 0.0) * 100.0),
         )
         return avg
 
@@ -479,7 +562,7 @@ class RLTrainer:
             import matplotlib.pyplot as plt
 
             # Run one deterministic episode for chart
-            env = self.create_env(segment_range=self.test_range)
+            env = self.create_env(segment_range=self.test_range, balanced_sampling=False)
             obs, _ = env.reset()
             positions = []
             while True:

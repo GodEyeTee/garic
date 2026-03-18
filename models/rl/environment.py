@@ -47,12 +47,20 @@ class CryptoFuturesEnv(gym.Env):
         maintenance_margin: float = 0.005,
         max_episode_steps: int = 2000,
         opportunity_threshold: float = 0.0010,  # 0.10% move = opportunity
-        missed_move_penalty_scale: float = 160.0,
+        missed_move_penalty_scale: float = 40.0,
         monthly_server_cost_usd: float = 100.0,
         periods_per_day: int = 96,
-        server_cost_reward_multiplier: float = 25.0,
-        flat_penalty_after_steps: int = 8,
-        flat_penalty_scale: float = 0.015,
+        server_cost_reward_multiplier: float = 6.0,
+        flat_penalty_after_steps: int = 32,
+        flat_penalty_scale: float = 0.002,
+        alpha_reward_weight: float = 0.35,
+        net_pnl_reward_weight: float = 1.00,
+        same_position_penalty_after_steps: int = 96,
+        same_position_penalty_scale: float = 0.003,
+        inactive_episode_penalty: float = 0.75,
+        static_position_episode_penalty: float = 0.25,
+        balanced_sampling: bool = False,
+        regime_label_threshold: float = 0.02,
         segment_start: int = 0,
         segment_end: int | None = None,
         **kwargs,
@@ -75,6 +83,14 @@ class CryptoFuturesEnv(gym.Env):
         self.server_cost_reward_multiplier = server_cost_reward_multiplier
         self.flat_penalty_after_steps = flat_penalty_after_steps
         self.flat_penalty_scale = flat_penalty_scale
+        self.alpha_reward_weight = alpha_reward_weight
+        self.net_pnl_reward_weight = net_pnl_reward_weight
+        self.same_position_penalty_after_steps = same_position_penalty_after_steps
+        self.same_position_penalty_scale = same_position_penalty_scale
+        self.inactive_episode_penalty = max(float(inactive_episode_penalty), 0.0)
+        self.static_position_episode_penalty = max(float(static_position_episode_penalty), 0.0)
+        self.balanced_sampling = bool(balanced_sampling)
+        self.regime_label_threshold = max(float(regime_label_threshold), 0.0)
         self.total_len = n
         self.segment_start = max(0, int(segment_start))
         resolved_segment_end = n if segment_end is None else int(segment_end)
@@ -92,15 +108,73 @@ class CryptoFuturesEnv(gym.Env):
         )
         # 3 actions: Short, Flat, Long
         self.action_space = spaces.Discrete(3)
+        self._sampling_cursor = 0
+        self._sampled_regime = "uniform"
+        self._sampling_buckets = self._build_sampling_buckets()
         self.reset()
+
+    def _build_sampling_buckets(self) -> dict[str, np.ndarray]:
+        latest_start = max(self.segment_start, self.segment_end - self.max_episode_steps - 1)
+        if latest_start <= self.segment_start:
+            candidate_starts = np.array([self.segment_start], dtype=np.int32)
+        else:
+            candidate_starts = np.arange(self.segment_start, latest_start + 1, dtype=np.int32)
+
+        if not self.balanced_sampling or candidate_starts.size == 0:
+            self.sampling_stats = {
+                "mode": "uniform",
+                "threshold": float(self.regime_label_threshold),
+                "total_candidates": int(candidate_starts.size),
+                "up_count": 0,
+                "down_count": 0,
+                "flat_count": 0,
+            }
+            return {}
+
+        horizon_end = np.minimum(candidate_starts + self.max_episode_steps, self.segment_end - 1)
+        episode_returns = (self.prices[horizon_end] / self.prices[candidate_starts]) - 1.0
+        threshold = self.regime_label_threshold
+        up_mask = episode_returns > threshold
+        down_mask = episode_returns < -threshold
+        flat_mask = ~(up_mask | down_mask)
+        buckets = {
+            "down": candidate_starts[down_mask],
+            "flat": candidate_starts[flat_mask],
+            "up": candidate_starts[up_mask],
+        }
+        usable_buckets = {name: starts for name, starts in buckets.items() if starts.size > 0}
+        self.sampling_stats = {
+            "mode": "balanced" if usable_buckets else "uniform",
+            "threshold": float(threshold),
+            "total_candidates": int(candidate_starts.size),
+            "up_count": int(buckets["up"].size),
+            "down_count": int(buckets["down"].size),
+            "flat_count": int(buckets["flat"].size),
+        }
+        if len(usable_buckets) >= 2:
+            return usable_buckets
+        self.sampling_stats["mode"] = "uniform"
+        return {}
+
+    def _sample_start_index(self) -> int:
+        latest_start = max(self.segment_start, self.segment_end - self.max_episode_steps - 1)
+        if latest_start <= self.segment_start:
+            self._sampled_regime = "uniform"
+            return self.segment_start
+        if self._sampling_buckets:
+            ordered = [name for name in ("down", "flat", "up") if name in self._sampling_buckets]
+            regime_name = ordered[self._sampling_cursor % len(ordered)]
+            self._sampling_cursor += 1
+            starts = self._sampling_buckets[regime_name]
+            sampled = int(starts[self.np_random.integers(0, len(starts))])
+            self._sampled_regime = regime_name
+            return sampled
+        self._sampled_regime = "uniform"
+        return int(self.np_random.integers(self.segment_start, latest_start + 1))
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        latest_start = max(self.segment_start, self.segment_end - self.max_episode_steps - 1)
-        if latest_start <= self.segment_start:
-            self._start = self.segment_start
-        else:
-            self._start = int(self.np_random.integers(self.segment_start, latest_start + 1))
+        self._start = self._sample_start_index()
         self._step = 0
         self.position = 0.0  # start flat
         self.entry_price = 0.0
@@ -119,6 +193,7 @@ class CryptoFuturesEnv(gym.Env):
         self._pos_steps_total = 0
         self._missed_moves = 0.0  # cumulative missed opportunity
         self._server_cost_paid = 0.0
+        self._direction_steps = 0
         return self._obs(), {}
 
     @property
@@ -145,6 +220,7 @@ class CryptoFuturesEnv(gym.Env):
             a = int(action)
 
         idx = self._idx
+        old_pos_for_streak = self.position
         prev_close = self.prices[max(idx - 1, self._start)]
         close_p = self.prices[idx]
         high_p = self.highs[idx]
@@ -244,9 +320,14 @@ class CryptoFuturesEnv(gym.Env):
         if self.position != 0:
             self._pos_steps += 1
             self._pos_steps_total += 1
+            if old_pos_for_streak != 0 and self.position == old_pos_for_streak:
+                self._direction_steps += 1
+            else:
+                self._direction_steps = 1
         else:
             self._pos_steps = 0
             self._flat_steps_total += 1
+            self._direction_steps = 0
 
         # === REWARD ===
         gross_pnl = pnl
@@ -259,7 +340,11 @@ class CryptoFuturesEnv(gym.Env):
             pnl -= server_cost_pct
             self._server_cost_paid += server_cost_usd_per_step
 
-        reward = pnl * 100.0  # (1% move = 1.0 reward)
+        benchmark_pnl = price_ret * self.leverage if self._step > 0 else 0.0
+        alpha_net_pnl = pnl - benchmark_pnl
+        reward = (alpha_net_pnl * 100.0 * self.alpha_reward_weight)
+        if self.net_pnl_reward_weight > 0:
+            reward += pnl * 100.0 * self.net_pnl_reward_weight
         if server_cost_pct > 0 and self.server_cost_reward_multiplier > 1.0:
             reward -= server_cost_pct * 100.0 * (self.server_cost_reward_multiplier - 1.0)
 
@@ -276,13 +361,15 @@ class CryptoFuturesEnv(gym.Env):
                     reward -= missed_move * self.missed_move_penalty_scale
         else:
             self._flat_steps = 0
+            if self._direction_steps > self.same_position_penalty_after_steps:
+                reward -= self.same_position_penalty_scale
 
         # Shaping: Symmetrical bonus/penalty
         if 'closed_trade_ret' in locals():
             if closed_trade_ret > 0:
-                reward += (closed_trade_ret * 200.0) + 1.0  # Extra fixed bonus for a win
+                reward += (closed_trade_ret * 75.0) + 0.25
             else:
-                reward += (closed_trade_ret * 200.0) - 1.0  # Extra fixed penalty for a loss
+                reward += (closed_trade_ret * 75.0) - 0.25
 
         # Update balances
         self.gross_balance *= (1 + gross_pnl)
@@ -306,6 +393,14 @@ class CryptoFuturesEnv(gym.Env):
                 self._wins += 1
             else:
                 self._losses += 1
+
+        if done or trunc:
+            total_steps = max(self._flat_steps_total + self._pos_steps_total, 1)
+            position_ratio = self._pos_steps_total / total_steps
+            if self._trades == 0 and self.inactive_episode_penalty > 0:
+                reward -= self.inactive_episode_penalty
+            elif self._trades <= 1 and position_ratio >= 0.98 and self.static_position_episode_penalty > 0:
+                reward -= self.static_position_episode_penalty
 
         obs = self._obs() if not (done or trunc) else np.zeros(self.observation_space.shape, dtype=np.float32)
         

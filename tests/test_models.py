@@ -80,6 +80,61 @@ class TestRLEnvironment:
         assert 120 <= env._start < 160
         assert env.segment_end == 160
 
+    def test_balanced_sampling_spreads_regimes(self):
+        from models.rl.environment import CryptoFuturesEnv
+
+        down = np.linspace(100, 80, 60, dtype=np.float32)
+        flat = np.linspace(80, 80.4, 60, dtype=np.float32)
+        up = np.linspace(80.4, 104, 60, dtype=np.float32)
+        prices = np.concatenate([down, flat, up])
+        features = np.random.randn(len(prices), 16).astype(np.float32)
+
+        env = CryptoFuturesEnv(
+            features,
+            prices,
+            max_episode_steps=20,
+            balanced_sampling=True,
+            regime_label_threshold=0.03,
+        )
+        stats = env.sampling_stats
+        assert stats["mode"] == "balanced"
+        assert stats["down_count"] > 0
+        assert stats["flat_count"] > 0
+        assert stats["up_count"] > 0
+
+        seen_regimes = set()
+        for _ in range(6):
+            env.reset()
+            seen_regimes.add(env._sampled_regime)
+
+        assert seen_regimes == {"down", "flat", "up"}
+
+    def test_inactive_episode_penalty_applies_when_no_trade(self):
+        from models.rl.environment import CryptoFuturesEnv
+
+        prices = np.full(8, 100.0, dtype=np.float32)
+        features = np.zeros((8, 4), dtype=np.float32)
+        env = CryptoFuturesEnv(
+            features,
+            prices,
+            max_episode_steps=3,
+            monthly_server_cost_usd=0.0,
+            opportunity_threshold=10.0,
+            flat_penalty_after_steps=99,
+            flat_penalty_scale=0.0,
+            inactive_episode_penalty=1.0,
+        )
+
+        env.reset(seed=1)
+        rewards = []
+        for _ in range(3):
+            _, reward, done, trunc, _ = env.step(1)
+            rewards.append(reward)
+            if done or trunc:
+                break
+
+        assert rewards[-1] <= -1.0
+
 
 class TestRiskManager:
     def test_reject_on_drawdown(self):
@@ -112,6 +167,42 @@ class TestRiskManager:
         rm.reset_daily()
         assert rm._daily_pnl == 0.0
         assert "BTCUSDT" in rm._open_positions
+
+
+class TestRLTrainerSelection:
+    def test_saved_model_path_uses_zip_suffix(self):
+        from models.rl.trainer import RLTrainer
+
+        assert str(RLTrainer._saved_model_path("checkpoints/rl_agent_best")).endswith("rl_agent_best.zip")
+        assert str(RLTrainer._saved_model_path("checkpoints/rl_agent_final.zip")).endswith("rl_agent_final.zip")
+
+    def test_selection_score_penalizes_collapsed_policy(self):
+        from models.rl.trainer import RLTrainer
+
+        features = np.zeros((100, 10), dtype=np.float32)
+        prices = np.linspace(100, 120, 100, dtype=np.float32)
+        trainer = RLTrainer(features, prices)
+
+        collapsed = {
+            "outperformance_vs_bh": -0.008,
+            "total_return": 0.12,
+            "flat_ratio": 0.0,
+            "position_ratio": 1.0,
+            "avg_trades_per_episode": 1.0,
+            "eval_action_entropy": 0.0,
+            "eval_dominant_action_ratio": 1.0,
+        }
+        diversified = {
+            "outperformance_vs_bh": 0.010,
+            "total_return": 0.05,
+            "flat_ratio": 0.35,
+            "position_ratio": 0.65,
+            "avg_trades_per_episode": 6.0,
+            "eval_action_entropy": 0.75,
+            "eval_dominant_action_ratio": 0.55,
+        }
+
+        assert trainer._selection_score(diversified) > trainer._selection_score(collapsed)
 
 
 class TestBacktest:

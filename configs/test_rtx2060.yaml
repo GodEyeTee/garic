@@ -69,14 +69,22 @@ training:
     batch_size: 32            # ลดจาก 64 เพื่อ VRAM
     n_epochs: 5               # ลดจาก 10 เพื่อความเร็ว
 
-    ent_coef: 0.02
+    ent_coef: 0.05
     eval_every_steps: 5000
-    eval_episodes: 2
+    eval_episodes: 4
     opportunity_threshold: 0.0010
-    missed_move_penalty_scale: 160.0
-    server_cost_reward_multiplier: 25.0
-    flat_penalty_after_steps: 8
-    flat_penalty_scale: 0.015
+    missed_move_penalty_scale: 40.0
+    server_cost_reward_multiplier: 6.0
+    flat_penalty_after_steps: 32
+    flat_penalty_scale: 0.002
+    alpha_reward_weight: 0.35
+    net_pnl_reward_weight: 1.00
+    same_position_penalty_after_steps: 96
+    same_position_penalty_scale: 0.003
+    inactive_episode_penalty: 0.75
+    static_position_episode_penalty: 0.25
+    balanced_sampling: true
+    regime_label_threshold: 0.02
 
   # Validation params
   validation:
