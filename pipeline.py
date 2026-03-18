@@ -257,6 +257,7 @@ def train_rl_agent(
         test_ratio=validation_config.get("holdout_test_ratio", 0.20),
         validation_ratio_within_train=validation_config.get("validation_ratio_within_train", 0.10),
     )
+    config["_data_ranges"] = ranges
 
     # OHLCV data สำหรับ realistic intra-candle simulation
     ohlcv_data = config.get("_ohlcv_data")  # passed from pipeline
@@ -334,6 +335,7 @@ def backtest_with_model(
     feature_array: np.ndarray,
     prices: np.ndarray,
     config: dict | None = None,
+    data_ranges: dict[str, tuple[int, int]] | None = None,
 ) -> dict:
     """Run backtest using trained RL model via BacktestRunner.
 
@@ -343,11 +345,13 @@ def backtest_with_model(
     trading_config = (config or {}).get("trading", {})
     validation_config = (config or {}).get("training", {}).get("validation", {})
     min_trade = trading_config.get("min_trade_pct", 0.05)
-    ranges = _compute_data_ranges(
-        len(prices),
-        test_ratio=validation_config.get("holdout_test_ratio", 0.20),
-        validation_ratio_within_train=validation_config.get("validation_ratio_within_train", 0.10),
-    )
+    ranges = data_ranges or (config or {}).get("_data_ranges")
+    if ranges is None:
+        ranges = _compute_data_ranges(
+            len(prices),
+            test_ratio=validation_config.get("holdout_test_ratio", 0.20),
+            validation_ratio_within_train=validation_config.get("validation_ratio_within_train", 0.10),
+        )
     test_start, test_end = ranges["test"]
     fa_eval = feature_array[test_start:test_end]
     pr_eval = prices[test_start:test_end]
@@ -993,7 +997,13 @@ def run_test_pipeline(config_path: str | None = None):
     logger.info("\n>>> Phase 6: Backtest with RL Model")
     t0 = time.time()
     try:
-        bt_result = backtest_with_model(model, feature_array, prices, config)
+        bt_result = backtest_with_model(
+            model,
+            feature_array,
+            prices,
+            config,
+            data_ranges=config.get("_data_ranges"),
+        )
         report["phases"]["6_rl_backtest"] = {
             "status": "OK",
             **bt_result,
@@ -1332,6 +1342,7 @@ def run_training_pipeline(config_path: str | None = None, no_cache: bool = False
             test_ratio=validation_config.get("holdout_test_ratio", 0.20),
             validation_ratio_within_train=validation_config.get("validation_ratio_within_train", 0.10),
         )
+        config["_data_ranges"] = ranges
         logger.info(
             "Dataset split for %s: train=[%d:%d) validation=[%d:%d) test=[%d:%d)",
             symbol,

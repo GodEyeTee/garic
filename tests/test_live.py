@@ -86,6 +86,14 @@ class TestTradingEngine:
         assert engine.paper_mode
         assert engine._last_action == 0.0
 
+    def test_estimate_equity_uses_balance_and_position(self):
+        from execution.live.trading_engine import TradingEngine
+
+        engine = TradingEngine(symbol="BTCUSDT", paper_mode=True)
+        engine.order_manager._paper_balance = 500.0
+        engine.order_manager._paper_position = 2.0
+        assert engine._estimate_equity(100.0) == 700.0
+
     def test_warmup_no_crash(self):
         from execution.live.trading_engine import TradingEngine
         engine = TradingEngine(symbol="BTCUSDT", paper_mode=True, timeframe_seconds=60)

@@ -106,7 +106,7 @@ class TradingEngine:
             logger.info("RiskManager daily state reset for UTC day %s", day_key)
 
     def _estimate_equity(self, price: float) -> float:
-        balance = self._estimate_equity(price)
+        balance = self.order_manager.get_balance()
         if self.paper_mode:
             return float(balance + (self.order_manager.get_position(self.symbol) * price))
         return float(balance)

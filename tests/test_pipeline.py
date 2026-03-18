@@ -1,8 +1,9 @@
 """Tests for pipeline data splitting and aggregation helpers."""
 
+import numpy as np
 import pandas as pd
 
-from pipeline import _aggregate_ohlcv_15m, _compute_data_ranges
+from pipeline import _aggregate_ohlcv_15m, _compute_data_ranges, backtest_with_model
 
 
 class TestPipelineHelpers:
@@ -33,3 +34,12 @@ class TestPipelineHelpers:
         assert agg.iloc[0]["volume"] == 15.0
         assert agg.iloc[1]["open"] == 16
         assert agg.iloc[1]["close"] == 30
+
+    def test_backtest_uses_caller_ranges_when_provided(self):
+        prices = np.linspace(100.0, 200.0, 100, dtype=np.float32)
+        features = np.zeros((100, 30), dtype=np.float32)
+        config = {"trading": {"min_trade_pct": 0.05}, "training": {"validation": {}}}
+        ranges = {"train": (0, 60), "validation": (60, 80), "test": (10, 20)}
+
+        result = backtest_with_model(None, features, prices, config, data_ranges=ranges)
+        assert result["test_range"] == [10, 20]
