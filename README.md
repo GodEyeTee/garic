@@ -180,6 +180,19 @@ Ignored from git:
 - local tool folders
 - markdown files other than this `README.md`
 
+## License
+
+This repository is source-available, not open source.
+
+It is licensed under the custom license in `LICENSE` with these practical rules:
+
+- free use is allowed only for non-commercial use
+- attribution to `GodEyeTee` is always required
+- modification and derivative works are not allowed
+- any commercial or profit-seeking use requires a separate paid license
+
+Read the full terms in the `LICENSE` file before using the code.
+
 ## Disclaimer
 
 This project is experimental and not financial advice. A profitable backtest or training run does not guarantee live profitability.

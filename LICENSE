@@ -1,0 +1,96 @@
+GARIC Source-Available Attribution / No-Derivatives / Commercial License Required
+
+Copyright (c) 2026 GodEyeTee
+All rights reserved.
+
+1. Definitions
+
+"Software" means all source code, configuration, scripts, documentation, examples,
+and other materials in this repository, except materials that are explicitly marked
+as being under a different license.
+
+"Non-Commercial Use" means personal use, study, research, evaluation, testing,
+education, and other uses that do not directly or indirectly generate revenue,
+commercial advantage, business value, client deliverables, paid services, or
+production trading income.
+
+"Commercial Use" means any use that directly or indirectly generates revenue,
+commercial advantage, business value, client work, paid consulting, internal
+business operations, trading for profit, SaaS, subscriptions, monetized content,
+commercial products, or any other for-profit activity.
+
+2. Limited Free License for Non-Commercial Use
+
+Subject to the terms of this License, you are granted a limited, revocable,
+non-exclusive, non-transferable, non-sublicensable license to:
+
+- view the Software;
+- download and run the unmodified Software; and
+- share verbatim, unmodified copies of the Software.
+
+This free license applies only to Non-Commercial Use.
+
+3. Mandatory Attribution
+
+Attribution is required in all permitted cases of use, copying, or sharing.
+You must:
+
+- keep this LICENSE file and all copyright notices intact;
+- clearly credit "GodEyeTee" as the original author; and
+- include a visible reference to the original repository:
+  https://github.com/GodEyeTee/garic
+
+If the Software is used in a public-facing context, the attribution must be
+reasonably visible in accompanying documentation, notices, about pages, or other
+equivalent materials.
+
+4. No Modifications or Derivative Works
+
+You may not, under any circumstance:
+
+- modify, adapt, alter, translate, improve, or create derivative works of the Software;
+- merge the Software into another project in modified form;
+- remove, obscure, or alter attribution or copyright notices; or
+- distribute any modified or derivative version of the Software.
+
+Use of the Software is allowed only in unmodified form unless you have obtained a
+separate written license from the copyright holder.
+
+5. Commercial Use Requires a Separate Paid License
+
+You may not use the Software for any Commercial Use without first obtaining a
+separate written commercial license from the copyright holder.
+
+Any Commercial Use without such a license is prohibited.
+
+For commercial licensing, contact the copyright holder through the GitHub account
+that publishes this repository.
+
+6. No Trademark Rights
+
+This License does not grant any right to use the names, branding, logos, or marks
+of the copyright holder except as strictly necessary for the required attribution.
+
+7. Termination
+
+This License terminates automatically if you violate any term of this License.
+Upon termination, you must immediately stop using the Software and destroy all
+copies in your possession or control, except where applicable law prevents this.
+
+8. Warranty Disclaimer
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT.
+
+9. Limitation of Liability
+
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE COPYRIGHT HOLDER SHALL NOT BE LIABLE
+FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT,
+OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE
+OR OTHER DEALINGS IN THE SOFTWARE.
+
+10. Reservation of Rights
+
+All rights not expressly granted under this License are reserved by the copyright
+holder.
