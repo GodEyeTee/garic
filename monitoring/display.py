@@ -103,6 +103,8 @@ class Dashboard:
             "rl_return": 0, "gross_return": 0, "server_cost_paid": 0,
             "total_server_cost_paid": 0, "avg_trades_per_episode": 0, "eval_episodes": 0,
             "flat_ratio": 0, "position_ratio": 0, "alpha_vs_bh": 0, "avg_reward_sum": 0,
+            "wrong_side_moves": 0, "eval_action_entropy": 0, "eval_dominant_action_ratio": 1,
+            "selection_gate_passed": 1, "selection_best_score": 0,
             "eval_short_actions": 0, "eval_flat_actions": 0, "eval_long_actions": 0,
             "sharpe": 0, "sortino": 0, "max_dd": 0,
             "n_trades": 0, "n_longs": 0, "n_shorts": 0,
@@ -365,9 +367,13 @@ class Dashboard:
         sharpe_color = "green" if d["sharpe"] > 0 else "red"
         dd_mag = abs(d["max_dd"])
         dd_color = "red" if dd_mag > 0.3 else "yellow" if dd_mag > 0.1 else "green"
+        collapsed = (
+            float(d.get("selection_gate_passed", 1)) <= 0
+            or float(d.get("eval_dominant_action_ratio", 0.0)) >= 0.95
+        )
         inactive = d["n_trades"] <= 0 or d["flat_ratio"] >= 0.95
-        status = "INACTIVE" if inactive else "ACTIVE"
-        status_color = "red" if inactive else "green"
+        status = "COLLAPSED" if collapsed else "INACTIVE" if inactive else "ACTIVE"
+        status_color = "red" if collapsed or inactive else "green"
         alpha_color = "green" if alpha > 0 else "red"
 
         perf_text = Text.from_markup(
@@ -383,6 +389,8 @@ class Dashboard:
             f"  {'Sortino':<16} [{sharpe_color}]{d['sortino']:.3f}[/]\n"
             f"  {'Max DD':<16} [{dd_color}]{format_drawdown_pct(d['max_dd'])}[/]\n"
             f"  {'Position Ratio':<16} [cyan]{d['position_ratio']:.1%}[/]\n"
+            f"  {'Action Entropy':<16} [cyan]{d.get('eval_action_entropy', 0.0):.3f}[/]\n"
+            f"  {'Wrong-Side Move':<16} [yellow]{d.get('wrong_side_moves', 0.0):.3f}[/]\n"
             f"  {'Avg Reward/Ep':<16} [magenta]{d['avg_reward_sum']:+.2f}[/]\n"
         )
         res["perf"].update(Panel(perf_text, title="[bold]Performance[/]", box=box.ROUNDED))

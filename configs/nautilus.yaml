@@ -1,0 +1,21 @@
+nautilus:
+  symbol: BTCUSDT
+  instrument_id: BTCUSDT-PERP.BINANCE
+  venue: BINANCE
+  bar_minutes: 15
+  history_bars: 160
+  request_history_days: 3
+  trade_size: "0.002"
+  initial_balance_usdt: 10000.0
+  leverage: 1
+  model_path: checkpoints/rl_agent_supervised.joblib
+  data_path: data/raw/BTCUSDT_1m.parquet
+  state_path: checkpoints/nautilus_dashboard_state.json
+  log_path: nautilus.log
+  dashboard_log_path: nautilus_dashboard.log
+  environment: LIVE
+  api_key_env: BINANCE_API_KEY
+  api_secret_env: BINANCE_API_SECRET
+  close_positions_on_stop: true
+  reduce_only_on_stop: true
+

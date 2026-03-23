@@ -250,84 +250,191 @@ class CryptoMambaForecaster(BaseForecaster):
         batch_size: int = 32,
         max_samples: int = 50_000,
         save_path: str = "checkpoints/crypto_mamba.pt",
+        val_ratio: float = 0.2,
+        patience: int = 5,
     ) -> dict:
-        """Fine-tune on historical data.
+        """Fine-tune on historical data with validation + early stopping.
 
-        สร้าง sliding window dataset จาก price_series (ใช้ข้อมูลล่าสุด max_samples windows).
+        Returns quality metrics including directional accuracy and RMSE vs naive.
         """
         if not self._available:
             return {"error": "PyTorch not available"}
 
-        # Create sliding window dataset
+        # Create sliding window dataset from log returns
         log_returns = np.diff(np.log(price_series.astype(np.float64)))
-        mean_r = log_returns.mean()
-        std_r = max(log_returns.std(), 1e-10)
-        normalized = ((log_returns - mean_r) / std_r).astype(np.float32)
 
         ctx = self.context_len
         h = self.horizon
-        n_total = len(normalized) - ctx - h + 1
+        n_total = len(log_returns) - ctx - h + 1
         if n_total < batch_size:
             return {"error": f"Not enough data: {n_total} < {batch_size}"}
 
-        # Use most recent data only (recent data is more relevant + faster training)
         n_samples = min(n_total, max_samples)
         offset = n_total - n_samples
         logger.info(f"Fine-tune: using {n_samples:,} / {n_total:,} windows (most recent)")
 
-        X = np.array([normalized[offset + i:offset + i + ctx] for i in range(n_samples)])
-        Y = np.array([normalized[offset + i + ctx:offset + i + ctx + h] for i in range(n_samples)])
+        # Build raw windows (per-window normalization — matches predict_batch inference)
+        X_raw = np.array([log_returns[offset + i:offset + i + ctx] for i in range(n_samples)])
+        Y_raw = np.array([log_returns[offset + i + ctx:offset + i + ctx + h] for i in range(n_samples)])
 
-        X_t = torch.tensor(X, dtype=torch.float32).unsqueeze(-1).to(self._device)
-        Y_t = torch.tensor(Y, dtype=torch.float32).to(self._device)
+        # Per-window normalization: each window uses its OWN mean/std
+        # This matches predict_batch exactly — no train/inference mismatch
+        win_means = X_raw.mean(axis=1, keepdims=True)   # (n_samples, 1)
+        win_stds = np.maximum(X_raw.std(axis=1, keepdims=True), 1e-10)
+        X = ((X_raw - win_means) / win_stds).astype(np.float32)
+        Y = ((Y_raw - win_means) / win_stds).astype(np.float32)  # same scale as X
+
+        # Train/validation split (time-ordered, no shuffle)
+        n_val = max(int(n_samples * val_ratio), batch_size)
+        n_train = n_samples - n_val
+        X_train, X_val = X[:n_train], X[n_train:]
+        Y_train, Y_val = Y[:n_train], Y[n_train:]
+
+        # Keep raw stats for accuracy evaluation
+        val_means = win_means[n_train:]
+        val_stds = win_stds[n_train:]
+
+        X_t = torch.tensor(X_train, dtype=torch.float32).unsqueeze(-1).to(self._device)
+        Y_t = torch.tensor(Y_train, dtype=torch.float32).to(self._device)
+        X_v = torch.tensor(X_val, dtype=torch.float32).unsqueeze(-1).to(self._device)
+        Y_v = torch.tensor(Y_val, dtype=torch.float32).to(self._device)
+
+        logger.info(f"Fine-tune split: train={n_train:,} val={n_val:,}")
 
         self._model.train()
         optimizer = torch.optim.AdamW(self._model.parameters(), lr=lr, weight_decay=1e-4)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-        losses = []
+        best_val_loss = float("inf")
+        best_state = None
+        patience_counter = 0
+        train_losses = []
+        val_losses = []
+
         for epoch in range(epochs):
+            # --- Train ---
+            self._model.train()
             epoch_loss = 0.0
             n_batches = 0
-
-            indices = torch.randperm(n_samples)
-            for start in range(0, n_samples - batch_size + 1, batch_size):
+            indices = torch.randperm(n_train)
+            for start in range(0, n_train - batch_size + 1, batch_size):
                 batch_idx = indices[start:start + batch_size]
-                xb = X_t[batch_idx]
-                yb = Y_t[batch_idx]
-
-                pred = self._model(xb)
-                loss = torch.nn.functional.mse_loss(pred, yb)
-
+                pred = self._model(X_t[batch_idx])
+                loss = torch.nn.functional.mse_loss(pred, Y_t[batch_idx])
                 optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self._model.parameters(), 1.0)
                 optimizer.step()
-
                 epoch_loss += loss.item()
                 n_batches += 1
 
             scheduler.step()
-            avg_loss = epoch_loss / max(n_batches, 1)
-            losses.append(avg_loss)
-            logger.info(f"CryptoMamba epoch {epoch + 1}/{epochs}: loss={avg_loss:.6f}, lr={scheduler.get_last_lr()[0]:.2e}")
+            avg_train = epoch_loss / max(n_batches, 1)
+            train_losses.append(avg_train)
+
+            # --- Validate ---
+            self._model.eval()
+            with torch.no_grad():
+                val_pred = self._model(X_v)
+                val_loss = torch.nn.functional.mse_loss(val_pred, Y_v).item()
+            val_losses.append(val_loss)
+
+            logger.info(
+                f"CryptoMamba epoch {epoch + 1}/{epochs}: "
+                f"train_loss={avg_train:.6f} val_loss={val_loss:.6f} lr={scheduler.get_last_lr()[0]:.2e}"
+            )
+
+            # Early stopping on validation loss
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_state = {k: v.clone() for k, v in self._model.state_dict().items()}
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    logger.info(f"Early stopping at epoch {epoch + 1} (patience={patience})")
+                    break
+
+        # Restore best model
+        if best_state is not None:
+            self._model.load_state_dict(best_state)
+        self._model.eval()
+
+        # --- Evaluate accuracy on validation set ---
+        quality = self._evaluate_accuracy(X_val, Y_val, val_stds, val_means)
+        logger.info(
+            "CryptoMamba accuracy: dir_acc=%.1f%% rmse_ratio=%.3f (vs naive) quality=%s",
+            quality["directional_accuracy"] * 100,
+            quality["rmse_ratio_vs_naive"],
+            "GOOD" if quality["better_than_naive"] else "BAD (worse than naive)",
+        )
 
         # Save
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
         torch.save(self._model.state_dict(), save_path)
         logger.info(f"Saved: {save_path}")
 
-        # Clear training tensors from GPU
-        del X_t, Y_t, optimizer, scheduler
+        del X_t, Y_t, X_v, Y_v, optimizer, scheduler
         if self._device != "cpu":
             torch.cuda.empty_cache()
 
-        self._model.eval()
         return {
-            "final_loss": losses[-1],
-            "n_samples": n_samples,
-            "n_epochs": epochs,
+            "final_loss": train_losses[-1],
+            "best_val_loss": best_val_loss,
+            "n_train": n_train,
+            "n_val": n_val,
+            "n_epochs_actual": len(train_losses),
             "save_path": save_path,
+            **quality,
+        }
+
+    def _evaluate_accuracy(
+        self,
+        X_val: np.ndarray,
+        Y_val: np.ndarray,
+        val_stds: np.ndarray,
+        val_means: np.ndarray,
+    ) -> dict:
+        """Evaluate forecast quality on validation data.
+
+        Returns directional accuracy and RMSE ratio vs naive (last-value) baseline.
+        Uses per-window denormalization matching predict_batch behavior.
+        """
+        self._model.eval()
+        x_t = torch.tensor(X_val, dtype=torch.float32).unsqueeze(-1).to(self._device)
+        with torch.no_grad():
+            pred_norm = self._model(x_t).cpu().numpy()
+
+        # Denormalize: per-window stats (matches how training data was normalized)
+        pred_returns = pred_norm * val_stds + val_means
+        true_returns = Y_val * val_stds + val_means
+
+        # Naive baseline: predict zero return (last price = next price)
+        naive_returns = np.zeros_like(true_returns)
+
+        # RMSE
+        rmse_model = float(np.sqrt(np.mean((pred_returns - true_returns) ** 2)))
+        rmse_naive = float(np.sqrt(np.mean((naive_returns - true_returns) ** 2)))
+        rmse_ratio = rmse_model / max(rmse_naive, 1e-10)
+
+        # Directional accuracy: does the model predict the right direction?
+        pred_dir = np.sign(pred_returns[:, 0])
+        true_dir = np.sign(true_returns[:, 0])
+        n_correct = int(np.sum(pred_dir == true_dir))
+        n_total = len(true_dir)
+        dir_acc = n_correct / max(n_total, 1)
+
+        # Multi-step directional accuracy (avg across all horizon steps)
+        all_dir_acc = float(np.mean(np.sign(pred_returns) == np.sign(true_returns)))
+
+        return {
+            "directional_accuracy": float(dir_acc),
+            "multi_step_dir_accuracy": all_dir_acc,
+            "rmse_model": rmse_model,
+            "rmse_naive": rmse_naive,
+            "rmse_ratio_vs_naive": float(rmse_ratio),
+            "better_than_naive": rmse_ratio < 1.0 and dir_acc > 0.50,
+            "n_val_samples": n_total,
         }
 
     def predict_batch(

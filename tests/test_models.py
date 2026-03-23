@@ -119,9 +119,7 @@ class TestRLEnvironment:
             prices,
             max_episode_steps=3,
             monthly_server_cost_usd=0.0,
-            opportunity_threshold=10.0,
-            flat_penalty_after_steps=99,
-            flat_penalty_scale=0.0,
+            opportunity_cost_scale=0.0,
             inactive_episode_penalty=1.0,
         )
 
@@ -134,6 +132,35 @@ class TestRLEnvironment:
                 break
 
         assert rewards[-1] <= -1.0
+
+    def test_wrong_side_gets_negative_reward_right_side_positive(self):
+        """Long in downtrend → negative PnL reward; Short in downtrend → positive."""
+        from models.rl.environment import CryptoFuturesEnv
+
+        prices = np.array([100.0, 99.0, 98.0, 97.0, 96.0], dtype=np.float32)
+        features = np.zeros((len(prices), 4), dtype=np.float32)
+
+        env_long = CryptoFuturesEnv(
+            features, prices, max_episode_steps=3,
+            monthly_server_cost_usd=0.0, pnl_reward_scale=200.0,
+            opportunity_cost_scale=0.0,
+        )
+        env_short = CryptoFuturesEnv(
+            features, prices, max_episode_steps=3,
+            monthly_server_cost_usd=0.0, pnl_reward_scale=200.0,
+            opportunity_cost_scale=0.0,
+        )
+
+        env_long.reset(seed=1)
+        env_short.reset(seed=1)
+        env_long.step(2)   # Long
+        env_short.step(0)  # Short
+        _, reward_long, _, _, _ = env_long.step(2)   # hold long in downtrend
+        _, reward_short, _, _, _ = env_short.step(0)  # hold short in downtrend
+
+        # Short should profit, long should lose in a downtrend
+        assert reward_short > reward_long
+        assert reward_long < 0  # wrong side = negative reward
 
 
 class TestRiskManager:
@@ -203,6 +230,126 @@ class TestRLTrainerSelection:
         }
 
         assert trainer._selection_score(diversified) > trainer._selection_score(collapsed)
+
+    def test_selection_score_rejects_single_action_policy(self):
+        from models.rl.trainer import RLTrainer
+
+        trainer = RLTrainer(np.zeros((100, 4), dtype=np.float32), np.linspace(100, 110, 100, dtype=np.float32))
+        collapsed = {
+            "outperformance_vs_bh": 0.02,
+            "total_return": 0.03,
+            "flat_ratio": 0.0,
+            "position_ratio": 1.0,
+            "avg_trades_per_episode": 1.0,
+            "eval_action_entropy": 0.0,
+            "eval_dominant_action_ratio": 1.0,
+            "wrong_side_moves": 0.0,
+        }
+
+        assert trainer._selection_score(collapsed) == float("-inf")
+
+    def test_relaxed_selection_score_accepts_sparse_noncollapsed_policy(self):
+        from models.rl.trainer import RLTrainer
+
+        trainer = RLTrainer(np.zeros((100, 4), dtype=np.float32), np.linspace(100, 110, 100, dtype=np.float32))
+        sparse = {
+            "outperformance_vs_bh": 0.01,
+            "total_return": 0.01,
+            "flat_ratio": 0.60,
+            "position_ratio": 0.40,
+            "avg_trades_per_episode": 1.0,
+            "eval_action_entropy": 0.01,
+            "eval_dominant_action_ratio": 0.70,
+            "wrong_side_moves": 0.2,
+        }
+
+        assert trainer._selection_score(sparse) == float("-inf")
+        assert np.isfinite(
+            trainer.score_candidate(
+                sparse,
+                min_avg_trades_per_episode=0.5,
+                min_action_entropy=0.005,
+            )
+        )
+
+
+class TestSupervisedFallback:
+    def test_stateful_policy_holds_position_before_min_hold(self):
+        from models.rl.supervised import ACTION_SHORT, SupervisedActionModel
+
+        class DummyClassifier:
+            classes_ = np.array([0, 1, 2], dtype=np.int32)
+
+            def predict_proba(self, x):
+                return np.array([[0.20, 0.70, 0.10]], dtype=np.float32)
+
+        model = SupervisedActionModel(
+            scaler=None,
+            classifier=DummyClassifier(),
+            feature_dim=6,
+            confidence_threshold=0.34,
+            min_hold_steps=16,
+            reversal_margin=0.08,
+            metadata={},
+        )
+        obs = np.array([0, 0, 0, 0, 0, 0, -1.0, 0.0, 0.0, 0.05], dtype=np.float32)
+        action, _ = model.predict(obs)
+
+        assert action == ACTION_SHORT
+
+    def test_extratrees_model_round_trip(self, tmp_path):
+        from models.rl.supervised import SupervisedActionModel, train_supervised_action_model
+
+        n = 320
+        prices = np.concatenate(
+            [
+                np.linspace(100.0, 120.0, 110, dtype=np.float32),
+                np.linspace(120.0, 120.3, 90, dtype=np.float32),
+                np.linspace(120.3, 95.0, 120, dtype=np.float32),
+            ]
+        )
+        horizon = 4
+        future_ret = np.zeros(n, dtype=np.float32)
+        future_ret[:-horizon] = (prices[horizon:] / prices[:-horizon]) - 1.0
+        features = np.column_stack(
+            [
+                future_ret,
+                np.sign(future_ret),
+                future_ret ** 2,
+                np.roll(future_ret, 1),
+                np.roll(future_ret, 2),
+                np.linspace(-1.0, 1.0, n, dtype=np.float32),
+            ]
+        ).astype(np.float32)
+
+        model, meta = train_supervised_action_model(
+            feature_array=features,
+            prices=prices,
+            train_range=(0, 220),
+            validation_range=(220, 300),
+            model_type="extratrees",
+            horizon=horizon,
+            min_return_threshold=0.002,
+            threshold_quantile=0.40,
+            max_train_samples=2000,
+            extra_trees_n_estimators=64,
+            extra_trees_max_depth=8,
+            extra_trees_min_samples_leaf=4,
+            min_hold_steps=12,
+            reversal_margin=0.05,
+        )
+        model.confidence_threshold = 0.30
+        action_before, _ = model.predict(features[240])
+        assert action_before in (0, 1, 2)
+        assert meta["model_type"] == "extratrees"
+
+        saved_path = model.save(tmp_path / "supervised_model.joblib")
+        loaded = SupervisedActionModel.load(saved_path)
+        action_after, _ = loaded.predict(features[240])
+
+        assert action_before == action_after
+        assert loaded.min_hold_steps == 12
+        assert loaded.reversal_margin == pytest.approx(0.05)
 
 
 class TestBacktest:

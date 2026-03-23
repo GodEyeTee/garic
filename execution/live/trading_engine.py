@@ -89,8 +89,13 @@ class TradingEngine:
     def _load_model(self, path: str):
         """Load trained RL model."""
         try:
-            from stable_baselines3 import PPO
-            self._model = PPO.load(path)
+            model_path = Path(path)
+            if model_path.suffix.lower() == ".joblib":
+                from models.rl.supervised import SupervisedActionModel
+                self._model = SupervisedActionModel.load(model_path)
+            else:
+                from stable_baselines3 import PPO
+                self._model = PPO.load(path)
             logger.info(f"Model loaded: {path}")
         except Exception as e:
             logger.error(f"Model load failed: {e}")

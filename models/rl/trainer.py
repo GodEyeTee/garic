@@ -39,6 +39,9 @@ class RLTrainer:
         train_range: tuple[int, int] | None = None,
         eval_range: tuple[int, int] | None = None,
         test_range: tuple[int, int] | None = None,
+        selection_max_dominant_action_ratio: float = 0.95,
+        selection_min_avg_trades_per_episode: float = 2.0,
+        selection_min_action_entropy: float = 0.02,
         **kwargs,
     ):
         self.feature_arrays = feature_arrays
@@ -61,6 +64,9 @@ class RLTrainer:
         self.train_range = self._normalize_range(train_range)
         self.eval_range = self._normalize_range(eval_range or self.train_range)
         self.test_range = self._normalize_range(test_range or self.eval_range)
+        self.selection_max_dominant_action_ratio = float(selection_max_dominant_action_ratio)
+        self.selection_min_avg_trades_per_episode = float(selection_min_avg_trades_per_episode)
+        self.selection_min_action_entropy = float(selection_min_action_entropy)
 
     def _normalize_range(self, segment_range: tuple[int, int] | None) -> tuple[int, int]:
         if self.total_len <= 0:
@@ -178,22 +184,12 @@ class RLTrainer:
             self.periods_per_day,
         )
         logger.info(
-            "Reward shaping: opportunity_threshold=%.6f missed_move_penalty_scale=%.2f "
-            "server_cost_reward_multiplier=%.2f flat_penalty_after_steps=%d flat_penalty_scale=%.4f "
-            "alpha_reward_weight=%.2f net_pnl_reward_weight=%.2f same_position_penalty_after_steps=%d "
-            "same_position_penalty_scale=%.4f inactive_episode_penalty=%.2f "
-            "static_position_episode_penalty=%.2f",
-            float(self.env_kwargs.get("opportunity_threshold", 0.0)),
-            float(self.env_kwargs.get("missed_move_penalty_scale", 0.0)),
-            float(self.env_kwargs.get("server_cost_reward_multiplier", 0.0)),
-            int(self.env_kwargs.get("flat_penalty_after_steps", 0)),
-            float(self.env_kwargs.get("flat_penalty_scale", 0.0)),
-            float(self.env_kwargs.get("alpha_reward_weight", 0.0)),
-            float(self.env_kwargs.get("net_pnl_reward_weight", 0.0)),
-            int(self.env_kwargs.get("same_position_penalty_after_steps", 0)),
-            float(self.env_kwargs.get("same_position_penalty_scale", 0.0)),
-            float(self.env_kwargs.get("inactive_episode_penalty", 0.0)),
-            float(self.env_kwargs.get("static_position_episode_penalty", 0.0)),
+            "Reward v2: pnl_reward_scale=%.1f opportunity_cost_scale=%.1f "
+            "inactive_episode_penalty=%.2f static_position_episode_penalty=%.2f",
+            float(self.env_kwargs.get("pnl_reward_scale", 200.0)),
+            float(self.env_kwargs.get("opportunity_cost_scale", 30.0)),
+            float(self.env_kwargs.get("inactive_episode_penalty", 3.0)),
+            float(self.env_kwargs.get("static_position_episode_penalty", 1.0)),
         )
         logger.info(
             "Dataset ranges: train=[%d:%d) validation=[%d:%d) test=[%d:%d)",
@@ -213,6 +209,13 @@ class RLTrainer:
             int(sampling_stats.get("down_count", 0)),
             int(sampling_stats.get("flat_count", 0)),
             int(sampling_stats.get("up_count", 0)),
+        )
+        logger.info(
+            "Checkpoint gates: max_dominant_action_ratio=%.2f min_avg_trades_per_episode=%.2f "
+            "min_action_entropy=%.3f",
+            self.selection_max_dominant_action_ratio,
+            self.selection_min_avg_trades_per_episode,
+            self.selection_min_action_entropy,
         )
 
         # Custom callback: update dashboard + checkpoint
@@ -351,7 +354,7 @@ class RLTrainer:
                         float(metrics.get("eval_action_entropy", 0.0)),
                         float(metrics.get("eval_dominant_action_ratio", 0.0) * 100.0),
                     )
-                    if score > self.best_score:
+                    if np.isfinite(score) and score > self.best_score:
                         self.best_score = score
                         self.best_base_path = self.save_path / "rl_agent_best"
                         self.model.save(str(self.best_base_path))
@@ -373,9 +376,15 @@ class RLTrainer:
                                eval_eps=eval_episodes)
         model.learn(total_timesteps=total_timesteps, callback=cb)
 
-        if cb.best_path is not None and cb.best_path.exists():
+        selection_gate_passed = cb.best_path is not None and cb.best_path.exists()
+        if selection_gate_passed:
             logger.info("Loading best checkpoint -> %s", cb.best_path)
             model = PPO.load(str(cb.best_path), env=env)
+        else:
+            logger.warning(
+                "No checkpoint passed selection gates; keeping final in-memory model. "
+                "Training likely remained collapsed."
+            )
 
         final_path = self.checkpoint_dir / "rl_agent_final"
         model.save(str(final_path))
@@ -383,6 +392,8 @@ class RLTrainer:
 
         # === Multi-episode eval ===
         metrics = self._eval_multi_episode(model, n_episodes=10, segment_range=self.test_range)
+        metrics["selection_gate_passed"] = 1.0 if selection_gate_passed else 0.0
+        metrics["selection_best_score"] = float(cb.best_score) if np.isfinite(cb.best_score) else float("-inf")
         logger.info(f"Eval ({10} episodes avg): {metrics}")
 
         # === Save chart ===
@@ -390,32 +401,72 @@ class RLTrainer:
 
         return metrics
 
-    def _selection_score(self, metrics: dict) -> float:
+    def score_candidate(
+        self,
+        metrics: dict,
+        *,
+        max_dominant_action_ratio: float | None = None,
+        min_avg_trades_per_episode: float | None = None,
+        min_action_entropy: float | None = None,
+    ) -> float:
         """Prefer positive alpha and penalize action-collapse policies."""
         alpha = float(metrics.get("outperformance_vs_bh", 0.0))
         net_return = float(metrics.get("total_return", 0.0))
+        gross_return = float(metrics.get("gross_total_return", net_return))
         flat_ratio = float(metrics.get("flat_ratio", 1.0))
         position_ratio = float(metrics.get("position_ratio", 0.0))
         avg_trades = float(metrics.get("avg_trades_per_episode", 0.0))
         action_entropy = float(metrics.get("eval_action_entropy", 0.0))
         dominant_action_ratio = float(metrics.get("eval_dominant_action_ratio", 1.0))
+        wrong_side_moves = float(metrics.get("wrong_side_moves", 0.0))
 
-        collapse_penalty = max(dominant_action_ratio - 0.85, 0.0) * 1.75
-        collapse_penalty += max(position_ratio - 0.90, 0.0) * 1.00
-        collapse_penalty += max(flat_ratio - 0.95, 0.0) * 0.75
+        max_dominant_action_ratio = (
+            self.selection_max_dominant_action_ratio
+            if max_dominant_action_ratio is None
+            else float(max_dominant_action_ratio)
+        )
+        min_avg_trades_per_episode = (
+            self.selection_min_avg_trades_per_episode
+            if min_avg_trades_per_episode is None
+            else float(min_avg_trades_per_episode)
+        )
+        min_action_entropy = (
+            self.selection_min_action_entropy
+            if min_action_entropy is None
+            else float(min_action_entropy)
+        )
 
-        trade_bonus = min(avg_trades, 12.0) * 0.005
-        trade_floor_penalty = max(2.0 - avg_trades, 0.0) * 0.05
-        loss_penalty = max(-net_return, 0.0) * 4.0
+        if dominant_action_ratio > max_dominant_action_ratio:
+            return float("-inf")
+        if avg_trades < min_avg_trades_per_episode:
+            return float("-inf")
+        if action_entropy < min_action_entropy:
+            return float("-inf")
+        # Hard gate: reject models that lose more than 10% net
+        if net_return < -0.10:
+            return float("-inf")
+
+        collapse_penalty = max(dominant_action_ratio - 0.75, 0.0) * 2.0
+        collapse_penalty += max(flat_ratio - 0.90, 0.0) * 1.5
+
+        trade_bonus = min(avg_trades, 12.0) * 0.01
+        turnover_penalty = max(avg_trades - 32.0, 0.0) * 0.010
+        loss_penalty = max(-net_return, 0.0) * 8.0
+        # Reward profitability heavily
+        profit_bonus = max(net_return, 0.0) * 10.0
         return (
-            alpha * 5.0
-            + net_return * 3.0
-            + action_entropy * 0.10
+            alpha * 6.0
+            + net_return * 5.0
+            + profit_bonus
+            + action_entropy * 0.15
             + trade_bonus
             - collapse_penalty
-            - trade_floor_penalty
+            - turnover_penalty
             - loss_penalty
         )
+
+    def _selection_score(self, metrics: dict) -> float:
+        return self.score_candidate(metrics)
 
     def _eval_multi_episode(
         self,
@@ -430,6 +481,7 @@ class RLTrainer:
         bh_eval_returns = []
         server_costs = []
         missed_moves = []
+        wrong_side_moves = []
         reward_sums = []
         total_action_counts = {0: 0, 1: 0, 2: 0}
         active_range = self._normalize_range(segment_range or self.test_range)
@@ -457,6 +509,7 @@ class RLTrainer:
                 bh_eval_returns.append(0.0)
             server_costs.append(float(m.get("server_cost_paid", 0.0)))
             missed_moves.append(float(m.get("missed_moves", 0.0)))
+            wrong_side_moves.append(float(m.get("wrong_side_moves", 0.0)))
             reward_sums.append(float(np.sum(rewards)))
             for key, value in action_counts.items():
                 total_action_counts[key] = total_action_counts.get(key, 0) + int(value)
@@ -464,7 +517,7 @@ class RLTrainer:
                 logger.info(
                     "Eval episode %d/%d: start=%d steps=%d net=%.4f gross=%.4f dd=%.4f trades=%d "
                     "win_rate=%.2f%% flat_ratio=%.2f%% pos_ratio=%.2f%% server_cost=$%.2f "
-                    "missed_moves=%.4f actions={short:%d, flat:%d, long:%d} reward_sum=%.4f",
+                    "missed_moves=%.4f wrong_side_moves=%.4f actions={short:%d, flat:%d, long:%d} reward_sum=%.4f",
                     ep + 1,
                     n_episodes,
                     env._start,
@@ -478,6 +531,7 @@ class RLTrainer:
                     float(m.get("position_ratio", 0.0) * 100.0),
                     float(m.get("server_cost_paid", 0.0)),
                     float(m.get("missed_moves", 0.0)),
+                    float(m.get("wrong_side_moves", 0.0)),
                     int(action_counts.get(0, 0)),
                     int(action_counts.get(1, 0)),
                     int(action_counts.get(2, 0)),
@@ -503,6 +557,8 @@ class RLTrainer:
         avg["total_server_cost_paid"] = float(np.sum(server_costs)) if server_costs else 0.0
         avg["missed_moves"] = float(np.mean(missed_moves)) if missed_moves else 0.0
         avg["total_missed_moves"] = float(np.sum(missed_moves)) if missed_moves else 0.0
+        avg["wrong_side_moves"] = float(np.mean(wrong_side_moves)) if wrong_side_moves else 0.0
+        avg["total_wrong_side_moves"] = float(np.sum(wrong_side_moves)) if wrong_side_moves else 0.0
         avg["outperformance_vs_bh"] = float(avg.get("total_return", 0.0) - avg["bh_eval_return"])
         avg["avg_reward_sum"] = float(np.mean(reward_sums)) if reward_sums else 0.0
         avg["eval_short_actions"] = float(total_action_counts.get(0, 0))
@@ -521,6 +577,8 @@ class RLTrainer:
             ], dtype=np.float64) / total_actions
             nonzero_probs = action_probs[action_probs > 0]
             entropy = float(-np.sum(nonzero_probs * np.log(nonzero_probs)) / np.log(3.0))
+            if abs(entropy) < 1e-12:
+                entropy = 0.0
             dominant_idx = int(np.argmax(action_probs))
             dominant_ratio = float(np.max(action_probs))
         else:
@@ -533,7 +591,8 @@ class RLTrainer:
         logger.info(
             "Eval aggregate [%d:%d): net=%.4f gross=%.4f dd=%.4f trades=%d win_rate=%.2f%% "
             "flat_ratio=%.2f%% pos_ratio=%.2f%% avg_server_cost=$%.2f total_server_cost=$%.2f "
-            "avg_missed_moves=%.4f bh_eval=%.4f alpha=%.4f action_entropy=%.3f dominant_action=%d dominant_ratio=%.2f%%",
+            "avg_missed_moves=%.4f avg_wrong_side_moves=%.4f bh_eval=%.4f alpha=%.4f "
+            "action_entropy=%.3f dominant_action=%d dominant_ratio=%.2f%%",
             int(active_range[0]),
             int(active_range[1]),
             float(avg.get("total_return", 0.0)),
@@ -546,6 +605,7 @@ class RLTrainer:
             float(avg.get("server_cost_paid", 0.0)),
             float(avg.get("total_server_cost_paid", 0.0)),
             float(avg.get("missed_moves", 0.0)),
+            float(avg.get("wrong_side_moves", 0.0)),
             float(avg.get("bh_eval_return", 0.0)),
             float(avg.get("outperformance_vs_bh", 0.0)),
             float(avg.get("eval_action_entropy", 0.0)),

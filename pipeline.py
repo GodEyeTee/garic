@@ -190,6 +190,137 @@ def _compute_data_ranges(
     }
 
 
+def _build_nautilus_frame(
+    prices: np.ndarray,
+    ohlcv_data: np.ndarray | None = None,
+    timestamps: np.ndarray | None = None,
+) -> pd.DataFrame:
+    n = len(prices)
+    if timestamps is None or len(timestamps) != n:
+        timestamps = pd.date_range("2020-01-01", periods=n, freq="15min", tz="UTC")
+    else:
+        timestamps = pd.to_datetime(timestamps, utc=True)
+
+    if ohlcv_data is not None and len(ohlcv_data) == n:
+        ohlcv = np.asarray(ohlcv_data, dtype=np.float64)
+        open_col = ohlcv[:, 0]
+        high_col = ohlcv[:, 1]
+        low_col = ohlcv[:, 2]
+        close_col = ohlcv[:, 3]
+        volume_col = ohlcv[:, 4] if ohlcv.shape[1] >= 5 else np.ones(n, dtype=np.float64)
+    else:
+        close_col = np.asarray(prices, dtype=np.float64)
+        open_col = close_col.copy()
+        high_col = close_col.copy()
+        low_col = close_col.copy()
+        volume_col = np.ones(n, dtype=np.float64)
+
+    frame = pd.DataFrame(
+        {
+            "open_time": timestamps,
+            "open": open_col,
+            "high": high_col,
+            "low": low_col,
+            "close": close_col,
+            "volume": volume_col,
+        }
+    )
+    return frame.reset_index(drop=True)
+
+
+def _score_nautilus_summary(
+    summary: dict,
+    *,
+    min_trades: float = 1.0,
+    max_dominant_action_ratio: float = 0.995,
+) -> float:
+    if summary.get("error"):
+        return float("-inf")
+
+    trades = float(summary.get("n_trades", 0.0))
+    net_return = float(summary.get("total_return", 0.0))
+    alpha = float(summary.get("outperformance_vs_bh", 0.0))
+    win_rate = float(summary.get("win_rate", 0.0))
+    flat_ratio = float(summary.get("flat_ratio", 1.0))
+    dominant_ratio = float(summary.get("eval_dominant_action_ratio", 1.0))
+    action_entropy = float(summary.get("eval_action_entropy", 0.0))
+    max_drawdown = abs(float(summary.get("max_drawdown", 0.0)))
+
+    if trades < min_trades:
+        return float("-inf")
+    if dominant_ratio > max_dominant_action_ratio and trades <= (min_trades + 1.0):
+        return float("-inf")
+    # Reject models that lose more than 10%
+    if net_return < -0.10:
+        return float("-inf")
+
+    # Reward profitability heavily
+    profit_bonus = max(net_return, 0.0) * 10.0
+    return (
+        alpha * 6.0
+        + net_return * 5.0
+        + profit_bonus
+        + win_rate * 0.50
+        + min(trades, 16.0) * 0.01
+        + action_entropy * 0.20
+        - max(flat_ratio - 0.95, 0.0) * 2.0
+        - max(dominant_ratio - 0.85, 0.0) * 1.5
+        - max(max_drawdown - 0.15, 0.0) * 2.0
+    )
+
+
+def _run_nautilus_backtest_segment(
+    *,
+    model_path: str,
+    frame_15m: pd.DataFrame,
+    segment_range: tuple[int, int],
+    config: dict,
+    label: str,
+) -> dict:
+    from execution.nautilus.backtest_runner import run_backtest_frame
+
+    start, end = int(segment_range[0]), int(segment_range[1])
+    segment = frame_15m.iloc[start:end].reset_index(drop=True)
+    if len(segment) < 128:
+        raise ValueError(f"Nautilus {label} segment too short: {len(segment)} bars")
+
+    training_config = config.get("training", {})
+    nav_config = training_config.get("nautilus_validation", {})
+    trading_config = config.get("trading", {})
+    symbol = str(config.get("_active_symbol") or config.get("data", {}).get("pairs", ["BTCUSDT"])[0])
+    initial_balance = float(nav_config.get("initial_balance_usdt", 10_000.0))
+    leverage = float(nav_config.get("leverage", trading_config.get("leverage", 1.0)))
+    trade_size_pct = float(nav_config.get("trade_size_pct_of_equity", 1.0))
+    first_price = float(segment["close"].iloc[0])
+    trade_qty = max((initial_balance * trade_size_pct) / max(first_price, 1e-9), 1e-6)
+    state_name = f"nautilus_{label}_{Path(model_path).stem}.json"
+    state_path = str(Path("checkpoints") / state_name)
+
+    summary = run_backtest_frame(
+        segment,
+        symbol=symbol,
+        model_path=model_path,
+        venue=str(nav_config.get("venue", "BINANCE")),
+        bar_minutes=int(nav_config.get("bar_minutes", 15)),
+        history_bars=int(nav_config.get("history_bars", 160)),
+        request_history_days=int(nav_config.get("request_history_days", 3)),
+        trade_size=f"{trade_qty:.12f}",
+        initial_balance_usdt=initial_balance,
+        leverage=leverage,
+        state_path=state_path,
+        mode=f"train_{label}",
+        close_positions_on_stop=True,
+        reduce_only_on_stop=True,
+        monthly_server_cost_usd=float(trading_config.get("monthly_server_cost_usd", 100.0)),
+        periods_per_day=int(trading_config.get("periods_per_day", 96)),
+    )
+    summary["segment_label"] = label
+    summary["segment_range"] = [start, end]
+    summary["trade_size_qty"] = float(trade_qty)
+    summary["trade_size_notional_usdt"] = float(trade_qty * first_price)
+    return summary
+
+
 # =============================================================================
 # Phase 4: MoE Routing
 # =============================================================================
@@ -231,6 +362,7 @@ def train_rl_agent(
     feature_array: np.ndarray,
     prices: np.ndarray,
     config: dict,
+    dashboard=None,
 ) -> tuple[object | None, dict]:
     """Train RL agent with PPO. Returns (model, metrics)."""
     training_config = config.get("training", {})
@@ -239,9 +371,12 @@ def train_rl_agent(
     total_timesteps = rl_config.get("total_timesteps", 10000)
     learning_rate = rl_config.get("learning_rate", 3e-4)
     n_steps = rl_config.get("n_steps", 512)
+    max_episode_steps = int(rl_config.get("max_episode_steps", n_steps))
     batch_size = rl_config.get("batch_size", 32)
     n_epochs = rl_config.get("n_epochs", 5)
     algo = rl_config.get("algo", "PPO")
+    supervised_config = training_config.get("supervised_fallback", {})
+    eval_episodes = rl_config.get("eval_episodes", 8)
 
     try:
         from models.rl.trainer import RLTrainer
@@ -272,25 +407,25 @@ def train_rl_agent(
         leverage=trading_config.get("leverage", 1.0),
         min_trade_pct=trading_config.get("min_trade_pct", 0.02),
         maintenance_margin=trading_config.get("maintenance_margin", 0.005),
+        funding_interval=rl_config.get("funding_interval", 32),
+        max_episode_steps=max_episode_steps,
         monthly_server_cost_usd=trading_config.get("monthly_server_cost_usd", 100.0),
         periods_per_day=trading_config.get("periods_per_day", 96),
-        opportunity_threshold=rl_config.get("opportunity_threshold", 0.0010),
-        missed_move_penalty_scale=rl_config.get("missed_move_penalty_scale", 40.0),
-        server_cost_reward_multiplier=rl_config.get("server_cost_reward_multiplier", 6.0),
-        flat_penalty_after_steps=rl_config.get("flat_penalty_after_steps", 32),
-        flat_penalty_scale=rl_config.get("flat_penalty_scale", 0.002),
-        alpha_reward_weight=rl_config.get("alpha_reward_weight", 0.35),
-        net_pnl_reward_weight=rl_config.get("net_pnl_reward_weight", 1.00),
-        same_position_penalty_after_steps=rl_config.get("same_position_penalty_after_steps", 96),
-        same_position_penalty_scale=rl_config.get("same_position_penalty_scale", 0.003),
-        inactive_episode_penalty=rl_config.get("inactive_episode_penalty", 0.75),
-        static_position_episode_penalty=rl_config.get("static_position_episode_penalty", 0.25),
+        pnl_reward_scale=rl_config.get("pnl_reward_scale", 200.0),
+        opportunity_cost_scale=rl_config.get("opportunity_cost_scale", 30.0),
+        inactive_episode_penalty=rl_config.get("inactive_episode_penalty", 3.0),
+        static_position_episode_penalty=rl_config.get("static_position_episode_penalty", 1.0),
         balanced_sampling=rl_config.get("balanced_sampling", True),
         regime_label_threshold=rl_config.get("regime_label_threshold", 0.02),
+        selection_max_dominant_action_ratio=rl_config.get("selection_max_dominant_action_ratio", 0.95),
+        selection_min_avg_trades_per_episode=rl_config.get("selection_min_avg_trades_per_episode", 2.0),
+        selection_min_action_entropy=rl_config.get("selection_min_action_entropy", 0.02),
         train_range=ranges["train"],
         eval_range=ranges["validation"],
         test_range=ranges["test"],
     )
+    if dashboard is not None:
+        trainer._dashboard = dashboard
 
     logger.info(f"Training {algo}: {total_timesteps} steps, lr={learning_rate}, "
                 f"batch={batch_size}, n_steps={n_steps}")
@@ -314,24 +449,334 @@ def train_rl_agent(
         n_epochs=n_epochs,
         ent_coef=rl_config.get("ent_coef", 0.08),
         eval_every_steps=rl_config.get("eval_every_steps", 50000),
-        eval_episodes=rl_config.get("eval_episodes", 8),
+        eval_episodes=eval_episodes,
     )
 
     _log_gpu_memory()
 
     # Load trained model for backtesting
-    model = None
-    model_path = Path("checkpoints/rl_agent_final.zip")
-    if model_path.exists():
+    ppo_model = None
+    selected_model = None
+    ppo_model_path = Path("checkpoints/rl_agent_final.zip")
+    if ppo_model_path.exists():
         try:
             from stable_baselines3 import PPO, SAC
             ModelClass = PPO if algo == "PPO" else SAC
-            model = ModelClass.load(str(model_path))
+            ppo_model = ModelClass.load(str(ppo_model_path))
             logger.info("Loaded trained model for evaluation")
         except Exception as e:
             logger.warning(f"Could not load model: {e}")
+    selected_model = ppo_model
+    selected_metrics = dict(metrics)
+    selected_metrics["model_family"] = "ppo"
+    selected_metrics["model_path"] = str(ppo_model_path).replace("\\", "/")
+    candidate_records: list[dict] = []
 
-    return model, metrics
+    ppo_validation_score = float("-inf")
+    ppo_validation_metrics = None
+    if ppo_model is not None:
+        ppo_validation_metrics = trainer._eval_multi_episode(
+            ppo_model,
+            n_episodes=eval_episodes,
+            segment_range=ranges["validation"],
+            log_episodes=False,
+        )
+        ppo_validation_score = trainer._selection_score(ppo_validation_metrics)
+        logger.info(
+            "PPO validation selection: score=%s alpha=%.4f net=%.4f trades=%.1f dominant_ratio=%.2f%%",
+            f"{ppo_validation_score:.4f}" if np.isfinite(ppo_validation_score) else "-inf",
+            float(ppo_validation_metrics.get("outperformance_vs_bh", 0.0)),
+            float(ppo_validation_metrics.get("total_return", 0.0)),
+            float(ppo_validation_metrics.get("avg_trades_per_episode", 0.0)),
+            float(ppo_validation_metrics.get("eval_dominant_action_ratio", 0.0) * 100.0),
+        )
+        candidate_records.append(
+            {
+                "family": "ppo",
+                "model": ppo_model,
+                "model_path": str(ppo_model_path).replace("\\", "/"),
+                "display_metrics": dict(selected_metrics),
+                "env_validation_score": float(ppo_validation_score),
+                "env_validation_metrics": dict(ppo_validation_metrics),
+            }
+        )
+
+    if supervised_config.get("enabled", True):
+        try:
+            from models.rl.supervised import train_supervised_action_model
+
+            confidence_grid = supervised_config.get("confidence_grid", [0.34, 0.38, 0.42, 0.46, 0.50])
+            model_types = supervised_config.get("model_types", ["logreg", "extratrees"])
+            if isinstance(model_types, str):
+                model_types = [model_types]
+
+            relaxed_min_avg_trades = float(
+                supervised_config.get("relaxed_min_avg_trades_per_episode", 0.5)
+            )
+            relaxed_max_dominant_ratio = float(
+                supervised_config.get("relaxed_max_dominant_action_ratio", 0.985)
+            )
+            relaxed_min_action_entropy = float(
+                supervised_config.get("relaxed_min_action_entropy", 0.0)
+            )
+
+            sup_best_model = None
+            sup_best_meta = None
+            sup_best_conf = None
+            sup_best_score = float("-inf")
+            sup_best_priority = -1
+            sup_best_mode = "strict"
+
+            for model_type in model_types:
+                sup_model, sup_meta = train_supervised_action_model(
+                    feature_array=feature_array,
+                    prices=prices,
+                    train_range=ranges["train"],
+                    validation_range=ranges["validation"],
+                    model_type=model_type,
+                    horizon=supervised_config.get("horizon", 16),
+                    min_return_threshold=supervised_config.get("min_return_threshold", 0.003),
+                    threshold_quantile=supervised_config.get("threshold_quantile", 0.65),
+                    max_train_samples=supervised_config.get("max_train_samples", 120_000),
+                    logistic_c=supervised_config.get("logistic_c", 1.0),
+                    extra_trees_n_estimators=supervised_config.get("extra_trees_n_estimators", 160),
+                    extra_trees_max_depth=supervised_config.get("extra_trees_max_depth", 12),
+                    extra_trees_min_samples_leaf=supervised_config.get("extra_trees_min_samples_leaf", 32),
+                    min_hold_steps=supervised_config.get("min_hold_steps", 16),
+                    reversal_margin=supervised_config.get("reversal_margin", 0.08),
+                    random_state=training_config.get("seed", 42),
+                )
+
+                for confidence in confidence_grid:
+                    sup_model.confidence_threshold = float(confidence)
+                    sup_val_metrics = trainer._eval_multi_episode(
+                        sup_model,
+                        n_episodes=eval_episodes,
+                        segment_range=ranges["validation"],
+                        log_episodes=False,
+                    )
+                    strict_score = trainer.score_candidate(sup_val_metrics)
+                    relaxed_score = trainer.score_candidate(
+                        sup_val_metrics,
+                        max_dominant_action_ratio=relaxed_max_dominant_ratio,
+                        min_avg_trades_per_episode=relaxed_min_avg_trades,
+                        min_action_entropy=relaxed_min_action_entropy,
+                    )
+                    logger.info(
+                        "Supervised validation: model=%s conf=%.2f strict=%s relaxed=%s alpha=%.4f net=%.4f trades=%.1f dominant_ratio=%.2f%%",
+                        model_type,
+                        float(confidence),
+                        f"{strict_score:.4f}" if np.isfinite(strict_score) else "-inf",
+                        f"{relaxed_score:.4f}" if np.isfinite(relaxed_score) else "-inf",
+                        float(sup_val_metrics.get("outperformance_vs_bh", 0.0)),
+                        float(sup_val_metrics.get("total_return", 0.0)),
+                        float(sup_val_metrics.get("avg_trades_per_episode", 0.0)),
+                        float(sup_val_metrics.get("eval_dominant_action_ratio", 0.0) * 100.0),
+                    )
+                    candidate_mode = None
+                    candidate_score = float("-inf")
+                    candidate_priority = -1
+                    if np.isfinite(strict_score):
+                        candidate_mode = "strict"
+                        candidate_score = float(strict_score)
+                        candidate_priority = 1
+                    elif np.isfinite(relaxed_score):
+                        candidate_mode = "relaxed"
+                        candidate_score = float(relaxed_score)
+                        candidate_priority = 0
+
+                    if candidate_mode is not None and (
+                        candidate_score > sup_best_score
+                        or (np.isclose(candidate_score, sup_best_score) and candidate_priority > sup_best_priority)
+                    ):
+                        sup_best_model = sup_model
+                        sup_best_meta = dict(sup_meta)
+                        sup_best_conf = float(confidence)
+                        sup_best_score = float(candidate_score)
+                        sup_best_priority = int(candidate_priority)
+                        sup_best_mode = str(candidate_mode)
+
+            if sup_best_model is not None and sup_best_conf is not None:
+                sup_best_model.confidence_threshold = float(sup_best_conf)
+                supervised_path = sup_best_model.save("checkpoints/rl_agent_supervised.joblib")
+                supervised_metrics = None
+                logger.info(
+                    "Saved supervised fallback -> %s (mode=%s confidence=%.2f validation_score=%s)",
+                    supervised_path,
+                    sup_best_mode,
+                    float(sup_best_conf),
+                    f"{sup_best_score:.4f}" if np.isfinite(sup_best_score) else "-inf",
+                )
+
+                use_supervised = False
+                if np.isfinite(sup_best_score):
+                    use_supervised = (not np.isfinite(ppo_validation_score)) or (sup_best_score > ppo_validation_score)
+                if not np.isfinite(ppo_validation_score) and np.isfinite(sup_best_score):
+                    use_supervised = True
+
+                if use_supervised:
+                    supervised_metrics = trainer._eval_multi_episode(
+                        sup_best_model,
+                        n_episodes=10,
+                        segment_range=ranges["test"],
+                        log_episodes=True,
+                    )
+                    trainer._save_chart(sup_best_model, supervised_metrics)
+                    supervised_metrics["selection_gate_passed"] = 1.0
+                    supervised_metrics["selection_best_score"] = float(sup_best_score)
+                    supervised_metrics["model_family"] = f"supervised_{sup_best_meta.get('model_type', 'fallback')}"
+                    supervised_metrics["model_path"] = str(supervised_path).replace("\\", "/")
+                    supervised_metrics["supervised_confidence_threshold"] = float(sup_best_conf)
+                    supervised_metrics["supervised_label_threshold"] = float(sup_best_meta.get("label_threshold", 0.0))
+                    supervised_metrics["supervised_model_type"] = str(sup_best_meta.get("model_type", "fallback"))
+                    supervised_metrics["selection_mode"] = sup_best_mode
+                    logger.info(
+                        "Using supervised fallback model: mode=%s validation_score=%s ppo_validation_score=%s",
+                        sup_best_mode,
+                        f"{sup_best_score:.4f}" if np.isfinite(sup_best_score) else "-inf",
+                        f"{ppo_validation_score:.4f}" if np.isfinite(ppo_validation_score) else "-inf",
+                    )
+                    selected_model = sup_best_model
+                    selected_metrics = supervised_metrics
+                else:
+                    logger.info(
+                        "Keeping PPO model: best supervised mode=%s score=%s ppo validation score=%s",
+                        sup_best_mode,
+                        f"{sup_best_score:.4f}" if np.isfinite(sup_best_score) else "-inf",
+                        f"{ppo_validation_score:.4f}" if np.isfinite(ppo_validation_score) else "-inf",
+                    )
+                candidate_records.append(
+                    {
+                        "family": f"supervised_{sup_best_meta.get('model_type', 'fallback')}",
+                        "model": sup_best_model,
+                        "model_path": str(supervised_path).replace("\\", "/"),
+                        "display_metrics": dict(supervised_metrics) if supervised_metrics is not None else None,
+                        "env_validation_score": float(sup_best_score),
+                        "env_validation_metrics": None,
+                        "selection_mode": sup_best_mode,
+                        "supervised_confidence_threshold": float(sup_best_conf),
+                        "supervised_label_threshold": float(sup_best_meta.get("label_threshold", 0.0)),
+                        "supervised_model_type": str(sup_best_meta.get("model_type", "fallback")),
+                    }
+                )
+        except Exception as e:
+            logger.exception("Supervised fallback training failed: %s", e)
+
+    nautilus_config = training_config.get("nautilus_validation", {})
+    nautilus_enabled = bool(nautilus_config.get("enabled", False))
+    if nautilus_enabled and candidate_records:
+        frame_15m = config.get("_nautilus_frame")
+        if not isinstance(frame_15m, pd.DataFrame) or len(frame_15m) != len(prices):
+            logger.warning(
+                "Nautilus validation enabled but no aligned 15m frame is available; skipping realistic selection."
+            )
+        else:
+            min_trades = float(nautilus_config.get("selection_min_trades", 1.0))
+            max_dom = float(nautilus_config.get("selection_max_dominant_action_ratio", 0.995))
+            use_for_selection = bool(nautilus_config.get("use_for_model_selection", True))
+            evaluate_final_test = bool(nautilus_config.get("evaluate_final_test", True))
+            best_candidate = None
+            best_nautilus_score = float("-inf")
+
+            for candidate in candidate_records:
+                try:
+                    validation_summary = _run_nautilus_backtest_segment(
+                        model_path=candidate["model_path"],
+                        frame_15m=frame_15m,
+                        segment_range=ranges["validation"],
+                        config=config,
+                        label=f"validation_{candidate['family']}",
+                    )
+                    validation_score = _score_nautilus_summary(
+                        validation_summary,
+                        min_trades=min_trades,
+                        max_dominant_action_ratio=max_dom,
+                    )
+                    candidate["nautilus_validation"] = validation_summary
+                    candidate["nautilus_validation_score"] = float(validation_score)
+                    logger.info(
+                        "Nautilus validation: family=%s score=%s net=%.4f gross=%.4f alpha=%.4f "
+                        "trades=%d dominant_ratio=%.2f%%",
+                        candidate["family"],
+                        f"{validation_score:.4f}" if np.isfinite(validation_score) else "-inf",
+                        float(validation_summary.get("total_return", 0.0)),
+                        float(validation_summary.get("gross_total_return", 0.0)),
+                        float(validation_summary.get("outperformance_vs_bh", 0.0)),
+                        int(validation_summary.get("n_trades", 0)),
+                        float(validation_summary.get("eval_dominant_action_ratio", 0.0) * 100.0),
+                    )
+                    if np.isfinite(validation_score) and validation_score > best_nautilus_score:
+                        best_nautilus_score = float(validation_score)
+                        best_candidate = candidate
+                except Exception as exc:
+                    candidate["nautilus_validation"] = {"error": str(exc)}
+                    candidate["nautilus_validation_score"] = float("-inf")
+                    logger.warning(
+                        "Nautilus validation failed for %s: %s",
+                        candidate["family"],
+                        exc,
+                    )
+
+            if best_candidate is not None:
+                logger.info(
+                    "Best Nautilus candidate: family=%s score=%.4f use_for_selection=%s",
+                    best_candidate["family"],
+                    float(best_nautilus_score),
+                    use_for_selection,
+                )
+                if use_for_selection and best_candidate["model"] is not None:
+                    selected_model = best_candidate["model"]
+                    if best_candidate.get("display_metrics") is None:
+                        selected_metrics = trainer._eval_multi_episode(
+                            best_candidate["model"],
+                            n_episodes=10,
+                            segment_range=ranges["test"],
+                            log_episodes=True,
+                        )
+                        if str(best_candidate["family"]).startswith("supervised_"):
+                            trainer._save_chart(best_candidate["model"], selected_metrics)
+                    else:
+                        selected_metrics = dict(best_candidate["display_metrics"])
+                    selected_metrics["model_family"] = str(best_candidate["family"])
+                    selected_metrics["model_path"] = str(best_candidate["model_path"])
+                    selected_metrics["selection_engine"] = "nautilus_validation"
+                    logger.info(
+                        "Selecting final model using Nautilus validation -> %s",
+                        best_candidate["family"],
+                    )
+
+                selected_metrics["nautilus_validation"] = dict(best_candidate["nautilus_validation"])
+                selected_metrics["nautilus_validation_score"] = float(best_nautilus_score)
+
+                if evaluate_final_test:
+                    try:
+                        final_summary = _run_nautilus_backtest_segment(
+                            model_path=str(best_candidate["model_path"]),
+                            frame_15m=frame_15m,
+                            segment_range=ranges["test"],
+                            config=config,
+                            label=f"test_{best_candidate['family']}",
+                        )
+                        selected_metrics["nautilus_test"] = dict(final_summary)
+                        logger.info(
+                            "Nautilus held-out test: family=%s net=%.4f gross=%.4f alpha=%.4f "
+                            "trades=%d win_rate=%.2f%%",
+                            best_candidate["family"],
+                            float(final_summary.get("total_return", 0.0)),
+                            float(final_summary.get("gross_total_return", 0.0)),
+                            float(final_summary.get("outperformance_vs_bh", 0.0)),
+                            int(final_summary.get("n_trades", 0)),
+                            float(final_summary.get("win_rate", 0.0) * 100.0),
+                        )
+                    except Exception as exc:
+                        selected_metrics["nautilus_test"] = {"error": str(exc)}
+                        logger.warning("Nautilus held-out test failed for %s: %s", best_candidate["family"], exc)
+            else:
+                logger.warning(
+                    "No model passed Nautilus validation gates; keeping fast-env selection."
+                )
+
+    return selected_model, selected_metrics
 
 
 # =============================================================================
@@ -1217,6 +1662,7 @@ def run_training_pipeline(config_path: str | None = None, no_cache: bool = False
     from data.cache import load_features, save_features
 
     for symbol in pairs:
+        config["_active_symbol"] = symbol
         ohlcv_path = raw_dir / f"{symbol}_1m.parquet"
         if not ohlcv_path.exists():
             dash.update(status_msg=f"Downloading {symbol} data...")
@@ -1241,17 +1687,50 @@ def run_training_pipeline(config_path: str | None = None, no_cache: bool = False
 
         cached = load_features(symbol, source_paths) if use_cache else None
 
+        # Validate cache: reject if too small (stale from test run with subsample)
+        if cached is not None:
+            try:
+                import pyarrow.parquet as pq
+                expected_1m_rows = pq.read_metadata(ohlcv_path).num_rows
+                expected_15m_rows = expected_1m_rows // 15
+                cached_rows = len(cached["prices"])
+                if cached_rows < expected_15m_rows * 0.5:
+                    logger.warning(
+                        "Cache invalidated: %d rows vs expected ~%d (stale from test run?). Rebuilding.",
+                        cached_rows, expected_15m_rows,
+                    )
+                    cached = None
+            except Exception:
+                pass
+
         if cached is not None:
             feature_array = cached["features"]
             prices = cached["prices"]
             ohlcv_data = cached["ohlcv"]
             close_15m = cached["close_15m"]
+            config["_nautilus_frame"] = _build_nautilus_frame(prices, ohlcv_data)
 
             n_feats = feature_array.shape[1]
             dash.update(data_1m=0, data_15m=len(prices))
             dash.add_phase("Loaded from cache", "ok", 0)
             dash.update(features=n_feats)
             logger.info(f"Using cached features: {n_feats} dims, {len(prices):,} rows")
+
+            if config.get("training", {}).get("nautilus_validation", {}).get("enabled", False):
+                t0 = time.time()
+                dash.update(status_msg="Preparing cached Nautilus validation frame...")
+                df_nav, _, _ = load_and_clean_data(config, symbol)
+                df_nav_15m = _aggregate_ohlcv_15m(df_nav, period=15)
+                if len(df_nav_15m) == len(prices):
+                    config["_nautilus_frame"] = df_nav_15m[["open_time", "open", "high", "low", "close", "volume"]].reset_index(drop=True)
+                else:
+                    logger.warning(
+                        "Cached Nautilus frame length mismatch for %s: raw_15m=%d cached=%d. Falling back to reconstructed frame.",
+                        symbol,
+                        len(df_nav_15m),
+                        len(prices),
+                    )
+                dash.add_phase("Nautilus Validation Frame", "ok", time.time() - t0)
         else:
             # Step 1: Load & clean 1m data
             t0 = time.time()
@@ -1282,47 +1761,69 @@ def run_training_pipeline(config_path: str | None = None, no_cache: bool = False
             returns_96 = pd.Series(returns_1).rolling(96).sum().fillna(0).values  # 1d
             ret_features = np.column_stack([returns_1, returns_4, returns_16, returns_96]).astype(np.float32)
 
-            # CryptoMamba forecast features
+            # CryptoMamba forecast features (with accuracy validation)
             dash.update(status_msg="Fine-tuning CryptoMamba...")
             from models.forecast.crypto_mamba import CryptoMambaForecaster
             mamba = CryptoMambaForecaster(
-                context_len=64, horizon=4, d_model=32, n_layers=2,
+                context_len=128, horizon=4, d_model=64, n_layers=4,
                 device="cuda" if gpu_name else "cpu",
             )
-            # Quick fine-tune on recent data (max 50K windows, batch_size=256 for GPU)
-            if mamba.available:
-                logger.info("Fine-tuning CryptoMamba on 15m data...")
-                mamba.fine_tune(close_15m, epochs=10, lr=1e-3, batch_size=256,
-                                max_samples=50_000,
-                                save_path="checkpoints/crypto_mamba_15m.pt")
-
-            # Generate forecast features — batch prediction (much faster than per-window)
+            mamba_quality_ok = False
             n_15m = len(close_15m)
             forecast_feats = np.zeros((n_15m, 5), dtype=np.float32)
-            ctx_len = 64
-            sample_step = 10
-            indices = list(range(ctx_len, n_15m, sample_step))
-            n_preds = len(indices)
-            logger.info(f"Generating CryptoMamba forecasts ({n_preds} predictions, batched)...")
-            dash.update(status_msg=f"CryptoMamba batch predict ({n_preds})...")
 
-            # Build all windows at once and predict in one batched call
-            windows = np.array([close_15m[i - ctx_len:i] for i in indices])
-            try:
-                preds, uncs = mamba.predict_batch(windows, horizon=4)
-                for k, i in enumerate(indices):
-                    last_p = close_15m[i - 1]
-                    if last_p > 0:
-                        fc = (preds[k, :4] / last_p - 1).astype(np.float32)
-                        end = min(i + sample_step, n_15m)
-                        forecast_feats[i:end, :4] = fc
-                        forecast_feats[i:end, 4] = float(uncs[k])
-            except Exception as e:
-                logger.warning(f"CryptoMamba batch predict failed: {e}")
+            if mamba.available:
+                logger.info("Fine-tuning CryptoMamba on 15m data...")
+                ft_result = mamba.fine_tune(
+                    close_15m, epochs=20, lr=1e-3, batch_size=256,
+                    max_samples=50_000, patience=5,
+                    save_path="checkpoints/crypto_mamba_15m.pt",
+                )
 
-            # Release GPU after CryptoMamba done
+                # Quality gate: only use forecasts if better than naive
+                mamba_quality_ok = bool(ft_result.get("better_than_naive", False))
+                dir_acc = ft_result.get("directional_accuracy", 0.0)
+                rmse_ratio = ft_result.get("rmse_ratio_vs_naive", 999.0)
+
+                if mamba_quality_ok:
+                    logger.info(
+                        "CryptoMamba PASSED quality gate: dir_acc=%.1f%% rmse_ratio=%.3f — using forecast features",
+                        dir_acc * 100, rmse_ratio,
+                    )
+                    # Generate forecast features
+                    ctx_len = 128
+                    sample_step = 10
+                    indices = list(range(ctx_len, n_15m, sample_step))
+                    n_preds = len(indices)
+                    logger.info(f"Generating CryptoMamba forecasts ({n_preds} predictions, batched)...")
+                    dash.update(status_msg=f"CryptoMamba batch predict ({n_preds})...")
+
+                    windows = np.array([close_15m[i - ctx_len:i] for i in indices])
+                    try:
+                        preds, uncs = mamba.predict_batch(windows, horizon=4)
+                        for k, i in enumerate(indices):
+                            last_p = close_15m[i - 1]
+                            if last_p > 0:
+                                fc = (preds[k, :4] / last_p - 1).astype(np.float32)
+                                end = min(i + sample_step, n_15m)
+                                forecast_feats[i:end, :4] = fc
+                                forecast_feats[i:end, 4] = float(uncs[k])
+                    except Exception as e:
+                        logger.warning(f"CryptoMamba batch predict failed: {e}")
+                        forecast_feats[:] = 0.0
+                        mamba_quality_ok = False
+                else:
+                    logger.warning(
+                        "CryptoMamba FAILED quality gate: dir_acc=%.1f%% rmse_ratio=%.3f — "
+                        "forecast features zeroed out (worse than naive baseline)",
+                        dir_acc * 100, rmse_ratio,
+                    )
+
             mamba.release_gpu()
-            dash.add_phase("CryptoMamba Forecast", "ok")
+            dash.add_phase(
+                f"CryptoMamba Forecast ({'GOOD' if mamba_quality_ok else 'ZEROED'})",
+                "ok" if mamba_quality_ok else "warn",
+            )
 
             # Volatility feature (rolling 20-period std of returns)
             vol_20 = pd.Series(returns_1).rolling(20).std().fillna(0).values.astype(np.float32)
@@ -1335,6 +1836,7 @@ def run_training_pipeline(config_path: str | None = None, no_cache: bool = False
             feature_array = np.nan_to_num(feature_array, nan=0.0, posinf=0.0, neginf=0.0)
             prices = close_15m.astype(np.float32)
             ohlcv_data = df_15m[["open", "high", "low", "close"]].values.astype(np.float32)
+            config["_nautilus_frame"] = df_15m[["open_time", "open", "high", "low", "close", "volume"]].reset_index(drop=True)
 
             n_feats = feature_array.shape[1]
             dash.add_phase(f"Features + CryptoMamba ({n_feats} dims)", "ok", time.time() - t0)
@@ -1363,59 +1865,23 @@ def run_training_pipeline(config_path: str | None = None, no_cache: bool = False
         )
         dash.update(bh_return=bh_return, bh_full_return=bh_return)
 
-        # Step 5: RL Training
+        # Step 5: Model training / selection
         training_config = config.get("training", {})
         rl_config = training_config.get("rl", {})
         total_steps = rl_config.get("total_timesteps", 200000)
-        ep_len = 2000
-        lr = rl_config.get("learning_rate", 3e-4)
 
-        dash.update(train_total=total_steps, status_msg="Initializing PPO...")
-
-        from models.rl.trainer import RLTrainer
-        trainer = RLTrainer(
-            feature_arrays=feature_array,
-            price_series=prices,
-            ohlcv_data=ohlcv_data,
-            leverage=trading_config.get("leverage", 1.0),
-            min_trade_pct=trading_config.get("min_trade_pct", 0.05),
-            maintenance_margin=trading_config.get("maintenance_margin", 0.005),
-            funding_interval=32,
-            max_episode_steps=ep_len,
-            monthly_server_cost_usd=trading_config.get("monthly_server_cost_usd", 100.0),
-            periods_per_day=trading_config.get("periods_per_day", 96),
-            opportunity_threshold=rl_config.get("opportunity_threshold", 0.0010),
-            missed_move_penalty_scale=rl_config.get("missed_move_penalty_scale", 40.0),
-            server_cost_reward_multiplier=rl_config.get("server_cost_reward_multiplier", 6.0),
-            flat_penalty_after_steps=rl_config.get("flat_penalty_after_steps", 32),
-            flat_penalty_scale=rl_config.get("flat_penalty_scale", 0.002),
-            alpha_reward_weight=rl_config.get("alpha_reward_weight", 0.35),
-            net_pnl_reward_weight=rl_config.get("net_pnl_reward_weight", 1.00),
-            same_position_penalty_after_steps=rl_config.get("same_position_penalty_after_steps", 96),
-            same_position_penalty_scale=rl_config.get("same_position_penalty_scale", 0.003),
-            inactive_episode_penalty=rl_config.get("inactive_episode_penalty", 0.75),
-            static_position_episode_penalty=rl_config.get("static_position_episode_penalty", 0.25),
-            balanced_sampling=rl_config.get("balanced_sampling", True),
-            regime_label_threshold=rl_config.get("regime_label_threshold", 0.02),
-            train_range=ranges["train"],
-            eval_range=ranges["validation"],
-            test_range=ranges["test"],
-        )
-        trainer._dashboard = dash  # pass dashboard to trainer callback
+        dash.update(train_total=total_steps, status_msg="Initializing training...")
 
         t0 = time.time()
-        dash.update(status_msg="PPO Training in progress...")
-        metrics = trainer.train(
-            total_timesteps=total_steps,
-            learning_rate=lr,
-            n_steps=ep_len,
-            batch_size=rl_config.get("batch_size", 64),
-            n_epochs=rl_config.get("n_epochs", 10),
-            ent_coef=rl_config.get("ent_coef", 0.08),
-            eval_every_steps=rl_config.get("eval_every_steps", 50000),
-            eval_episodes=rl_config.get("eval_episodes", 8),
+        dash.update(status_msg="Training and model selection in progress...")
+        config["_ohlcv_data"] = ohlcv_data
+        _, metrics = train_rl_agent(
+            feature_array=feature_array,
+            prices=prices,
+            config=config,
+            dashboard=dash,
         )
-        dash.add_phase(f"PPO Training ({total_steps//1000}K steps)", "ok", time.time() - t0)
+        dash.add_phase(f"Model Training ({total_steps//1000}K steps)", "ok", time.time() - t0)
         dash.add_phase("Multi-Episode Eval (10 eps)", "ok")
 
         # Update dashboard with results
@@ -1432,9 +1898,14 @@ def run_training_pipeline(config_path: str | None = None, no_cache: bool = False
             position_ratio=metrics.get("position_ratio", 0),
             alpha_vs_bh=metrics.get("outperformance_vs_bh", 0),
             avg_reward_sum=metrics.get("avg_reward_sum", 0),
+            wrong_side_moves=metrics.get("wrong_side_moves", 0),
             eval_short_actions=metrics.get("eval_short_actions", 0),
             eval_flat_actions=metrics.get("eval_flat_actions", 0),
             eval_long_actions=metrics.get("eval_long_actions", 0),
+            eval_action_entropy=metrics.get("eval_action_entropy", 0),
+            eval_dominant_action_ratio=metrics.get("eval_dominant_action_ratio", 1),
+            selection_gate_passed=metrics.get("selection_gate_passed", 1),
+            selection_best_score=metrics.get("selection_best_score", 0),
             sharpe=metrics.get("sharpe", 0),
             sortino=metrics.get("sortino", 0),
             max_dd=metrics.get("max_drawdown", 0),
@@ -1444,9 +1915,9 @@ def run_training_pipeline(config_path: str | None = None, no_cache: bool = False
             n_wins=metrics.get("n_wins", 0),
             n_losses=metrics.get("n_losses", 0),
             win_rate=metrics.get("win_rate", 0),
-            model_path="checkpoints/rl_agent_final.zip",
+            model_path=metrics.get("model_path", "checkpoints/rl_agent_final.zip"),
             chart_path="checkpoints/training_results.png",
-            status_msg="COMPLETE",
+            status_msg=f"COMPLETE ({metrics.get('model_family', 'ppo')})",
         )
 
         # Log to file

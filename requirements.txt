@@ -21,6 +21,7 @@ wandb>=0.16
 evidently>=0.4
 streamlit>=1.30
 plotly>=5.18
+nautilus_trader>=1.224,<2.0
 
 # Testing
 pytest>=7.0

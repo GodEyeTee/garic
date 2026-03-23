@@ -2,11 +2,11 @@
 
 3 actions: Short, Flat, Long
 
-Reward:
-- Mark-to-market PnL from the active position
-- Transaction fees and funding costs
-- Fixed monthly server cost charged against portfolio equity
-- Missed-opportunity penalty only in reward space when the agent stays flat
+Reward (v2 — simplified for profitability):
+- Net PnL from position (fees + funding included) × scale
+- Continuous opportunity cost when flat (proportional to market move)
+- No double-counting, no alpha benchmark, no server cost in reward
+- Server cost tracked in balance only (sunk cost the agent can't control)
 
 OHLCV path: Open -> High/Low (liquidation) -> Close
 """
@@ -46,19 +46,12 @@ class CryptoFuturesEnv(gym.Env):
         leverage: float = 1.0,
         maintenance_margin: float = 0.005,
         max_episode_steps: int = 2000,
-        opportunity_threshold: float = 0.0010,  # 0.10% move = opportunity
-        missed_move_penalty_scale: float = 40.0,
         monthly_server_cost_usd: float = 100.0,
         periods_per_day: int = 96,
-        server_cost_reward_multiplier: float = 6.0,
-        flat_penalty_after_steps: int = 32,
-        flat_penalty_scale: float = 0.002,
-        alpha_reward_weight: float = 0.35,
-        net_pnl_reward_weight: float = 1.00,
-        same_position_penalty_after_steps: int = 96,
-        same_position_penalty_scale: float = 0.003,
-        inactive_episode_penalty: float = 0.75,
-        static_position_episode_penalty: float = 0.25,
+        pnl_reward_scale: float = 200.0,
+        opportunity_cost_scale: float = 30.0,
+        inactive_episode_penalty: float = 3.0,
+        static_position_episode_penalty: float = 1.0,
         balanced_sampling: bool = False,
         regime_label_threshold: float = 0.02,
         segment_start: int = 0,
@@ -76,17 +69,10 @@ class CryptoFuturesEnv(gym.Env):
         self.leverage = leverage
         self.maintenance_margin = maintenance_margin
         self.max_episode_steps = max_episode_steps
-        self.opportunity_threshold = opportunity_threshold
-        self.missed_move_penalty_scale = missed_move_penalty_scale
         self.monthly_server_cost_usd = monthly_server_cost_usd
         self.periods_per_day = periods_per_day
-        self.server_cost_reward_multiplier = server_cost_reward_multiplier
-        self.flat_penalty_after_steps = flat_penalty_after_steps
-        self.flat_penalty_scale = flat_penalty_scale
-        self.alpha_reward_weight = alpha_reward_weight
-        self.net_pnl_reward_weight = net_pnl_reward_weight
-        self.same_position_penalty_after_steps = same_position_penalty_after_steps
-        self.same_position_penalty_scale = same_position_penalty_scale
+        self.pnl_reward_scale = pnl_reward_scale
+        self.opportunity_cost_scale = opportunity_cost_scale
         self.inactive_episode_penalty = max(float(inactive_episode_penalty), 0.0)
         self.static_position_episode_penalty = max(float(static_position_episode_penalty), 0.0)
         self.balanced_sampling = bool(balanced_sampling)
@@ -192,6 +178,7 @@ class CryptoFuturesEnv(gym.Env):
         self._flat_steps_total = 0
         self._pos_steps_total = 0
         self._missed_moves = 0.0  # cumulative missed opportunity
+        self._wrong_side_moves = 0.0
         self._server_cost_paid = 0.0
         self._direction_steps = 0
         return self._obs(), {}
@@ -329,47 +316,36 @@ class CryptoFuturesEnv(gym.Env):
             self._flat_steps_total += 1
             self._direction_steps = 0
 
-        # === REWARD ===
-        gross_pnl = pnl
+        # === REWARD (v2 — clean PnL + opportunity cost) ===
+        gross_pnl = pnl  # trading PnL: position PnL - fees - funding
 
+        # Server cost: track for balance but NOT in reward (sunk cost)
         server_cost_usd_per_step = 0.0
         server_cost_pct = 0.0
         if self.monthly_server_cost_usd > 0 and self.periods_per_day > 0:
             server_cost_usd_per_step = self.monthly_server_cost_usd / (self.periods_per_day * 30.0)
             server_cost_pct = server_cost_usd_per_step / max(self.balance, 1.0)
-            pnl -= server_cost_pct
             self._server_cost_paid += server_cost_usd_per_step
 
-        benchmark_pnl = price_ret * self.leverage if self._step > 0 else 0.0
-        alpha_net_pnl = pnl - benchmark_pnl
-        reward = (alpha_net_pnl * 100.0 * self.alpha_reward_weight)
-        if self.net_pnl_reward_weight > 0:
-            reward += pnl * 100.0 * self.net_pnl_reward_weight
-        if server_cost_pct > 0 and self.server_cost_reward_multiplier > 1.0:
-            reward -= server_cost_pct * 100.0 * (self.server_cost_reward_multiplier - 1.0)
+        # Core reward: net PnL from trading decisions only
+        reward = pnl * self.pnl_reward_scale
 
-        # Reward shaping only: missing a large candle while flat is bad, but it should not
-        # reduce realized portfolio return when no trade actually happened.
+        # Opportunity cost: penalize flat proportional to actual market movement
+        # Creates correct incentive ordering: right position > flat > wrong position
         if self.position == 0:
             if self._step > 0:
                 self._flat_steps += 1
-                if self._flat_steps > self.flat_penalty_after_steps:
-                    reward -= self.flat_penalty_scale
-                if abs_move > self.opportunity_threshold:
-                    missed_move = abs_move - self.opportunity_threshold
-                    self._missed_moves += missed_move
-                    reward -= missed_move * self.missed_move_penalty_scale
+                self._missed_moves += abs_move
+                reward -= abs_move * self.opportunity_cost_scale
         else:
             self._flat_steps = 0
-            if self._direction_steps > self.same_position_penalty_after_steps:
-                reward -= self.same_position_penalty_scale
+            # Track wrong-side moves for metrics (PnL already penalizes this)
+            if self._step > 0:
+                if (self.position > 0 and price_ret < 0) or (self.position < 0 and price_ret > 0):
+                    self._wrong_side_moves += abs_move
 
-        # Shaping: Symmetrical bonus/penalty
-        if 'closed_trade_ret' in locals():
-            if closed_trade_ret > 0:
-                reward += (closed_trade_ret * 75.0) + 0.25
-            else:
-                reward += (closed_trade_ret * 75.0) - 0.25
+        # Apply server cost to pnl for balance tracking (after reward calculation)
+        pnl -= server_cost_pct
 
         # Update balances
         self.gross_balance *= (1 + gross_pnl)
@@ -434,5 +410,6 @@ class CryptoFuturesEnv(gym.Env):
             "n_wins": self._wins, "n_losses": self._losses,
             "win_rate": float(self._wins / ncl) if ncl > 0 else 0,
             "missed_moves": float(self._missed_moves),
+            "wrong_side_moves": float(self._wrong_side_moves),
             "server_cost_paid": float(self._server_cost_paid),
         }

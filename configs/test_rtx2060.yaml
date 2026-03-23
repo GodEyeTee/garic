@@ -1,5 +1,4 @@
-# RTX 2060 6GB — Lightweight config สำหรับทดสอบทั้งระบบ
-# ใช้ข้อมูลน้อยลง + timesteps น้อยลง เพื่อ validate logic ก่อน deploy cloud
+# RTX 2060 6GB - lightweight validation config
 
 project:
   name: garic
@@ -8,15 +7,11 @@ project:
 data:
   pairs:
     - BTCUSDT
-    # ทดสอบแค่ BTC ก่อนเพื่อความเร็ว (เพิ่ม ETHUSDT ใน full run)
   start_date: "2020-01-01"
   end_date: "2026-03-15"
   base_timeframe: "1m"
   timeframes:
     - "1m"
-
-  # Subsample: ใช้แค่ 200K rows (จาก 3.2M) สำหรับ test
-  # ครอบคลุมข้อมูลล่าสุด ~4.5 เดือน
   subsample_rows: 200000
 
   paths:
@@ -48,48 +43,73 @@ trading:
     alt: 0.02
   kelly_fraction: 0.25
   risk_per_trade: 0.02
-  leverage: 1              # 1x สำหรับ test (conservative), production ใช้ 3-5x
-  maintenance_margin: 0.005  # 0.5% Binance BTC default
-  min_trade_pct: 0.02       # 2% position change (test: agent มีแค่ 10K steps ยังปรับเล็ก)
-
+  leverage: 1
+  maintenance_margin: 0.005
+  min_trade_pct: 0.02
   monthly_server_cost_usd: 100.0
   periods_per_day: 96
 
 training:
-  checkpoint_interval: 300   # 5 นาที (เร็วกว่า full run)
+  checkpoint_interval: 300
   device: "cuda"
   seed: 42
 
-  # RTX 2060 optimized RL params
   rl:
     algo: "PPO"
-    total_timesteps: 10000    # เร็วพอสำหรับ test (full: 500K+)
+    total_timesteps: 10000
     learning_rate: 0.0003
-    n_steps: 512              # ลดจาก 2048 เพื่อ VRAM
-    batch_size: 32            # ลดจาก 64 เพื่อ VRAM
-    n_epochs: 5               # ลดจาก 10 เพื่อความเร็ว
-
-    ent_coef: 0.05
+    n_steps: 512
+    batch_size: 32
+    n_epochs: 5
+    ent_coef: 0.02
     eval_every_steps: 5000
     eval_episodes: 4
-    opportunity_threshold: 0.0010
-    missed_move_penalty_scale: 40.0
-    server_cost_reward_multiplier: 6.0
-    flat_penalty_after_steps: 32
-    flat_penalty_scale: 0.002
-    alpha_reward_weight: 0.35
-    net_pnl_reward_weight: 1.00
-    same_position_penalty_after_steps: 96
-    same_position_penalty_scale: 0.003
-    inactive_episode_penalty: 0.75
-    static_position_episode_penalty: 0.25
+    # Reward v2
+    pnl_reward_scale: 200.0
+    opportunity_cost_scale: 30.0
+    inactive_episode_penalty: 3.0
+    static_position_episode_penalty: 1.0
     balanced_sampling: true
     regime_label_threshold: 0.02
+    selection_max_dominant_action_ratio: 0.85
+    selection_min_avg_trades_per_episode: 1.5
+    selection_min_action_entropy: 0.05
 
-  # Validation params
   validation:
     holdout_test_ratio: 0.20
     validation_ratio_within_train: 0.10
-    cpcv_splits: 4            # ลดจาก 6 เพื่อความเร็ว
+    cpcv_splits: 4
     embargo_pct: 0.01
-    n_trials_dsr: 1           # จำนวน strategy ที่ทดสอบ
+    n_trials_dsr: 1
+
+  supervised_fallback:
+    enabled: true
+    model_types: ["logreg", "extratrees"]
+    horizon: 32
+    min_return_threshold: 0.003
+    threshold_quantile: 0.75
+    max_train_samples: 80000
+    logistic_c: 1.0
+    extra_trees_n_estimators: 96
+    extra_trees_max_depth: 10
+    extra_trees_min_samples_leaf: 24
+    min_hold_steps: 16
+    reversal_margin: 0.08
+    relaxed_max_dominant_action_ratio: 0.985
+    relaxed_min_avg_trades_per_episode: 0.5
+    relaxed_min_action_entropy: 0.0
+    confidence_grid: [0.34, 0.42, 0.50, 0.58, 0.66]
+
+  nautilus_validation:
+    enabled: true
+    use_for_model_selection: true
+    evaluate_final_test: true
+    venue: "BINANCE"
+    bar_minutes: 15
+    history_bars: 160
+    request_history_days: 3
+    initial_balance_usdt: 10000.0
+    leverage: 1.0
+    trade_size_pct_of_equity: 1.0
+    selection_min_trades: 1.0
+    selection_max_dominant_action_ratio: 0.995

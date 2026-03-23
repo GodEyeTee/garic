@@ -66,22 +66,19 @@ training:
     n_steps: 2000
     batch_size: 250
     n_epochs: 15
-    ent_coef: 0.08
+    ent_coef: 0.02
     eval_every_steps: 50000
     eval_episodes: 8
-    opportunity_threshold: 0.0010
-    missed_move_penalty_scale: 40.0
-    server_cost_reward_multiplier: 6.0
-    flat_penalty_after_steps: 32
-    flat_penalty_scale: 0.002
-    alpha_reward_weight: 0.35
-    net_pnl_reward_weight: 1.00
-    same_position_penalty_after_steps: 96
-    same_position_penalty_scale: 0.003
-    inactive_episode_penalty: 0.75
-    static_position_episode_penalty: 0.25
+    # Reward v2: clean PnL + opportunity cost
+    pnl_reward_scale: 200.0
+    opportunity_cost_scale: 30.0
+    inactive_episode_penalty: 3.0
+    static_position_episode_penalty: 1.0
     balanced_sampling: true
     regime_label_threshold: 0.02
+    selection_max_dominant_action_ratio: 0.85
+    selection_min_avg_trades_per_episode: 1.5
+    selection_min_action_entropy: 0.05
 
   validation:
     holdout_test_ratio: 0.20
@@ -89,3 +86,35 @@ training:
     cpcv_splits: 6
     embargo_pct: 0.01
     n_trials_dsr: 5
+
+  supervised_fallback:
+    enabled: true
+    model_types: ["logreg", "extratrees"]
+    horizon: 32
+    min_return_threshold: 0.003
+    threshold_quantile: 0.75
+    max_train_samples: 120000
+    logistic_c: 1.0
+    extra_trees_n_estimators: 160
+    extra_trees_max_depth: 12
+    extra_trees_min_samples_leaf: 32
+    min_hold_steps: 16
+    reversal_margin: 0.08
+    relaxed_max_dominant_action_ratio: 0.985
+    relaxed_min_avg_trades_per_episode: 0.5
+    relaxed_min_action_entropy: 0.0
+    confidence_grid: [0.34, 0.42, 0.50, 0.58, 0.66]
+
+  nautilus_validation:
+    enabled: true
+    use_for_model_selection: true
+    evaluate_final_test: true
+    venue: "BINANCE"
+    bar_minutes: 15
+    history_bars: 160
+    request_history_days: 3
+    initial_balance_usdt: 10000.0
+    leverage: 1.0
+    trade_size_pct_of_equity: 1.0
+    selection_min_trades: 1.0
+    selection_max_dominant_action_ratio: 0.995

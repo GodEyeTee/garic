@@ -305,9 +305,13 @@ def _return_stack_figure(go, state: dict):
 
 
 def _summary_card(state: dict) -> str:
+    collapsed = (
+        float(state.get("selection_gate_passed", 1.0)) <= 0.0
+        or float(state.get("eval_dominant_action_ratio", 0.0)) >= 0.95
+    )
     inactive = float(state.get("flat_ratio", 0.0)) >= 0.95 or float(state.get("n_trades", 0.0)) <= 0
-    badge_tone = "negative" if inactive else "positive"
-    status = "INACTIVE" if inactive else "ACTIVE"
+    badge_tone = "negative" if collapsed or inactive else "positive"
+    status = "COLLAPSED" if collapsed else "INACTIVE" if inactive else "ACTIVE"
     return f"""
     <div class="glass-card">
       <div class="section-row">
@@ -320,6 +324,8 @@ def _summary_card(state: dict) -> str:
         <div><span>Max DD</span><strong>{_fmt_drawdown(float(state.get('max_dd', 0.0)))}</strong></div>
         <div><span>Flat Ratio</span><strong>{float(state.get('flat_ratio', 0.0)):.1%}</strong></div>
         <div><span>Position Ratio</span><strong>{float(state.get('position_ratio', 0.0)):.1%}</strong></div>
+        <div><span>Action Entropy</span><strong>{float(state.get('eval_action_entropy', 0.0)):.3f}</strong></div>
+        <div><span>Wrong-Side</span><strong>{float(state.get('wrong_side_moves', 0.0)):.3f}</strong></div>
         <div><span>Avg Reward / Ep</span><strong>{float(state.get('avg_reward_sum', 0.0)):+.2f}</strong></div>
       </div>
     </div>
@@ -344,6 +350,8 @@ def _phase_card(state: dict) -> str:
         <div><span>Chart</span><strong>{chart_path}</strong></div>
         <div><span>Log</span><strong>pipeline.log</strong></div>
         <div><span>Eval Episodes</span><strong>{float(state.get('eval_episodes', 0.0)):.0f}</strong></div>
+        <div><span>Gate Passed</span><strong>{'YES' if float(state.get('selection_gate_passed', 1.0)) > 0 else 'NO'}</strong></div>
+        <div><span>Best Score</span><strong>{float(state.get('selection_best_score', 0.0)):.3f}</strong></div>
       </div>
     </div>
     """
