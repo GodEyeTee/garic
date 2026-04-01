@@ -66,14 +66,15 @@ training:
     n_steps: 2000
     batch_size: 250
     n_epochs: 15
-    ent_coef: 0.02
+    ent_coef: 0.12
     eval_every_steps: 50000
     eval_episodes: 8
-    # Reward v2: clean PnL + opportunity cost
-    pnl_reward_scale: 200.0
-    opportunity_cost_scale: 30.0
-    inactive_episode_penalty: 3.0
-    static_position_episode_penalty: 1.0
+    # Reward v3: equity return after costs + drawdown/turnover penalties
+    pnl_reward_scale: 100.0
+    drawdown_penalty_scale: 2.0
+    turnover_penalty_scale: 0.05
+    inactive_episode_penalty: 0.0
+    static_position_episode_penalty: 0.0
     balanced_sampling: true
     regime_label_threshold: 0.02
     selection_max_dominant_action_ratio: 0.85
@@ -88,7 +89,7 @@ training:
     n_trials_dsr: 5
 
   supervised_fallback:
-    enabled: true
+    enabled: false
     model_types: ["logreg", "extratrees"]
     horizon: 32
     min_return_threshold: 0.003
@@ -104,6 +105,27 @@ training:
     relaxed_min_avg_trades_per_episode: 0.5
     relaxed_min_action_entropy: 0.0
     confidence_grid: [0.34, 0.42, 0.50, 0.58, 0.66]
+
+  forecast_features:
+    crypto_mamba:
+      enabled: false
+      context_len: 96
+      horizon: 4
+      sample_step: 15
+      d_model: 32
+      n_layers: 2
+      device: "cuda"
+      epochs: 6
+      lr: 0.001
+      batch_size: 128
+      max_samples: 12000
+      window_stride: 4
+      patience: 2
+      min_improvement: 0.002
+      eval_batch_size: 1024
+      predict_batch_size: 1024
+      use_amp: true
+      save_path: "checkpoints/crypto_mamba_15m.pt"
 
   nautilus_validation:
     enabled: true

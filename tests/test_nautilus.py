@@ -15,7 +15,7 @@ from execution.nautilus.state import NautilusStateWriter
 from execution.nautilus.strategy import GaricNautilusStrategy
 
 
-def test_nautilus_feature_builder_outputs_30_features():
+def test_nautilus_feature_builder_outputs_compact_features():
     n = 200
     close = 100 + np.cumsum(np.random.randn(n) * 0.2)
     frame = pd.DataFrame(
@@ -31,6 +31,28 @@ def test_nautilus_feature_builder_outputs_30_features():
         }
     )
     builder = NautilusFeatureBuilder(history_bars=160)
+    snapshot = builder.build_latest(frame)
+    assert snapshot.feature_array.shape == (25,)
+    assert np.isfinite(snapshot.feature_array).all()
+    assert set(ACTION_TO_DIRECTION) == {0, 1, 2}
+
+
+def test_nautilus_feature_builder_outputs_forecast_features_when_enabled():
+    n = 200
+    close = 100 + np.cumsum(np.random.randn(n) * 0.2)
+    frame = pd.DataFrame(
+        {
+            "open_time": pd.date_range("2024-01-01", periods=n, freq="15min", tz="UTC"),
+            "open": close - 0.1,
+            "high": close + 0.3,
+            "low": close - 0.3,
+            "close": close,
+            "volume": np.random.uniform(10, 100, size=n),
+            "trades": np.random.randint(50, 250, size=n),
+            "taker_buy_volume": np.random.uniform(5, 50, size=n),
+        }
+    )
+    builder = NautilusFeatureBuilder(history_bars=160, include_forecast=True)
     snapshot = builder.build_latest(frame)
     assert snapshot.feature_array.shape == (30,)
     assert np.isfinite(snapshot.feature_array).all()

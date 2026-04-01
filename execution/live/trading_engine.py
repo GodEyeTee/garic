@@ -21,9 +21,11 @@ from pathlib import Path
 import numpy as np
 
 from data.adapters.live import LiveAdapter
+from data.schema import StandardFeatureVector
 from execution.live.order_manager import OrderManager
 from monitoring.live.dashboard import DashboardData
 from monitoring.live.drift_detector import DriftDetector, AlertManager
+from models.rl.environment import AGENT_STATE_DIM, build_agent_state
 from risk.manager import RiskManager
 
 logger = logging.getLogger(__name__)
@@ -80,11 +82,13 @@ class TradingEngine:
         self._paused = False
         self._flat_steps = 0
         self._pos_steps = 0
+        self._last_turnover = 0.0
         self._entry_price = 0.0
         self._trade_returns: list[float] = []
         self._last_reset_day: str | None = None
         self._last_equity: float | None = None
         self._peak_equity: float | None = None
+        self._initial_equity: float = max(float(self.order_manager.get_balance() or 0.0), 1.0)
 
     def _load_model(self, path: str):
         """Load trained RL model."""
@@ -99,6 +103,14 @@ class TradingEngine:
             logger.info(f"Model loaded: {path}")
         except Exception as e:
             logger.error(f"Model load failed: {e}")
+
+    def _model_feature_dim(self) -> int:
+        if self._model is None:
+            return 0
+        if hasattr(self._model, "feature_dim"):
+            return int(self._model.feature_dim)
+        obs_shape = getattr(getattr(self._model, "observation_space", None), "shape", None) or (AGENT_STATE_DIM,)
+        return max(int(obs_shape[0]) - AGENT_STATE_DIM, 1)
 
     def _maybe_reset_daily(self, timestamp_ms: int):
         day_key = datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d")
@@ -131,6 +143,16 @@ class TradingEngine:
     def _current_drawdown(self, equity: float) -> float:
         peak = max(self._peak_equity or equity, equity, 1e-9)
         return max((peak - equity) / peak, 0.0)
+
+    def _rolling_volatility(self, ohlcv: np.ndarray, window: int = 32) -> float:
+        closes = np.asarray(ohlcv, dtype=np.float64)[:, 3]
+        closes = closes[-(max(int(window), 1) + 1):]
+        if closes.size < 2:
+            return 0.0
+        returns = np.diff(np.log(np.maximum(closes, 1e-9)))
+        if returns.size == 0:
+            return 0.0
+        return float(np.std(returns))
 
     def _trade_stats(self) -> tuple[float, float, float]:
         if not self._trade_returns:
@@ -201,7 +223,8 @@ class TradingEngine:
         try:
             # 1. Get feature vector (same as training)
             features = self.adapter.get_feature_vector(self.symbol, timestamp_ms)
-            feature_array = features.to_array()
+            include_forecast = self._model_feature_dim() > StandardFeatureVector.feature_dim()
+            feature_array = features.to_array(include_forecast=include_forecast)
 
         except ValueError as e:
             logger.info(f"Warmup: {e}")
@@ -211,7 +234,7 @@ class TradingEngine:
         equity = self._update_risk_state(timestamp_ms, price)
 
         # 2. Model prediction
-        action = self._predict_action(feature_array)
+        action = self._predict_action(feature_array, features.ohlcv, equity)
 
         # 3. Drift detection
         self.drift_detector.update(feature_array, action, 0.0)
@@ -252,7 +275,7 @@ class TradingEngine:
             metrics = self.dashboard_data.get_metrics()
             logger.info(f"Candle {self._candle_count}: balance=${balance:.2f}, metrics={metrics}")
 
-    def _predict_action(self, feature_array: np.ndarray) -> float:
+    def _predict_action(self, feature_array: np.ndarray, ohlcv: np.ndarray, equity: float) -> float:
         """Get discrete action from model and map it to [-1, 0, 1]."""
         if self._model is None:
             return 0.0  # no model = flat
@@ -266,15 +289,22 @@ class TradingEngine:
             self._pos_steps += 1
             self._flat_steps = 0
 
-        obs = np.concatenate([
-            feature_array,
-            np.array([
-                position_state,
-                0.0,
-                self._flat_steps / 100.0,
-                self._pos_steps / 100.0,
-            ], dtype=np.float32),
-        ])
+        model_feature_dim = self._model_feature_dim()
+        obs = np.concatenate(
+            [
+                np.asarray(feature_array[:model_feature_dim], dtype=np.float32),
+                build_agent_state(
+                    position=position_state,
+                    upnl=0.0,
+                    equity_ratio=(equity / max(self._initial_equity, 1e-9)) - 1.0,
+                    drawdown=self._current_drawdown(equity),
+                    rolling_volatility=self._rolling_volatility(ohlcv),
+                    turnover_last_step=self._last_turnover,
+                    flat_steps=self._flat_steps,
+                    pos_steps=self._pos_steps,
+                ),
+            ]
+        )
         action, _ = self._model.predict(obs, deterministic=True)
         action_idx = int(action.item()) if isinstance(action, np.ndarray) else int(action)
         if action_idx == 0:
@@ -292,11 +322,13 @@ class TradingEngine:
         current_qty = float(self.order_manager.get_position(self.symbol))
         current_direction = float(np.sign(current_qty))
         desired_direction = float(np.sign(action))
+        self._last_turnover = abs(desired_direction - current_direction)
 
         self.risk_manager.set_position(self.symbol, abs(current_qty) * price)
 
         if desired_direction == 0.0:
             if current_qty == 0.0:
+                self._last_turnover = 0.0
                 return
             self._record_closed_trade(current_direction, price)
             side = "sell" if current_qty > 0 else "buy"
@@ -314,6 +346,7 @@ class TradingEngine:
 
         if current_direction == desired_direction and current_qty != 0.0:
             self.risk_manager.set_position(self.symbol, abs(current_qty) * price)
+            self._last_turnover = 0.0
             return
 
         if current_direction != 0.0 and current_direction != desired_direction:
@@ -333,6 +366,7 @@ class TradingEngine:
 
         decision = self._evaluate_risk(desired_direction, features, price, equity)
         if not decision.approved or decision.size <= 0:
+            self._last_turnover = 0.0
             return
 
         quantity = float(decision.size / price)

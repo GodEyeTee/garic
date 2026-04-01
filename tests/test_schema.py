@@ -31,6 +31,7 @@ def test_to_array_shape():
     expected_dim = StandardFeatureVector.feature_dim()
     assert arr.shape == (expected_dim,)
     assert arr.dtype == np.float32
+    assert expected_dim == 25
 
 
 def test_to_array_deterministic():
@@ -47,6 +48,27 @@ def test_to_array_deterministic():
 
 
 def test_feature_dim_matches():
-    dim = StandardFeatureVector.feature_dim(lookback=60, n_return_periods=5,
-                                             n_ta=15, n_micro=5, horizon=12, n_onchain=5)
-    assert dim == 60 * 5 + 5 + 15 + 5 + 12 + 1 + 1 + 1 + 1 + 5  # = 346
+    dim = StandardFeatureVector.feature_dim(n_return_periods=5, n_ta=15, n_micro=5)
+    assert dim == 25
+
+
+def test_feature_dim_with_forecast_matches():
+    dim = StandardFeatureVector.feature_dim(
+        n_return_periods=5,
+        n_ta=15,
+        n_micro=5,
+        include_forecast=True,
+        forecast_dims=5,
+    )
+    assert dim == 30
+
+
+def test_zero_forecast_block_stays_zero_when_enabled():
+    vec = _make_dummy_vector(
+        ohlcv=np.full((60, 5), 100.0),
+        price_forecast=np.zeros(12, dtype=np.float32),
+        forecast_uncertainty=0.0,
+    )
+    arr = vec.to_array(include_forecast=True)
+    assert arr.shape == (30,)
+    np.testing.assert_array_equal(arr[-5:], np.zeros(5, dtype=np.float32))

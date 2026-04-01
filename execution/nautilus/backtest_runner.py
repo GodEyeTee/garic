@@ -5,24 +5,43 @@ from __future__ import annotations
 import argparse
 import logging
 from decimal import Decimal
+from typing import Any
 
 import numpy as np
 import pandas as pd
 
-from nautilus_trader.backtest.engine import BacktestEngine
-from nautilus_trader.core.datetime import dt_to_unix_nanos
-from nautilus_trader.model.currencies import USDT
-from nautilus_trader.model.data import Bar
-from nautilus_trader.model.data import BarSpecification
-from nautilus_trader.model.data import BarType
-from nautilus_trader.model.enums import AccountType
-from nautilus_trader.model.enums import AggregationSource
-from nautilus_trader.model.enums import BarAggregation
-from nautilus_trader.model.enums import OmsType
-from nautilus_trader.model.enums import PriceType
-from nautilus_trader.model.identifiers import Venue
-from nautilus_trader.model.objects import Money
-from nautilus_trader.test_kit.providers import TestInstrumentProvider
+try:
+    from nautilus_trader.backtest.engine import BacktestEngine
+    from nautilus_trader.core.datetime import dt_to_unix_nanos
+    from nautilus_trader.model.currencies import USDT
+    from nautilus_trader.model.data import Bar
+    from nautilus_trader.model.data import BarSpecification
+    from nautilus_trader.model.data import BarType
+    from nautilus_trader.model.enums import AccountType
+    from nautilus_trader.model.enums import AggregationSource
+    from nautilus_trader.model.enums import BarAggregation
+    from nautilus_trader.model.enums import OmsType
+    from nautilus_trader.model.enums import PriceType
+    from nautilus_trader.model.identifiers import Venue
+    from nautilus_trader.model.objects import Money
+    from nautilus_trader.test_kit.providers import TestInstrumentProvider
+    _NAUTILUS_IMPORT_ERROR: Exception | None = None
+except ModuleNotFoundError as exc:
+    BacktestEngine = None  # type: ignore[assignment]
+    dt_to_unix_nanos = None  # type: ignore[assignment]
+    USDT = None  # type: ignore[assignment]
+    Bar = Any  # type: ignore[assignment]
+    BarSpecification = None  # type: ignore[assignment]
+    BarType = Any  # type: ignore[assignment]
+    AccountType = None  # type: ignore[assignment]
+    AggregationSource = None  # type: ignore[assignment]
+    BarAggregation = None  # type: ignore[assignment]
+    OmsType = None  # type: ignore[assignment]
+    PriceType = None  # type: ignore[assignment]
+    Venue = None  # type: ignore[assignment]
+    Money = None  # type: ignore[assignment]
+    TestInstrumentProvider = None  # type: ignore[assignment]
+    _NAUTILUS_IMPORT_ERROR = exc
 
 from execution.nautilus.config import load_nautilus_config
 from execution.nautilus.state import NautilusStateWriter
@@ -31,6 +50,13 @@ from execution.nautilus.strategy import GaricNautilusStrategyConfig
 
 
 logger = logging.getLogger(__name__)
+
+
+def _require_nautilus() -> None:
+    if _NAUTILUS_IMPORT_ERROR is not None:
+        raise ModuleNotFoundError(
+            "nautilus_trader is required for Nautilus backtests"
+        ) from _NAUTILUS_IMPORT_ERROR
 
 
 def _aggregate_to_15m(df: pd.DataFrame, minutes: int) -> pd.DataFrame:
@@ -81,6 +107,7 @@ def _prepare_15m_frame(frame: pd.DataFrame, bar_minutes: int) -> pd.DataFrame:
 
 
 def _instrument_for_symbol(symbol: str):
+    _require_nautilus()
     symbol = symbol.upper()
     if symbol == "BTCUSDT":
         return TestInstrumentProvider.btcusdt_perp_binance()
@@ -90,6 +117,7 @@ def _instrument_for_symbol(symbol: str):
 
 
 def _bars_from_frame(frame: pd.DataFrame, instrument, bar_minutes: int) -> tuple[BarType, list[Bar]]:
+    _require_nautilus()
     bar_type = BarType(
         instrument.id,
         BarSpecification(bar_minutes, BarAggregation.MINUTE, PriceType.LAST),
@@ -232,6 +260,7 @@ def run_backtest_frame(
     monthly_server_cost_usd: float = 100.0,
     periods_per_day: int = 96,
 ) -> dict:
+    _require_nautilus()
     prepared = _prepare_15m_frame(frame_15m, bar_minutes)
     state = NautilusStateWriter(state_path)
     state.reset(

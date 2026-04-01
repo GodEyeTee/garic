@@ -3,17 +3,41 @@
 import numpy as np
 import pandas as pd
 
+from features.builder import FeatureBuilder
 from pipeline import (
     _aggregate_ohlcv_15m,
     _build_nautilus_frame,
     _compute_data_ranges,
     _run_nautilus_backtest_segment,
     _score_nautilus_summary,
+    add_naive_forecast,
     backtest_with_model,
 )
 
 
 class TestPipelineHelpers:
+    def test_feature_builder_batch_array_is_compact(self):
+        df = pd.DataFrame(
+            {
+                "open": np.linspace(100.0, 130.0, 120),
+                "high": np.linspace(101.0, 131.0, 120),
+                "low": np.linspace(99.0, 129.0, 120),
+                "close": np.linspace(100.5, 130.5, 120),
+                "volume": np.ones(120),
+            }
+        )
+        feature_array, ta_slice, micro_slice = FeatureBuilder(lookback=60).build_batch_array(df)
+        assert feature_array.shape == (60, 25)
+        assert ta_slice.shape[1] == 15
+        assert micro_slice.shape[1] == 5
+
+    def test_add_naive_forecast_appends_compact_block_without_overwriting(self):
+        base = np.ones((80, 25), dtype=np.float32)
+        prices = np.linspace(100.0, 120.0, 80, dtype=np.float32)
+        enriched = add_naive_forecast(base, prices)
+        assert enriched.shape == (80, 30)
+        np.testing.assert_array_equal(enriched[:, :25], base)
+
     def test_compute_data_ranges_reserves_holdout_tail(self):
         ranges = _compute_data_ranges(100, test_ratio=0.2, validation_ratio_within_train=0.1)
         assert ranges["train"] == (0, 72)
@@ -44,7 +68,7 @@ class TestPipelineHelpers:
 
     def test_backtest_uses_caller_ranges_when_provided(self):
         prices = np.linspace(100.0, 200.0, 100, dtype=np.float32)
-        features = np.zeros((100, 30), dtype=np.float32)
+        features = np.zeros((100, 25), dtype=np.float32)
         config = {"trading": {"min_trade_pct": 0.05}, "training": {"validation": {}}}
         ranges = {"train": (0, 60), "validation": (60, 80), "test": (10, 20)}
 

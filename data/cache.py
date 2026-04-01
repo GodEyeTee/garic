@@ -17,6 +17,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 CACHE_DIR = Path("data/cache")
+FEATURE_SCHEMA_VERSION = 2
 
 
 def _is_cache_valid(cache_path: Path, source_paths: list[Path]) -> bool:
@@ -59,6 +60,7 @@ def save_features(
 
     np.savez(
         cache_path,
+        schema_version=np.array([FEATURE_SCHEMA_VERSION], dtype=np.int32),
         features=feature_array,
         prices=prices,
         ohlcv=ohlcv_data,

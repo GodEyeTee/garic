@@ -26,7 +26,7 @@ class FeatureBuilder:
         return_periods: list[int] | None = None,
     ):
         self.lookback = lookback
-        self.return_periods = return_periods or [1, 5, 15, 60, 240]
+        self.return_periods = return_periods or [1, 4, 16, 48, 96]
 
     def build_batch_array(
         self,
@@ -51,22 +51,11 @@ class FeatureBuilder:
         log_returns = np.log(close / np.roll(close, 1))
         log_returns[0] = 0.0
 
-        ohlcv_data = df[["open", "high", "low", "close", "volume"]].values.astype(np.float32)
-
         n = len(df)
         lb = self.lookback
         n_out = n - lb
 
         logger.info(f"Building {n_out} feature vectors (vectorized)...")
-
-        # OHLCV windows via stride tricks: (n_out, lookback, 5)
-        from numpy.lib.stride_tricks import sliding_window_view
-        windows = sliding_window_view(ohlcv_data, lb, axis=0)  # (n-lb+1, 5, lb)
-        # windows[j] corresponds to ohlcv_data[j:j+lb] for each column
-        # We need windows for positions 0..n_out-1 (i.e. i-lb for i in range(lb, n))
-        # Transpose to get (n-lb+1, lb, 5) then flatten to (n_out, lb*5)
-        ohlcv_windows = np.moveaxis(windows[:n_out], 1, 2)  # (n_out, lb, 5)
-        ohlcv_flat = ohlcv_windows.reshape(n_out, lb * 5).astype(np.float32)
 
         # Period returns via cumsum
         cum_lr = np.concatenate([[0.0], np.cumsum(log_returns)])
@@ -80,21 +69,11 @@ class FeatureBuilder:
         ta_slice = ta_all[lb:].astype(np.float32)
         micro_slice = micro_all[lb:].astype(np.float32)
 
-        # Zeros for forecast, funding, sentiment, onchain (will be filled later if available)
-        zeros = np.zeros((n_out, 1), dtype=np.float32)
-
-        # Concatenate all features (same order as StandardFeatureVector.to_array)
+        # Keep the RL state compact and fully informative: returns + TA + micro only.
         feature_array = np.concatenate([
-            ohlcv_flat,                                         # (n_out, 300)
-            returns_all,                                        # (n_out, 5)
-            ta_slice,                                           # (n_out, 15)
-            micro_slice,                                        # (n_out, 5)
-            np.zeros((n_out, 12), dtype=np.float32),            # price_forecast
-            zeros,                                              # forecast_uncertainty
-            zeros,                                              # funding_rate
-            zeros,                                              # open_interest_change
-            zeros,                                              # sentiment_score
-            np.zeros((n_out, 5), dtype=np.float32),             # onchain_metrics
+            returns_all,     # (n_out, 5) normalized multi-period returns
+            ta_slice,        # (n_out, 15) TA indicators
+            micro_slice,     # (n_out, 5) microstructure features
         ], axis=1)
 
         logger.info(f"Built feature array: {feature_array.shape}")

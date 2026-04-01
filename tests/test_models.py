@@ -46,16 +46,16 @@ class TestRLEnvironment:
     def test_env_creation(self):
         from models.rl.environment import CryptoFuturesEnv
         n = 500
-        features = np.random.randn(n, 346).astype(np.float32)
+        features = np.random.randn(n, 25).astype(np.float32)
         prices = 100 + np.cumsum(np.random.randn(n) * 0.5)
         env = CryptoFuturesEnv(features, prices)
         obs, info = env.reset()
-        assert obs.shape == env.observation_space.shape == (350,)  # 346 + 4 agent-state features
+        assert obs.shape == env.observation_space.shape == (33,)  # 25 + 8 agent-state features
 
     def test_step_returns(self):
         from models.rl.environment import CryptoFuturesEnv
         n = 100
-        features = np.random.randn(n, 346).astype(np.float32)
+        features = np.random.randn(n, 25).astype(np.float32)
         prices = 100 + np.cumsum(np.random.randn(n) * 0.5)
         env = CryptoFuturesEnv(features, prices)
         obs, _ = env.reset()
@@ -67,7 +67,7 @@ class TestRLEnvironment:
     def test_segment_range_limits_reset(self):
         from models.rl.environment import CryptoFuturesEnv
         n = 200
-        features = np.random.randn(n, 346).astype(np.float32)
+        features = np.random.randn(n, 25).astype(np.float32)
         prices = 100 + np.cumsum(np.random.randn(n) * 0.5)
         env = CryptoFuturesEnv(
             features,
@@ -119,7 +119,6 @@ class TestRLEnvironment:
             prices,
             max_episode_steps=3,
             monthly_server_cost_usd=0.0,
-            opportunity_cost_scale=0.0,
             inactive_episode_penalty=1.0,
         )
 
@@ -143,12 +142,10 @@ class TestRLEnvironment:
         env_long = CryptoFuturesEnv(
             features, prices, max_episode_steps=3,
             monthly_server_cost_usd=0.0, pnl_reward_scale=200.0,
-            opportunity_cost_scale=0.0,
         )
         env_short = CryptoFuturesEnv(
             features, prices, max_episode_steps=3,
             monthly_server_cost_usd=0.0, pnl_reward_scale=200.0,
-            opportunity_cost_scale=0.0,
         )
 
         env_long.reset(seed=1)
@@ -275,6 +272,7 @@ class TestRLTrainerSelection:
 
 class TestSupervisedFallback:
     def test_stateful_policy_holds_position_before_min_hold(self):
+        from models.rl.environment import build_agent_state
         from models.rl.supervised import ACTION_SHORT, SupervisedActionModel
 
         class DummyClassifier:
@@ -292,7 +290,21 @@ class TestSupervisedFallback:
             reversal_margin=0.08,
             metadata={},
         )
-        obs = np.array([0, 0, 0, 0, 0, 0, -1.0, 0.0, 0.0, 0.05], dtype=np.float32)
+        obs = np.concatenate(
+            [
+                np.zeros(6, dtype=np.float32),
+                build_agent_state(
+                    position=-1.0,
+                    upnl=0.0,
+                    equity_ratio=0.0,
+                    drawdown=0.0,
+                    rolling_volatility=0.0,
+                    turnover_last_step=0.0,
+                    flat_steps=0,
+                    pos_steps=5,
+                ),
+            ]
+        ).astype(np.float32)
         action, _ = model.predict(obs)
 
         assert action == ACTION_SHORT

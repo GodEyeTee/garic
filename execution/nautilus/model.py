@@ -7,6 +7,8 @@ from pathlib import Path
 
 import numpy as np
 
+from models.rl.environment import AGENT_STATE_DIM, build_agent_state
+
 
 ACTION_TO_DIRECTION = {
     0: -1.0,
@@ -30,7 +32,7 @@ class GaricModelAdapter:
         self.model_path = Path(model_path)
         self.model_family = "ppo"
         self._model = None
-        self.feature_dim = 30
+        self.feature_dim = 25
 
         suffix = self.model_path.suffix.lower()
         if suffix == ".joblib":
@@ -41,8 +43,8 @@ class GaricModelAdapter:
             self.feature_dim = int(self._model.feature_dim)
         else:
             self._model = PPO.load(str(self.model_path))
-            obs_shape = getattr(self._model.observation_space, "shape", None) or (34,)
-            self.feature_dim = max(int(obs_shape[0]) - 4, 1)
+            obs_shape = getattr(self._model.observation_space, "shape", None) or (33,)
+            self.feature_dim = max(int(obs_shape[0]) - AGENT_STATE_DIM, 1)
 
     def _build_obs(
         self,
@@ -51,20 +53,25 @@ class GaricModelAdapter:
         flat_steps: int,
         pos_steps: int,
         upnl: float = 0.0,
+        equity_ratio: float = 0.0,
+        drawdown: float = 0.0,
+        rolling_volatility: float = 0.0,
+        turnover_last_step: float = 0.0,
     ) -> np.ndarray:
         return np.concatenate(
             [
                 np.asarray(feature_array[: self.feature_dim], dtype=np.float32),
-                np.array(
-                    [
-                        float(np.clip(position_state, -1.0, 1.0)),
-                        float(upnl),
-                        float(max(flat_steps, 0)) / 100.0,
-                        float(max(pos_steps, 0)) / 100.0,
-                    ],
-                    dtype=np.float32,
+                build_agent_state(
+                    position=position_state,
+                    upnl=upnl,
+                    equity_ratio=equity_ratio,
+                    drawdown=drawdown,
+                    rolling_volatility=rolling_volatility,
+                    turnover_last_step=turnover_last_step,
+                    flat_steps=flat_steps,
+                    pos_steps=pos_steps,
                 ),
-            ]
+            ],
         ).astype(np.float32)
 
     def predict(
@@ -75,6 +82,10 @@ class GaricModelAdapter:
         flat_steps: int,
         pos_steps: int,
         upnl: float = 0.0,
+        equity_ratio: float = 0.0,
+        drawdown: float = 0.0,
+        rolling_volatility: float = 0.0,
+        turnover_last_step: float = 0.0,
     ) -> ModelPrediction:
         obs = self._build_obs(
             feature_array,
@@ -82,6 +93,10 @@ class GaricModelAdapter:
             flat_steps=flat_steps,
             pos_steps=pos_steps,
             upnl=upnl,
+            equity_ratio=equity_ratio,
+            drawdown=drawdown,
+            rolling_volatility=rolling_volatility,
+            turnover_last_step=turnover_last_step,
         )
 
         if self.model_path.suffix.lower() == ".joblib":
@@ -119,4 +134,3 @@ class GaricModelAdapter:
             confidence=confidence,
             probabilities=prob_map,
         )
-

@@ -24,12 +24,13 @@ class FeatureSnapshot:
 
 
 class NautilusFeatureBuilder:
-    """Build the current 30-dim GARIC feature vector from 15m bars."""
+    """Build the compact GARIC feature vector from 15m bars."""
 
-    def __init__(self, history_bars: int = 160):
+    def __init__(self, history_bars: int = 160, include_forecast: bool = False):
         self.history_bars = max(int(history_bars), 128)
-        self.return_periods = (1, 4, 16, 96)
+        self.return_periods = (1, 4, 16, 48, 96)
         self.forecaster = NaiveForecaster()
+        self.include_forecast = bool(include_forecast)
 
     @property
     def warmup_bars(self) -> int:
@@ -59,21 +60,20 @@ class NautilusFeatureBuilder:
         )
 
         forecast = np.zeros(5, dtype=np.float32)
-        preds, uncertainty = self.forecaster.predict(safe_closes[-60:], horizon=12)
-        forecast[:4] = ((preds[:4] / max(latest_price, 1e-9)) - 1.0).astype(np.float32)
-        forecast[4] = float(uncertainty)
+        if self.include_forecast:
+            preds, uncertainty = self.forecaster.predict(safe_closes[-60:], horizon=4)
+            forecast[:4] = ((preds[:4] / max(latest_price, 1e-9)) - 1.0).astype(np.float32)
+            forecast[4] = float(uncertainty)
 
+        feature_parts = [
+            returns,
+            ta[-1],
+            micro[-1],
+        ]
+        if self.include_forecast:
+            feature_parts.append(forecast)
+        feature_array = np.concatenate(feature_parts).astype(np.float32)
         vol_20 = float(pd.Series(log_returns).rolling(20).std().fillna(0.0).iloc[-1])
-
-        feature_array = np.concatenate(
-            [
-                ta[-1],
-                micro[-1],
-                returns,
-                forecast,
-                np.array([vol_20], dtype=np.float32),
-            ]
-        ).astype(np.float32)
 
         return FeatureSnapshot(
             feature_array=feature_array,
@@ -84,4 +84,3 @@ class NautilusFeatureBuilder:
             forecast=forecast,
             vol_20=vol_20,
         )
-

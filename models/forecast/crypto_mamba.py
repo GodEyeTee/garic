@@ -13,6 +13,7 @@ References:
 """
 
 import logging
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -252,6 +253,10 @@ class CryptoMambaForecaster(BaseForecaster):
         save_path: str = "checkpoints/crypto_mamba.pt",
         val_ratio: float = 0.2,
         patience: int = 5,
+        min_improvement: float = 0.0,
+        window_stride: int = 1,
+        eval_batch_size: int = 1024,
+        use_amp: bool | None = None,
     ) -> dict:
         """Fine-tune on historical data with validation + early stopping.
 
@@ -265,17 +270,24 @@ class CryptoMambaForecaster(BaseForecaster):
 
         ctx = self.context_len
         h = self.horizon
-        n_total = len(log_returns) - ctx - h + 1
+        stride = max(int(window_stride), 1)
+        start_idx = np.arange(0, len(log_returns) - ctx - h + 1, stride, dtype=np.int64)
+        n_total = len(start_idx)
         if n_total < batch_size:
             return {"error": f"Not enough data: {n_total} < {batch_size}"}
 
         n_samples = min(n_total, max_samples)
-        offset = n_total - n_samples
-        logger.info(f"Fine-tune: using {n_samples:,} / {n_total:,} windows (most recent)")
+        sample_idx = start_idx[-n_samples:]
+        logger.info(
+            "Fine-tune: using %s / %s windows (most recent, stride=%s)",
+            f"{n_samples:,}",
+            f"{n_total:,}",
+            stride,
+        )
 
         # Build raw windows (per-window normalization — matches predict_batch inference)
-        X_raw = np.array([log_returns[offset + i:offset + i + ctx] for i in range(n_samples)])
-        Y_raw = np.array([log_returns[offset + i + ctx:offset + i + ctx + h] for i in range(n_samples)])
+        X_raw = np.array([log_returns[i:i + ctx] for i in sample_idx], dtype=np.float32)
+        Y_raw = np.array([log_returns[i + ctx:i + ctx + h] for i in sample_idx], dtype=np.float32)
 
         # Per-window normalization: each window uses its OWN mean/std
         # This matches predict_batch exactly — no train/inference mismatch
@@ -294,16 +306,18 @@ class CryptoMambaForecaster(BaseForecaster):
         val_means = win_means[n_train:]
         val_stds = win_stds[n_train:]
 
-        X_t = torch.tensor(X_train, dtype=torch.float32).unsqueeze(-1).to(self._device)
-        Y_t = torch.tensor(Y_train, dtype=torch.float32).to(self._device)
-        X_v = torch.tensor(X_val, dtype=torch.float32).unsqueeze(-1).to(self._device)
-        Y_v = torch.tensor(Y_val, dtype=torch.float32).to(self._device)
+        X_t = torch.tensor(X_train, dtype=torch.float32).unsqueeze(-1)
+        Y_t = torch.tensor(Y_train, dtype=torch.float32)
+        X_v = torch.tensor(X_val, dtype=torch.float32).unsqueeze(-1)
+        Y_v = torch.tensor(Y_val, dtype=torch.float32)
 
         logger.info(f"Fine-tune split: train={n_train:,} val={n_val:,}")
 
         self._model.train()
         optimizer = torch.optim.AdamW(self._model.parameters(), lr=lr, weight_decay=1e-4)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        amp_enabled = bool((self._device != "cpu") and (use_amp if use_amp is not None else True))
+        scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
 
         best_val_loss = float("inf")
         best_state = None
@@ -319,12 +333,23 @@ class CryptoMambaForecaster(BaseForecaster):
             indices = torch.randperm(n_train)
             for start in range(0, n_train - batch_size + 1, batch_size):
                 batch_idx = indices[start:start + batch_size]
-                pred = self._model(X_t[batch_idx])
-                loss = torch.nn.functional.mse_loss(pred, Y_t[batch_idx])
+                xb = X_t[batch_idx].to(self._device, non_blocking=True)
+                yb = Y_t[batch_idx].to(self._device, non_blocking=True)
                 optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self._model.parameters(), 1.0)
-                optimizer.step()
+                autocast_ctx = torch.cuda.amp.autocast(enabled=amp_enabled) if amp_enabled else nullcontext()
+                with autocast_ctx:
+                    pred = self._model(xb)
+                    loss = torch.nn.functional.mse_loss(pred, yb)
+                if amp_enabled:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(self._model.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self._model.parameters(), 1.0)
+                    optimizer.step()
                 epoch_loss += loss.item()
                 n_batches += 1
 
@@ -334,9 +359,20 @@ class CryptoMambaForecaster(BaseForecaster):
 
             # --- Validate ---
             self._model.eval()
+            val_loss_total = 0.0
+            val_seen = 0
             with torch.no_grad():
-                val_pred = self._model(X_v)
-                val_loss = torch.nn.functional.mse_loss(val_pred, Y_v).item()
+                for start in range(0, n_val, eval_batch_size):
+                    end = min(start + eval_batch_size, n_val)
+                    xb = X_v[start:end].to(self._device, non_blocking=True)
+                    yb = Y_v[start:end].to(self._device, non_blocking=True)
+                    autocast_ctx = torch.cuda.amp.autocast(enabled=amp_enabled) if amp_enabled else nullcontext()
+                    with autocast_ctx:
+                        val_pred = self._model(xb)
+                        batch_loss = torch.nn.functional.mse_loss(val_pred, yb, reduction="sum")
+                    val_loss_total += float(batch_loss.item())
+                    val_seen += (end - start) * yb.shape[1]
+            val_loss = val_loss_total / max(val_seen, 1)
             val_losses.append(val_loss)
 
             logger.info(
@@ -345,7 +381,7 @@ class CryptoMambaForecaster(BaseForecaster):
             )
 
             # Early stopping on validation loss
-            if val_loss < best_val_loss:
+            if val_loss < (best_val_loss - float(min_improvement)):
                 best_val_loss = val_loss
                 best_state = {k: v.clone() for k, v in self._model.state_dict().items()}
                 patience_counter = 0
@@ -361,7 +397,14 @@ class CryptoMambaForecaster(BaseForecaster):
         self._model.eval()
 
         # --- Evaluate accuracy on validation set ---
-        quality = self._evaluate_accuracy(X_val, Y_val, val_stds, val_means)
+        quality = self._evaluate_accuracy(
+            X_val,
+            Y_val,
+            val_stds,
+            val_means,
+            batch_size=eval_batch_size,
+            use_amp=amp_enabled,
+        )
         logger.info(
             "CryptoMamba accuracy: dir_acc=%.1f%% rmse_ratio=%.3f (vs naive) quality=%s",
             quality["directional_accuracy"] * 100,
@@ -374,7 +417,7 @@ class CryptoMambaForecaster(BaseForecaster):
         torch.save(self._model.state_dict(), save_path)
         logger.info(f"Saved: {save_path}")
 
-        del X_t, Y_t, X_v, Y_v, optimizer, scheduler
+        del X_t, Y_t, X_v, Y_v, optimizer, scheduler, scaler
         if self._device != "cpu":
             torch.cuda.empty_cache()
 
@@ -394,6 +437,8 @@ class CryptoMambaForecaster(BaseForecaster):
         Y_val: np.ndarray,
         val_stds: np.ndarray,
         val_means: np.ndarray,
+        batch_size: int = 1024,
+        use_amp: bool = False,
     ) -> dict:
         """Evaluate forecast quality on validation data.
 
@@ -401,9 +446,16 @@ class CryptoMambaForecaster(BaseForecaster):
         Uses per-window denormalization matching predict_batch behavior.
         """
         self._model.eval()
-        x_t = torch.tensor(X_val, dtype=torch.float32).unsqueeze(-1).to(self._device)
+        pred_chunks = []
         with torch.no_grad():
-            pred_norm = self._model(x_t).cpu().numpy()
+            for start in range(0, len(X_val), batch_size):
+                end = min(start + batch_size, len(X_val))
+                x_t = torch.tensor(X_val[start:end], dtype=torch.float32).unsqueeze(-1).to(self._device)
+                autocast_ctx = torch.cuda.amp.autocast(enabled=bool(use_amp and self._device != "cpu")) if self._device != "cpu" else nullcontext()
+                with autocast_ctx:
+                    pred_batch = self._model(x_t)
+                pred_chunks.append(pred_batch.cpu().numpy())
+        pred_norm = np.concatenate(pred_chunks, axis=0)
 
         # Denormalize: per-window stats (matches how training data was normalized)
         pred_returns = pred_norm * val_stds + val_means

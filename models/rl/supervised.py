@@ -18,6 +18,8 @@ from sklearn.ensemble import ExtraTreesClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 
+from models.rl.environment import AGENT_STATE_DIM, STATE_IDX_POSITION, STATE_IDX_POS_STEPS
+
 logger = logging.getLogger(__name__)
 
 ACTION_SHORT = 0
@@ -71,10 +73,10 @@ class SupervisedActionModel:
 
     def _extract_policy_state(self, obs: np.ndarray) -> tuple[int, float]:
         arr = np.asarray(obs, dtype=np.float32).reshape(-1)
-        if arr.shape[0] < self.feature_dim + 4:
+        if arr.shape[0] < self.feature_dim + AGENT_STATE_DIM:
             return ACTION_FLAT, 0.0
-        position = float(arr[self.feature_dim])
-        pos_steps = max(float(arr[self.feature_dim + 3]) * 100.0, 0.0)
+        position = float(arr[self.feature_dim + STATE_IDX_POSITION])
+        pos_steps = max(float(arr[self.feature_dim + STATE_IDX_POS_STEPS]) * 100.0, 0.0)
         if position > 0.5:
             return ACTION_LONG, pos_steps
         if position < -0.5:

@@ -184,12 +184,14 @@ class RLTrainer:
             self.periods_per_day,
         )
         logger.info(
-            "Reward v2: pnl_reward_scale=%.1f opportunity_cost_scale=%.1f "
-            "inactive_episode_penalty=%.2f static_position_episode_penalty=%.2f",
-            float(self.env_kwargs.get("pnl_reward_scale", 200.0)),
-            float(self.env_kwargs.get("opportunity_cost_scale", 30.0)),
-            float(self.env_kwargs.get("inactive_episode_penalty", 3.0)),
-            float(self.env_kwargs.get("static_position_episode_penalty", 1.0)),
+            "Reward v3: pnl_reward_scale=%.1f drawdown_penalty_scale=%.2f "
+            "turnover_penalty_scale=%.3f inactive_episode_penalty=%.2f "
+            "static_position_episode_penalty=%.2f",
+            float(self.env_kwargs.get("pnl_reward_scale", 100.0)),
+            float(self.env_kwargs.get("drawdown_penalty_scale", 2.0)),
+            float(self.env_kwargs.get("turnover_penalty_scale", 0.05)),
+            float(self.env_kwargs.get("inactive_episode_penalty", 0.0)),
+            float(self.env_kwargs.get("static_position_episode_penalty", 0.0)),
         )
         logger.info(
             "Dataset ranges: train=[%d:%d) validation=[%d:%d) test=[%d:%d)",
@@ -413,6 +415,8 @@ class RLTrainer:
         alpha = float(metrics.get("outperformance_vs_bh", 0.0))
         net_return = float(metrics.get("total_return", 0.0))
         gross_return = float(metrics.get("gross_total_return", net_return))
+        sharpe = float(metrics.get("sharpe", 0.0))
+        max_drawdown = abs(float(metrics.get("max_drawdown", 1.0)))
         flat_ratio = float(metrics.get("flat_ratio", 1.0))
         position_ratio = float(metrics.get("position_ratio", 0.0))
         avg_trades = float(metrics.get("avg_trades_per_episode", 0.0))
@@ -455,9 +459,11 @@ class RLTrainer:
         # Reward profitability heavily
         profit_bonus = max(net_return, 0.0) * 10.0
         return (
-            alpha * 6.0
-            + net_return * 5.0
+            sharpe * 4.0
+            + alpha * 4.0
+            + net_return * 3.0
             + profit_bonus
+            - max_drawdown * 3.0
             + action_entropy * 0.15
             + trade_bonus
             - collapse_penalty

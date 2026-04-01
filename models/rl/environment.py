@@ -1,9 +1,9 @@
-"""Trading environment for Binance USDT-M futures.
+﻿"""Trading environment for Binance USDT-M futures.
 
 3 actions: Short, Flat, Long
 
-Reward (v2 — simplified for profitability):
-- Net PnL from position (fees + funding included) × scale
+Reward (v2 โ€” simplified for profitability):
+- Net PnL from position (fees + funding included) ร— scale
 - Continuous opportunity cost when flat (proportional to market move)
 - No double-counting, no alpha benchmark, no server cost in reward
 - Server cost tracked in balance only (sunk cost the agent can't control)
@@ -28,6 +28,41 @@ logger = logging.getLogger(__name__)
 ACTION_SHORT = 0
 ACTION_FLAT = 1
 ACTION_LONG = 2
+AGENT_STATE_DIM = 8
+STATE_IDX_POSITION = 0
+STATE_IDX_UPNL = 1
+STATE_IDX_EQUITY_RATIO = 2
+STATE_IDX_DRAWDOWN = 3
+STATE_IDX_ROLLING_VOL = 4
+STATE_IDX_TURNOVER = 5
+STATE_IDX_FLAT_STEPS = 6
+STATE_IDX_POS_STEPS = 7
+
+
+def build_agent_state(
+    *,
+    position: float,
+    upnl: float,
+    equity_ratio: float,
+    drawdown: float,
+    rolling_volatility: float,
+    turnover_last_step: float,
+    flat_steps: int,
+    pos_steps: int,
+) -> np.ndarray:
+    return np.array(
+        [
+            float(np.clip(position, -1.0, 1.0)),
+            float(upnl),
+            float(equity_ratio),
+            float(max(drawdown, 0.0)),
+            float(max(rolling_volatility, 0.0)),
+            float(max(turnover_last_step, 0.0)),
+            float(max(flat_steps, 0)) / 100.0,
+            float(max(pos_steps, 0)) / 100.0,
+        ],
+        dtype=np.float32,
+    )
 
 
 class CryptoFuturesEnv(gym.Env):
@@ -48,10 +83,11 @@ class CryptoFuturesEnv(gym.Env):
         max_episode_steps: int = 2000,
         monthly_server_cost_usd: float = 100.0,
         periods_per_day: int = 96,
-        pnl_reward_scale: float = 200.0,
-        opportunity_cost_scale: float = 30.0,
-        inactive_episode_penalty: float = 3.0,
-        static_position_episode_penalty: float = 1.0,
+        pnl_reward_scale: float = 100.0,
+        drawdown_penalty_scale: float = 2.0,
+        turnover_penalty_scale: float = 0.05,
+        inactive_episode_penalty: float = 0.0,
+        static_position_episode_penalty: float = 0.0,
         balanced_sampling: bool = False,
         regime_label_threshold: float = 0.02,
         segment_start: int = 0,
@@ -71,8 +107,9 @@ class CryptoFuturesEnv(gym.Env):
         self.max_episode_steps = max_episode_steps
         self.monthly_server_cost_usd = monthly_server_cost_usd
         self.periods_per_day = periods_per_day
-        self.pnl_reward_scale = pnl_reward_scale
-        self.opportunity_cost_scale = opportunity_cost_scale
+        self.pnl_reward_scale = max(float(pnl_reward_scale), 0.0)
+        self.drawdown_penalty_scale = max(float(drawdown_penalty_scale), 0.0)
+        self.turnover_penalty_scale = max(float(turnover_penalty_scale), 0.0)
         self.inactive_episode_penalty = max(float(inactive_episode_penalty), 0.0)
         self.static_position_episode_penalty = max(float(static_position_episode_penalty), 0.0)
         self.balanced_sampling = bool(balanced_sampling)
@@ -90,7 +127,7 @@ class CryptoFuturesEnv(gym.Env):
 
         feature_dim = feature_arrays.shape[1]
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(feature_dim + 4,), dtype=np.float32,
+            low=-np.inf, high=np.inf, shape=(feature_dim + AGENT_STATE_DIM,), dtype=np.float32,
         )
         # 3 actions: Short, Flat, Long
         self.action_space = spaces.Discrete(3)
@@ -181,6 +218,9 @@ class CryptoFuturesEnv(gym.Env):
         self._wrong_side_moves = 0.0
         self._server_cost_paid = 0.0
         self._direction_steps = 0
+        self._last_turnover = 0.0
+        self._peak_balance = self.initial_balance
+        self._prev_drawdown = 0.0
         return self._obs(), {}
 
     @property
@@ -190,15 +230,43 @@ class CryptoFuturesEnv(gym.Env):
     def _obs(self):
         f = self.features[self._idx].astype(np.float32)
         upnl = self._unrealized_pnl()
-        # Extra state helps the policy reason about current exposure and time in/out of market.
-        return np.concatenate([f, np.array([
-            self.position, upnl, self._flat_steps / 100.0, self._pos_steps / 100.0
-        ], dtype=np.float32)])
+        return np.concatenate(
+            [
+                f,
+                build_agent_state(
+                    position=self.position,
+                    upnl=upnl,
+                    equity_ratio=(self.balance / max(self.initial_balance, 1e-9)) - 1.0,
+                    drawdown=self._current_drawdown(),
+                    rolling_volatility=self._rolling_volatility(),
+                    turnover_last_step=self._last_turnover,
+                    flat_steps=self._flat_steps,
+                    pos_steps=self._pos_steps,
+                ),
+            ]
+        )
 
     def _unrealized_pnl(self):
         if self.position == 0 or self.entry_price == 0:
             return 0.0
         return self.position * (self.prices[self._idx] / self.entry_price - 1) * self.leverage
+
+    def _current_drawdown(self) -> float:
+        peak = max(self._peak_balance, self.balance, 1e-9)
+        return max((peak - self.balance) / peak, 0.0)
+
+    def _rolling_volatility(self, window: int = 32) -> float:
+        idx = self._idx
+        start = max(self._start, idx - max(int(window), 1))
+        if idx <= start:
+            return 0.0
+        prices = np.maximum(self.prices[start: idx + 1], 1e-9)
+        if prices.size < 2:
+            return 0.0
+        returns = np.diff(np.log(prices))
+        if returns.size == 0:
+            return 0.0
+        return float(np.std(returns))
 
     def step(self, action):
         if isinstance(action, np.ndarray):
@@ -207,164 +275,133 @@ class CryptoFuturesEnv(gym.Env):
             a = int(action)
 
         idx = self._idx
-        old_pos_for_streak = self.position
+        old_balance = float(self.balance)
+        old_pos = float(self.position)
         prev_close = self.prices[max(idx - 1, self._start)]
         close_p = self.prices[idx]
         high_p = self.highs[idx]
         low_p = self.lows[idx]
 
-        price_ret = (close_p / prev_close - 1) if self._step > 0 else 0.0
+        price_ret = (close_p / prev_close - 1.0) if self._step > 0 else 0.0
         abs_move = abs(price_ret)
 
-        # === Determine new position ===
         if a == ACTION_LONG:
-            new_pos = 1.0
+            requested_pos = 1.0
         elif a == ACTION_SHORT:
-            new_pos = -1.0
-        else:  # Flat / close position
-            new_pos = 0.0
+            requested_pos = -1.0
+        else:
+            requested_pos = 0.0
 
-        # === PnL from current position ===
-        pnl = 0.0
+        gross_pnl = 0.0
+        funding_cost = 0.0
+        liquidation_cost = 0.0
         liquidated = False
 
-        if self._step > 0 and self.position != 0:
-            pnl = self.position * price_ret * self.leverage
-
-            # Intra-candle liquidation
-            if self.leverage > 1 and self.entry_price > 0:
-                ld = (1.0 / self.leverage) - self.maintenance_margin
-                if self.position > 0 and low_p <= self.entry_price * (1 - ld):
-                    pnl = -ld * self.leverage
-                    liquidated = True
-                elif self.position < 0 and high_p >= self.entry_price * (1 + ld):
-                    pnl = -ld * self.leverage
-                    liquidated = True
+        if self._step > 0 and old_pos != 0.0:
+            gross_pnl = old_pos * price_ret * self.leverage
 
             if self.funding_interval > 0 and self._step % self.funding_interval == 0:
-                pnl -= abs(self.position) * abs(self.funding_rates[idx])
+                funding_cost = abs(old_pos) * abs(self.funding_rates[idx])
 
-        # === Trade execution ===
-        entered = False
-        exited = False
+            if self.leverage > 1 and self.entry_price > 0:
+                ld = (1.0 / self.leverage) - self.maintenance_margin
+                if old_pos > 0 and low_p <= self.entry_price * (1.0 - ld):
+                    gross_pnl = -ld * self.leverage
+                    liquidated = True
+                elif old_pos < 0 and high_p >= self.entry_price * (1.0 + ld):
+                    gross_pnl = -ld * self.leverage
+                    liquidated = True
 
-        if liquidated:
-            self._losses += 1
+        actual_new_pos = 0.0 if liquidated else requested_pos
+        turnover = abs(actual_new_pos - old_pos)
+        trading_cost = turnover * self.fee_rate
+        self._last_turnover = float(turnover)
+
+        if self._step > 0 and old_pos == 0.0:
+            self._missed_moves += abs_move
+        elif self._step > 0 and old_pos != 0.0:
+            if (old_pos > 0 and price_ret < 0) or (old_pos < 0 and price_ret > 0):
+                self._wrong_side_moves += abs_move
+
+        if old_pos == 0.0 and actual_new_pos != 0.0:
             self._trades += 1
-            self.position = 0.0
+            if actual_new_pos > 0:
+                self._longs += 1
+            else:
+                self._shorts += 1
+        elif old_pos != 0.0 and actual_new_pos != old_pos:
+            trade_ret = old_pos * (close_p / self.entry_price - 1.0) * self.leverage - self.fee_rate - funding_cost
+            if liquidated:
+                trade_ret = gross_pnl - self.fee_rate - funding_cost
+            if trade_ret > 0:
+                self._wins += 1
+            else:
+                self._losses += 1
+            self._trades += 1
+            if actual_new_pos != 0.0:
+                if actual_new_pos > 0:
+                    self._longs += 1
+                else:
+                    self._shorts += 1
+
+        if actual_new_pos != 0.0 and actual_new_pos != old_pos:
+            self.entry_price = close_p
+        elif actual_new_pos == 0.0:
             self.entry_price = 0.0
-            exited = True
 
-        if not liquidated:
-            old_pos = self.position
+        gross_step_return = gross_pnl - trading_cost - funding_cost - liquidation_cost
 
-            # Entering from flat
-            if old_pos == 0 and new_pos != 0:
-                pnl -= self.fee_rate  # entry fee
-                self._trades += 1
-                if new_pos > 0:
-                    self._longs += 1
-                else:
-                    self._shorts += 1
-                self.entry_price = close_p
-                entered = True
-                self._flat_steps = 0
+        server_cost_usd_per_step = 0.0
+        server_cost_pct = 0.0
+        if self.monthly_server_cost_usd > 0 and self.periods_per_day > 0 and old_balance > 0:
+            server_cost_usd_per_step = self.monthly_server_cost_usd / (self.periods_per_day * 30.0)
+            server_cost_pct = server_cost_usd_per_step / max(old_balance, 1.0)
+            self._server_cost_paid += server_cost_usd_per_step
 
-            # Reversing direction
-            elif old_pos != 0 and new_pos != 0 and old_pos != new_pos:
-                # Close old + open new
-                trade_ret = old_pos * (close_p / self.entry_price - 1) * self.leverage - (2.0 * self.fee_rate)
-                if trade_ret > 0:
-                    self._wins += 1
-                else:
-                    self._losses += 1
-                pnl -= 2.0 * self.fee_rate  # close + open
-                self._trades += 1
-                if new_pos > 0:
-                    self._longs += 1
-                else:
-                    self._shorts += 1
-                self.entry_price = close_p
-                entered = True
-                closed_trade_ret = trade_ret
+        net_step_return = gross_step_return - server_cost_pct
+        self.gross_balance *= (1.0 + gross_step_return)
+        self.gross_balance = max(self.gross_balance, 0.0)
+        self.gross_equity_curve.append(self.gross_balance)
 
-            # Exiting to flat 
-            elif old_pos != 0 and new_pos == 0:
-                # Close old
-                trade_ret = old_pos * (close_p / self.entry_price - 1) * self.leverage - (2.0 * self.fee_rate)
-                if trade_ret > 0:
-                    self._wins += 1
-                else:
-                    self._losses += 1
-                pnl -= self.fee_rate  # close fee
-                self._trades += 1
-                self.entry_price = 0.0
-                exited = True
-                closed_trade_ret = trade_ret
+        self.balance *= (1.0 + net_step_return)
+        self.balance = max(self.balance, 0.0)
+        self.equity_curve.append(self.balance)
+        self._peak_balance = max(self._peak_balance, self.balance)
 
-            self.position = new_pos
+        drawdown = self._current_drawdown()
+        drawdown_increase = max(0.0, drawdown - self._prev_drawdown)
+        equity_ret = (self.balance - old_balance) / max(old_balance, 1e-9)
+        reward = (
+            self.pnl_reward_scale * equity_ret
+            - self.drawdown_penalty_scale * drawdown_increase
+            - self.turnover_penalty_scale * turnover
+        )
+        reward = float(np.clip(reward, -5.0, 5.0))
+        self._prev_drawdown = drawdown
 
-        if self.position != 0:
+        self.position = actual_new_pos
+        if self.position != 0.0:
             self._pos_steps += 1
             self._pos_steps_total += 1
-            if old_pos_for_streak != 0 and self.position == old_pos_for_streak:
+            if old_pos != 0.0 and self.position == old_pos:
                 self._direction_steps += 1
             else:
                 self._direction_steps = 1
+            self._flat_steps = 0
         else:
             self._pos_steps = 0
+            self._flat_steps += 1
             self._flat_steps_total += 1
             self._direction_steps = 0
 
-        # === REWARD (v2 — clean PnL + opportunity cost) ===
-        gross_pnl = pnl  # trading PnL: position PnL - fees - funding
-
-        # Server cost: track for balance but NOT in reward (sunk cost)
-        server_cost_usd_per_step = 0.0
-        server_cost_pct = 0.0
-        if self.monthly_server_cost_usd > 0 and self.periods_per_day > 0:
-            server_cost_usd_per_step = self.monthly_server_cost_usd / (self.periods_per_day * 30.0)
-            server_cost_pct = server_cost_usd_per_step / max(self.balance, 1.0)
-            self._server_cost_paid += server_cost_usd_per_step
-
-        # Core reward: net PnL from trading decisions only
-        reward = pnl * self.pnl_reward_scale
-
-        # Opportunity cost: penalize flat proportional to actual market movement
-        # Creates correct incentive ordering: right position > flat > wrong position
-        if self.position == 0:
-            if self._step > 0:
-                self._flat_steps += 1
-                self._missed_moves += abs_move
-                reward -= abs_move * self.opportunity_cost_scale
-        else:
-            self._flat_steps = 0
-            # Track wrong-side moves for metrics (PnL already penalizes this)
-            if self._step > 0:
-                if (self.position > 0 and price_ret < 0) or (self.position < 0 and price_ret > 0):
-                    self._wrong_side_moves += abs_move
-
-        # Apply server cost to pnl for balance tracking (after reward calculation)
-        pnl -= server_cost_pct
-
-        # Update balances
-        self.gross_balance *= (1 + gross_pnl)
-        self.gross_balance = max(self.gross_balance, 0)
-        self.gross_equity_curve.append(self.gross_balance)
-
-        self.balance *= (1 + pnl)
-        self.balance = max(self.balance, 0)
-        self.equity_curve.append(self.balance)
-
         self._step += 1
         done = self._step >= self.max_episode_steps or self._idx >= self.segment_end - 1
-        trunc = self.balance <= 0
+        trunc = self.balance <= 0.0
         if trunc:
-            reward = -10.0
+            reward = -5.0
 
-        # Evaluate final open position for accurate win/loss stats at episode end
-        if (done or trunc) and self.position != 0:
-            trade_ret = self.position * (close_p / self.entry_price - 1) * self.leverage - self.fee_rate
+        if (done or trunc) and self.position != 0.0:
+            trade_ret = self.position * (close_p / self.entry_price - 1.0) * self.leverage - self.fee_rate
             if trade_ret > 0:
                 self._wins += 1
             else:
@@ -377,12 +414,19 @@ class CryptoFuturesEnv(gym.Env):
                 reward -= self.inactive_episode_penalty
             elif self._trades <= 1 and position_ratio >= 0.98 and self.static_position_episode_penalty > 0:
                 reward -= self.static_position_episode_penalty
+            reward = float(np.clip(reward, -5.0, 5.0))
 
         obs = self._obs() if not (done or trunc) else np.zeros(self.observation_space.shape, dtype=np.float32)
-        
+
         info = {
-            "balance": self.balance, "position": self.position,
-            "pnl": pnl, "upnl": self._unrealized_pnl(), "n_trades": self._trades,
+            "balance": self.balance,
+            "position": self.position,
+            "pnl": net_step_return,
+            "gross_pnl": gross_step_return,
+            "upnl": self._unrealized_pnl(),
+            "n_trades": self._trades,
+            "drawdown": drawdown,
+            "turnover": turnover,
         }
         return obs, float(reward), done, trunc, info
 

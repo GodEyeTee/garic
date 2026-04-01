@@ -12,9 +12,13 @@ from collections import deque
 from threading import Lock
 
 import numpy as np
+import pandas as pd
 
 from data.adapters.base import BaseDataAdapter
 from data.schema import OHLCV, StandardFeatureVector
+from features.technical.indicators import compute_all as compute_ta
+from features.technical.microstructure import compute_all as compute_micro
+from models.forecast.naive import NaiveForecaster
 
 logger = logging.getLogger(__name__)
 
@@ -146,9 +150,10 @@ class LiveAdapter(BaseDataAdapter):
         lookback: int = 60,
     ):
         self.aggregator = CandleAggregator(timeframe_seconds)
-        self.lookback = lookback
-        self._candle_history: deque[OHLCV] = deque(maxlen=lookback + 10)
-        self._return_periods = [1, 5, 15, 60, 240]
+        self.lookback = max(int(lookback), 128)
+        self._candle_history: deque[OHLCV] = deque(maxlen=self.lookback + 10)
+        self._return_periods = [1, 4, 16, 48, 96]
+        self._forecaster = NaiveForecaster()
 
     def on_trade(self, price: float, volume: float, timestamp_ms: int):
         """รับ trade data จาก WebSocket. ไม่ action ที่นี่."""
@@ -192,13 +197,27 @@ class LiveAdapter(BaseDataAdapter):
         ])
 
         # Placeholder features (เติมใน Phase 2)
+        frame = pd.DataFrame(
+            {
+                "open": ohlcv[:, 0],
+                "high": ohlcv[:, 1],
+                "low": ohlcv[:, 2],
+                "close": ohlcv[:, 3],
+                "volume": ohlcv[:, 4],
+            }
+        )
+        ta = compute_ta(frame).astype(np.float32)[-1]
+        micro = compute_micro(frame).astype(np.float32)[-1]
+        forecast, uncertainty = self._forecaster.predict(closes[-60:], horizon=4)
+        forecast_prices = np.zeros(12, dtype=np.float32)
+        forecast_prices[:min(len(forecast), 4)] = np.asarray(forecast[:4], dtype=np.float32)
         return StandardFeatureVector(
             ohlcv=ohlcv,
             returns=returns,
-            ta_indicators=np.zeros(15, dtype=np.float32),
-            microstructure=np.zeros(5, dtype=np.float32),
-            price_forecast=np.zeros(12, dtype=np.float32),
-            forecast_uncertainty=0.0,
+            ta_indicators=ta,
+            microstructure=micro,
+            price_forecast=forecast_prices,
+            forecast_uncertainty=float(uncertainty),
             funding_rate=0.0,
             open_interest_change=0.0,
             sentiment_score=0.0,

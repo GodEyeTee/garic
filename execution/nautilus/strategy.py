@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import deque
 from decimal import Decimal
 
+import numpy as np
 import pandas as pd
 
 from nautilus_trader.common.enums import LogColor
@@ -43,7 +44,10 @@ class GaricNautilusStrategy(Strategy):
         super().__init__(config)
         self.instrument = None
         self.model = GaricModelAdapter(config.model_path)
-        self.features = NautilusFeatureBuilder(config.history_bars)
+        self.features = NautilusFeatureBuilder(
+            config.history_bars,
+            include_forecast=self.model.feature_dim > 25,
+        )
         self.state_writer = NautilusStateWriter(config.state_path)
         self._bars: deque[dict] = deque(maxlen=self.features.history_bars)
         self._last_bar_ts_event: int | None = None
@@ -53,6 +57,7 @@ class GaricNautilusStrategy(Strategy):
         self._last_probabilities = {"short": 0.0, "flat": 0.0, "long": 0.0}
         self._flat_steps = 0
         self._pos_steps = 0
+        self._last_turnover = 0.0
         self._last_realized_pnl = 0.0
         self._n_trades = 0
         self._n_wins = 0
@@ -150,6 +155,7 @@ class GaricNautilusStrategy(Strategy):
         total_pnl = self._portfolio_pnl("total", snapshot.latest_price)
         equity = float(self.config.starting_balance) + total_pnl
         self._peak_equity = max(self._peak_equity, equity)
+        drawdown = 0.0
         if self._peak_equity > 0:
             drawdown = (equity / self._peak_equity) - 1.0
             self._max_drawdown = min(self._max_drawdown, float(drawdown))
@@ -160,6 +166,10 @@ class GaricNautilusStrategy(Strategy):
             flat_steps=self._flat_steps,
             pos_steps=self._pos_steps,
             upnl=upnl,
+            equity_ratio=(equity / max(float(self.config.starting_balance), 1e-9)) - 1.0,
+            drawdown=abs(drawdown),
+            rolling_volatility=self._rolling_volatility(frame),
+            turnover_last_step=self._last_turnover,
         )
         self._record_action(prediction.direction)
         self._rebalance(prediction.direction, snapshot.latest_price)
@@ -278,7 +288,9 @@ class GaricNautilusStrategy(Strategy):
 
     def _rebalance(self, desired_direction: float, price: float) -> None:
         current_direction = self._current_position_state()
+        self._last_turnover = abs(desired_direction - current_direction)
         if abs(desired_direction - current_direction) < 1e-9:
+            self._last_turnover = 0.0
             return
 
         if current_direction != 0.0:
@@ -293,6 +305,15 @@ class GaricNautilusStrategy(Strategy):
                 price=price,
                 event="Flattening position",
             )
+
+    def _rolling_volatility(self, frame: pd.DataFrame, window: int = 32) -> float:
+        closes = frame["close"].astype(float).to_numpy()[-(max(int(window), 1) + 1):]
+        if closes.size < 2:
+            return 0.0
+        returns = pd.Series(np.log(np.maximum(closes, 1e-9))).diff().dropna().to_numpy()
+        if returns.size == 0:
+            return 0.0
+        return float(np.std(returns))
 
     def _submit_market(self, side: OrderSide) -> None:
         order: MarketOrder = self.order_factory.market(

@@ -1,16 +1,16 @@
-"""Main pipeline — รวมทุก component เข้าด้วยกัน.
+﻿"""Main pipeline โ€” เธฃเธงเธกเธ—เธธเธ component เน€เธเนเธฒเธ”เนเธงเธขเธเธฑเธ.
 
-ใช้ได้ทั้ง:
-1. train: historical data → features → train RL → backtest → validate
-2. test:  subsample data → features → train RL (เร็ว) → backtest → validate ทุก component
-3. paper: live data → features → model → paper orders
-4. live:  live data → features → model → risk → real orders
+เนเธเนเนเธ”เนเธ—เธฑเนเธ:
+1. train: historical data โ’ features โ’ train RL โ’ backtest โ’ validate
+2. test:  subsample data โ’ features โ’ train RL (เน€เธฃเนเธง) โ’ backtest โ’ validate เธ—เธธเธ component
+3. paper: live data โ’ features โ’ model โ’ paper orders
+4. live:  live data โ’ features โ’ model โ’ risk โ’ real orders
 
-*** ทุก mode ใช้ code path เดียวกัน ***
-*** Action เฉพาะ candle close เท่านั้น ***
+*** เธ—เธธเธ mode เนเธเน code path เน€เธ”เธตเธขเธงเธเธฑเธ ***
+*** Action เน€เธเธเธฒเธฐ candle close เน€เธ—เนเธฒเธเธฑเนเธ ***
 
 Usage:
-  python pipeline.py --mode test                           # ทดสอบทั้งระบบ (RTX 2060)
+  python pipeline.py --mode test                           # เธ—เธ”เธชเธญเธเธ—เธฑเนเธเธฃเธฐเธเธ (RTX 2060)
   python pipeline.py --mode test --config configs/test_rtx2060.yaml
   python pipeline.py --mode train                          # full training
   python pipeline.py --mode train --config configs/default.yaml
@@ -48,10 +48,10 @@ def _log_gpu_info():
             logger.info(f"CUDA: {torch.version.cuda}")
             return True
         else:
-            logger.warning("No CUDA GPU detected — will use CPU (slower)")
+            logger.warning("No CUDA GPU detected โ€” will use CPU (slower)")
             return False
     except ImportError:
-        logger.warning("PyTorch not installed — will use CPU")
+        logger.warning("PyTorch not installed โ€” will use CPU")
         return False
 
 
@@ -85,7 +85,7 @@ def load_and_clean_data(config: dict, symbol: str) -> tuple[pd.DataFrame, pd.Dat
         download_range(symbol, "1m", date(2020, 1, 1), output_dir=str(raw_dir))
         
         if not ohlcv_path.exists():
-            raise FileNotFoundError(f"Data not found: {ohlcv_path} — run downloaders first")
+            raise FileNotFoundError(f"Data not found: {ohlcv_path} โ€” run downloaders first")
 
     df = pd.read_parquet(ohlcv_path)
     logger.info(f"Loaded {symbol}: {len(df):,} rows")
@@ -143,19 +143,20 @@ def build_features(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray
 # =============================================================================
 
 def add_naive_forecast(feature_array: np.ndarray, prices: np.ndarray) -> np.ndarray:
-    """Add naive forecast to feature array using past-only windows."""
+    """Append a compact causal naive-forecast block to the feature array."""
     forecaster = NaiveForecaster()
-    forecast_col_start = 60 * 5 + 5 + 15 + 5  # ohlcv + returns + ta + micro
-    enriched = feature_array.copy()
+    forecast_feats = np.zeros((len(prices), 5), dtype=np.float32)
 
     for i in range(60, len(prices)):
         price_window = prices[max(0, i - 60):i]
         if len(price_window) > 1:
-            forecast, uncertainty = forecaster.predict(price_window)
-            enriched[i, forecast_col_start:forecast_col_start + 12] = forecast
-            enriched[i, forecast_col_start + 12] = uncertainty
+            forecast, uncertainty = forecaster.predict(price_window, horizon=4)
+            last_price = max(float(price_window[-1]), 1e-9)
+            usable = min(4, len(forecast))
+            forecast_feats[i, :usable] = (np.asarray(forecast[:usable], dtype=np.float32) / last_price) - 1.0
+            forecast_feats[i, 4] = float(uncertainty)
 
-    return enriched
+    return np.concatenate([feature_array, forecast_feats], axis=1).astype(np.float32)
 
 
 def _compute_data_ranges(
@@ -384,7 +385,7 @@ def train_rl_agent(
         logger.error("Cannot import RLTrainer")
         return None, {"error": "import failed"}
 
-    # Trading params — ใช้ค่าเดียวกันทั้ง Env และ BacktestRunner
+    # Trading params โ€” เนเธเนเธเนเธฒเน€เธ”เธตเธขเธงเธเธฑเธเธ—เธฑเนเธ Env เนเธฅเธฐ BacktestRunner
     trading_config = config.get("trading", {})
     validation_config = training_config.get("validation", {})
     ranges = _compute_data_ranges(
@@ -394,7 +395,7 @@ def train_rl_agent(
     )
     config["_data_ranges"] = ranges
 
-    # OHLCV data สำหรับ realistic intra-candle simulation
+    # OHLCV data เธชเธณเธซเธฃเธฑเธ realistic intra-candle simulation
     ohlcv_data = config.get("_ohlcv_data")  # passed from pipeline
 
     trainer = RLTrainer(
@@ -411,10 +412,11 @@ def train_rl_agent(
         max_episode_steps=max_episode_steps,
         monthly_server_cost_usd=trading_config.get("monthly_server_cost_usd", 100.0),
         periods_per_day=trading_config.get("periods_per_day", 96),
-        pnl_reward_scale=rl_config.get("pnl_reward_scale", 200.0),
-        opportunity_cost_scale=rl_config.get("opportunity_cost_scale", 30.0),
-        inactive_episode_penalty=rl_config.get("inactive_episode_penalty", 3.0),
-        static_position_episode_penalty=rl_config.get("static_position_episode_penalty", 1.0),
+        pnl_reward_scale=rl_config.get("pnl_reward_scale", 100.0),
+        drawdown_penalty_scale=rl_config.get("drawdown_penalty_scale", 2.0),
+        turnover_penalty_scale=rl_config.get("turnover_penalty_scale", 0.05),
+        inactive_episode_penalty=rl_config.get("inactive_episode_penalty", 0.0),
+        static_position_episode_penalty=rl_config.get("static_position_episode_penalty", 0.0),
         balanced_sampling=rl_config.get("balanced_sampling", True),
         regime_label_threshold=rl_config.get("regime_label_threshold", 0.02),
         selection_max_dominant_action_ratio=rl_config.get("selection_max_dominant_action_ratio", 0.95),
@@ -792,8 +794,8 @@ def backtest_with_model(
 ) -> dict:
     """Run backtest using trained RL model via BacktestRunner.
 
-    *** ใช้ cost model เดียวกันกับ CryptoFuturesEnv ***
-    *** ใช้ last 200K steps สำหรับ eval (ไม่ต้องรัน 3.2M ทั้งหมด) ***
+    *** เนเธเน cost model เน€เธ”เธตเธขเธงเธเธฑเธเธเธฑเธ CryptoFuturesEnv ***
+    *** เนเธเน last 200K steps เธชเธณเธซเธฃเธฑเธ eval (เนเธกเนเธ•เนเธญเธเธฃเธฑเธ 3.2M เธ—เธฑเนเธเธซเธกเธ”) ***
     """
     trading_config = (config or {}).get("trading", {})
     validation_config = (config or {}).get("training", {}).get("validation", {})
@@ -943,8 +945,8 @@ def run_validation(
         results["dsr"] = {"status": "ERROR", "error": str(e)}
 
     # Feature consistency check (subsample to realistic window size)
-    # KS test กับ 100K samples อ่อนไหวเกินไป (detect noise ไม่ใช่ real drift)
-    # ใช้ 500 samples เหมือน production drift detector window
+    # KS test เธเธฑเธ 100K samples เธญเนเธญเธเนเธซเธงเน€เธเธดเธเนเธ (detect noise เนเธกเนเนเธเน real drift)
+    # เนเธเน 500 samples เน€เธซเธกเธทเธญเธ production drift detector window
     from features.validation import check_feature_consistency
     half = len(feature_array) // 2
     subsample_n = min(500, half)
@@ -1015,10 +1017,10 @@ def test_risk_manager() -> dict:
         decision1.approved
         and not decision2.approved
         and decision3.approved
-        and decision3.size < decision1.size  # low confidence → smaller size
+        and decision3.size < decision1.size  # low confidence โ’ smaller size
     )
     results["all_checks_passed"] = passed
-    logger.info(f"Risk Manager: {'PASS' if passed else 'FAIL'} — {results}")
+    logger.info(f"Risk Manager: {'PASS' if passed else 'FAIL'} โ€” {results}")
     return results
 
 
@@ -1030,7 +1032,7 @@ def test_drift_detection(feature_array: np.ndarray) -> dict:
     """Test drift detector with feature data."""
     from monitoring.live.drift_detector import DriftDetector
 
-    # Subsample reference เพื่อให้ KS test ไม่ oversensitive
+    # Subsample reference เน€เธเธทเนเธญเนเธซเน KS test เนเธกเน oversensitive
     # Production: reference = training data (~500 samples window)
     half = len(feature_array) // 2
     rng = np.random.RandomState(42)
@@ -1083,7 +1085,7 @@ def test_live_components() -> dict:
     agg.on_trade(49900.0, 0.8, base_ts + 120000)
     assert not agg.candle_closed, "Candle should NOT close mid-candle"
 
-    # Next candle period → triggers close
+    # Next candle period โ’ triggers close
     agg.on_trade(50200.0, 1.2, base_ts + 900000)
     assert agg.candle_closed, "Candle SHOULD close when new period starts"
 
@@ -1170,7 +1172,7 @@ def test_forecasters(prices: np.ndarray) -> dict:
             device="cpu",
         )
 
-        # Predict (untrained — expect random output)
+        # Predict (untrained โ€” expect random output)
         forecast, uncertainty = mamba.predict(test_prices, horizon=12)
         results["crypto_mamba_predict"] = {
             "available": mamba.available,
@@ -1237,9 +1239,9 @@ def test_benchmarks(prices: np.ndarray) -> dict:
 def test_regime_backtest(df: pd.DataFrame, ta_slice: np.ndarray) -> dict:
     """Run backtest across different market regimes.
 
-    *** ใช้ FULL data + aggregate เป็น 15m ก่อนรัน strategy ***
-    - Full data เพื่อครอบคลุมทุก regime (COVID ถึง Present)
-    - 15m aggregation เพื่อไม่ overtrade เหมือน benchmarks
+    *** เนเธเน FULL data + aggregate เน€เธเนเธ 15m เธเนเธญเธเธฃเธฑเธ strategy ***
+    - Full data เน€เธเธทเนเธญเธเธฃเธญเธเธเธฅเธธเธกเธ—เธธเธ regime (COVID เธ–เธถเธ Present)
+    - 15m aggregation เน€เธเธทเนเธญเนเธกเน overtrade เน€เธซเธกเธทเธญเธ benchmarks
     """
     from execution.backtest.regime_test import run_regime_backtest, compute_regime_stats
     from execution.backtest.benchmarks import aggregate_to_candles
@@ -1254,8 +1256,8 @@ def test_regime_backtest(df: pd.DataFrame, ta_slice: np.ndarray) -> dict:
         logger.warning("Full data not found, using subsampled data")
 
     # Aggregate to 15m for realistic strategy signals
-    # *** RSI บน 1m จะ overtrade 16K+ times → -99% ทุก regime ***
-    # *** RSI บน 15m จะ trade ~1-2K times → ผลลัพธ์สมจริง ***
+    # *** RSI เธเธ 1m เธเธฐ overtrade 16K+ times โ’ -99% เธ—เธธเธ regime ***
+    # *** RSI เธเธ 15m เธเธฐ trade ~1-2K times โ’ เธเธฅเธฅเธฑเธเธเนเธชเธกเธเธฃเธดเธ ***
     prices_1m = df_full["close"].values
     prices_15m = aggregate_to_candles(prices_1m, period=15)
 
@@ -1304,7 +1306,7 @@ def test_feature_importance(feature_array: np.ndarray, prices: np.ndarray) -> di
     returns = np.diff(prices) / prices[:-1]
     labels = (returns > 0).astype(int)
 
-    # Align: features[:-1] → labels
+    # Align: features[:-1] โ’ labels
     X = feature_array[:-1]
     y = labels
 
@@ -1345,10 +1347,10 @@ def test_feature_importance(feature_array: np.ndarray, prices: np.ndarray) -> di
 # =============================================================================
 
 def run_test_pipeline(config_path: str | None = None):
-    """Full system test — ทดสอบทุก component ด้วย RTX 2060 6GB.
+    """Full system test โ€” เธ—เธ”เธชเธญเธเธ—เธธเธ component เธ”เนเธงเธข RTX 2060 6GB.
 
-    ทำทุกอย่างเหมือน full training แต่ใช้ data น้อยลง + timesteps น้อยลง.
-    เป้าหมาย: validate logic ทั้งระบบ ก่อน deploy cloud GPU.
+    เธ—เธณเธ—เธธเธเธญเธขเนเธฒเธเน€เธซเธกเธทเธญเธ full training เนเธ•เนเนเธเน data เธเนเธญเธขเธฅเธ + timesteps เธเนเธญเธขเธฅเธ.
+    เน€เธเนเธฒเธซเธกเธฒเธข: validate logic เธ—เธฑเนเธเธฃเธฐเธเธ เธเนเธญเธ deploy cloud GPU.
     """
     config_path = config_path or "configs/test_rtx2060.yaml"
     config = load_config(config_path)
@@ -1357,7 +1359,7 @@ def run_test_pipeline(config_path: str | None = None):
     report = {"phases": {}, "errors": []}
 
     logger.info("=" * 70)
-    logger.info("GARIC — Full System Test (RTX 2060 Mode)")
+    logger.info("GARIC โ€” Full System Test (RTX 2060 Mode)")
     logger.info("=" * 70)
 
     # GPU check
@@ -1591,7 +1593,7 @@ def run_test_pipeline(config_path: str | None = None):
 # =============================================================================
 
 def _aggregate_ohlcv_15m(df: pd.DataFrame, period: int = 15) -> pd.DataFrame:
-    """Aggregate 1m OHLCV → 15m OHLCV (proper aggregation, not just close)."""
+    """Aggregate 1m OHLCV โ’ 15m OHLCV (proper aggregation, not just close)."""
     n = len(df)
     n_candles = n // period
     if n_candles <= 0:
@@ -1625,13 +1627,13 @@ def _aggregate_ohlcv_15m(df: pd.DataFrame, period: int = 15) -> pd.DataFrame:
 
 
 def run_training_pipeline(config_path: str | None = None, no_cache: bool = False):
-    """Full training pipeline — aggregate 15m → features → train → backtest.
+    """Full training pipeline โ€” aggregate 15m โ’ features โ’ train โ’ backtest.
 
     *** KEY FIXES ***
-    1. Aggregate 1m → 15m ก่อนทุกอย่าง (216K candles แทน 3.2M)
-    2. ใช้ TA features เท่านั้น (20 features แทน 346)
+    1. Aggregate 1m โ’ 15m เธเนเธญเธเธ—เธธเธเธญเธขเนเธฒเธ (216K candles เนเธ—เธ 3.2M)
+    2. Use compact returns + TA + micro features (25 dims instead of the old 346-dim raw window)
     3. Short episodes (2000 candles) + random start
-    4. PPO ent_coef=0.02 ป้องกัน entropy collapse
+    4. PPO ent_coef=0.02 เธเนเธญเธเธเธฑเธ entropy collapse
     """
     from monitoring.display import Dashboard
 
@@ -1659,7 +1661,7 @@ def run_training_pipeline(config_path: str | None = None, no_cache: bool = False
     raw_dir = Path(data_config["paths"]["raw"])
 
     use_cache = not no_cache
-    from data.cache import load_features, save_features
+    from data.cache import FEATURE_SCHEMA_VERSION, load_features, save_features
 
     for symbol in pairs:
         config["_active_symbol"] = symbol
@@ -1688,6 +1690,19 @@ def run_training_pipeline(config_path: str | None = None, no_cache: bool = False
         cached = load_features(symbol, source_paths) if use_cache else None
 
         # Validate cache: reject if too small (stale from test run with subsample)
+        if cached is not None:
+            try:
+                cached_schema_version = int(np.asarray(cached.get("schema_version", [0])).reshape(-1)[0])
+                if cached_schema_version != FEATURE_SCHEMA_VERSION:
+                    logger.warning(
+                        "Cache invalidated: schema version %d != expected %d. Rebuilding.",
+                        cached_schema_version,
+                        FEATURE_SCHEMA_VERSION,
+                    )
+                    cached = None
+            except Exception:
+                cached = None
+
         if cached is not None:
             try:
                 import pyarrow.parquet as pq
@@ -1722,7 +1737,9 @@ def run_training_pipeline(config_path: str | None = None, no_cache: bool = False
                 df_nav, _, _ = load_and_clean_data(config, symbol)
                 df_nav_15m = _aggregate_ohlcv_15m(df_nav, period=15)
                 if len(df_nav_15m) == len(prices):
-                    config["_nautilus_frame"] = df_nav_15m[["open_time", "open", "high", "low", "close", "volume"]].reset_index(drop=True)
+                    config["_nautilus_frame"] = df_nav_15m[
+                        ["open_time", "open", "high", "low", "close", "volume"]
+                    ].reset_index(drop=True)
                 else:
                     logger.warning(
                         "Cached Nautilus frame length mismatch for %s: raw_15m=%d cached=%d. Falling back to reconstructed frame.",
@@ -1745,7 +1762,7 @@ def run_training_pipeline(config_path: str | None = None, no_cache: bool = False
             dash.add_phase("15m OHLCV Aggregation", "ok", time.time() - t0)
             dash.update(data_15m=len(df_15m))
 
-            # Step 3: Compute features on 15m data (TA + micro = 20 features)
+            # Step 3: Compute compact 15m features (returns + TA + micro = 25 dims)
             from features.technical.indicators import compute_all as compute_ta
             from features.technical.microstructure import compute_all as compute_micro
 
@@ -1756,83 +1773,129 @@ def run_training_pipeline(config_path: str | None = None, no_cache: bool = False
             close_15m = df_15m["close"].values.astype(np.float64)
             log_ret = np.log(close_15m[1:] / close_15m[:-1])
             returns_1 = np.concatenate([[0], log_ret])
-            returns_4 = pd.Series(returns_1).rolling(4).sum().fillna(0).values  # 1h
-            returns_16 = pd.Series(returns_1).rolling(16).sum().fillna(0).values  # 4h
-            returns_96 = pd.Series(returns_1).rolling(96).sum().fillna(0).values  # 1d
-            ret_features = np.column_stack([returns_1, returns_4, returns_16, returns_96]).astype(np.float32)
+            returns_4 = pd.Series(returns_1).rolling(4).sum().fillna(0).values
+            returns_16 = pd.Series(returns_1).rolling(16).sum().fillna(0).values
+            returns_48 = pd.Series(returns_1).rolling(48).sum().fillna(0).values
+            returns_96 = pd.Series(returns_1).rolling(96).sum().fillna(0).values
+            ret_features = np.column_stack(
+                [returns_1, returns_4, returns_16, returns_48, returns_96]
+            ).astype(np.float32)
 
-            # CryptoMamba forecast features (with accuracy validation)
-            dash.update(status_msg="Fine-tuning CryptoMamba...")
-            from models.forecast.crypto_mamba import CryptoMambaForecaster
-            mamba = CryptoMambaForecaster(
-                context_len=128, horizon=4, d_model=64, n_layers=4,
-                device="cuda" if gpu_name else "cpu",
-            )
-            mamba_quality_ok = False
+            # CryptoMamba forecast features are optional and disabled by default.
+            # This implementation uses a sequential scan, so it can be expensive
+            # on Windows/consumer GPUs unless kept on a small budget.
             n_15m = len(close_15m)
             forecast_feats = np.zeros((n_15m, 5), dtype=np.float32)
-
-            if mamba.available:
-                logger.info("Fine-tuning CryptoMamba on 15m data...")
-                ft_result = mamba.fine_tune(
-                    close_15m, epochs=20, lr=1e-3, batch_size=256,
-                    max_samples=50_000, patience=5,
-                    save_path="checkpoints/crypto_mamba_15m.pt",
-                )
-
-                # Quality gate: only use forecasts if better than naive
-                mamba_quality_ok = bool(ft_result.get("better_than_naive", False))
-                dir_acc = ft_result.get("directional_accuracy", 0.0)
-                rmse_ratio = ft_result.get("rmse_ratio_vs_naive", 999.0)
-
-                if mamba_quality_ok:
-                    logger.info(
-                        "CryptoMamba PASSED quality gate: dir_acc=%.1f%% rmse_ratio=%.3f — using forecast features",
-                        dir_acc * 100, rmse_ratio,
-                    )
-                    # Generate forecast features
-                    ctx_len = 128
-                    sample_step = 10
-                    indices = list(range(ctx_len, n_15m, sample_step))
-                    n_preds = len(indices)
-                    logger.info(f"Generating CryptoMamba forecasts ({n_preds} predictions, batched)...")
-                    dash.update(status_msg=f"CryptoMamba batch predict ({n_preds})...")
-
-                    windows = np.array([close_15m[i - ctx_len:i] for i in indices])
-                    try:
-                        preds, uncs = mamba.predict_batch(windows, horizon=4)
-                        for k, i in enumerate(indices):
-                            last_p = close_15m[i - 1]
-                            if last_p > 0:
-                                fc = (preds[k, :4] / last_p - 1).astype(np.float32)
-                                end = min(i + sample_step, n_15m)
-                                forecast_feats[i:end, :4] = fc
-                                forecast_feats[i:end, 4] = float(uncs[k])
-                    except Exception as e:
-                        logger.warning(f"CryptoMamba batch predict failed: {e}")
-                        forecast_feats[:] = 0.0
-                        mamba_quality_ok = False
-                else:
-                    logger.warning(
-                        "CryptoMamba FAILED quality gate: dir_acc=%.1f%% rmse_ratio=%.3f — "
-                        "forecast features zeroed out (worse than naive baseline)",
-                        dir_acc * 100, rmse_ratio,
-                    )
-
-            mamba.release_gpu()
-            dash.add_phase(
-                f"CryptoMamba Forecast ({'GOOD' if mamba_quality_ok else 'ZEROED'})",
-                "ok" if mamba_quality_ok else "warn",
+            mamba_quality_ok = False
+            mamba_phase_label = "CryptoMamba Forecast (DISABLED)"
+            mamba_phase_status = "warn"
+            mamba_cfg = (
+                config.get("training", {})
+                .get("forecast_features", {})
+                .get("crypto_mamba", {})
             )
+            mamba_enabled = bool(mamba_cfg.get("enabled", False))
+            mamba = None
 
-            # Volatility feature (rolling 20-period std of returns)
-            vol_20 = pd.Series(returns_1).rolling(20).std().fillna(0).values.astype(np.float32)
+            if mamba_enabled:
+                dash.update(status_msg="Evaluating CryptoMamba...")
+                from models.forecast.crypto_mamba import CryptoMambaForecaster
 
-            # Combine: TA(15) + Micro(5) + Returns(4) + Forecast(5) + Vol(1) = 30 features
-            feature_array = np.concatenate([
-                ta_15m, micro_15m, ret_features,
-                forecast_feats, vol_20.reshape(-1, 1),
-            ], axis=1)
+                ctx_len = int(mamba_cfg.get("context_len", 96))
+                pred_horizon = max(1, min(int(mamba_cfg.get("horizon", 4)), 4))
+                sample_step = max(1, int(mamba_cfg.get("sample_step", 15)))
+                mamba = CryptoMambaForecaster(
+                    context_len=ctx_len,
+                    horizon=pred_horizon,
+                    d_model=int(mamba_cfg.get("d_model", 32)),
+                    n_layers=int(mamba_cfg.get("n_layers", 2)),
+                    device=str(mamba_cfg.get("device", "cuda" if gpu_name else "cpu")),
+                )
+                mamba_phase_label = "CryptoMamba Forecast (UNAVAILABLE)"
+
+                if mamba.available:
+                    logger.info(
+                        "Fine-tuning CryptoMamba on 15m data with conservative budget: "
+                        "ctx=%d horizon=%d stride=%d epochs=%d batch=%d max_samples=%d patience=%d",
+                        ctx_len,
+                        pred_horizon,
+                        int(mamba_cfg.get("window_stride", 4)),
+                        int(mamba_cfg.get("epochs", 6)),
+                        int(mamba_cfg.get("batch_size", 128)),
+                        int(mamba_cfg.get("max_samples", 12_000)),
+                        int(mamba_cfg.get("patience", 2)),
+                    )
+                    ft_result = mamba.fine_tune(
+                        close_15m,
+                        epochs=int(mamba_cfg.get("epochs", 6)),
+                        lr=float(mamba_cfg.get("lr", 1e-3)),
+                        batch_size=int(mamba_cfg.get("batch_size", 128)),
+                        max_samples=int(mamba_cfg.get("max_samples", 12_000)),
+                        patience=int(mamba_cfg.get("patience", 2)),
+                        min_improvement=float(mamba_cfg.get("min_improvement", 0.002)),
+                        window_stride=int(mamba_cfg.get("window_stride", 4)),
+                        eval_batch_size=int(mamba_cfg.get("eval_batch_size", 1024)),
+                        use_amp=bool(mamba_cfg.get("use_amp", True)),
+                        save_path=str(mamba_cfg.get("save_path", "checkpoints/crypto_mamba_15m.pt")),
+                    )
+
+                    mamba_quality_ok = bool(ft_result.get("better_than_naive", False))
+                    dir_acc = float(ft_result.get("directional_accuracy", 0.0))
+                    rmse_ratio = float(ft_result.get("rmse_ratio_vs_naive", 999.0))
+
+                    if mamba_quality_ok:
+                        logger.info(
+                            "CryptoMamba PASSED quality gate: dir_acc=%.1f%% rmse_ratio=%.3f - using forecast features",
+                            dir_acc * 100,
+                            rmse_ratio,
+                        )
+                        indices = list(range(ctx_len, n_15m, sample_step))
+                        n_preds = len(indices)
+                        logger.info("Generating CryptoMamba forecasts (%d predictions, batched)...", n_preds)
+                        dash.update(status_msg=f"CryptoMamba batch predict ({n_preds})...")
+
+                        windows = np.array([close_15m[i - ctx_len:i] for i in indices], dtype=np.float32)
+                        try:
+                            preds, uncs = mamba.predict_batch(
+                                windows,
+                                horizon=pred_horizon,
+                                batch_size=int(mamba_cfg.get("predict_batch_size", 1024)),
+                            )
+                            for k, i in enumerate(indices):
+                                last_p = close_15m[i - 1]
+                                if last_p > 0:
+                                    fc = (preds[k, :pred_horizon] / last_p - 1.0).astype(np.float32)
+                                    end = min(i + sample_step, n_15m)
+                                    forecast_feats[i:end, :pred_horizon] = fc
+                                    forecast_feats[i:end, 4] = float(uncs[k])
+                            mamba_phase_label = "CryptoMamba Forecast (GOOD)"
+                            mamba_phase_status = "ok"
+                        except Exception as e:
+                            logger.warning("CryptoMamba batch predict failed: %s", e)
+                            forecast_feats[:] = 0.0
+                            mamba_quality_ok = False
+                            mamba_phase_label = "CryptoMamba Forecast (PREDICT FAILED)"
+                    else:
+                        logger.warning(
+                            "CryptoMamba FAILED quality gate: dir_acc=%.1f%% rmse_ratio=%.3f - forecast features zeroed out",
+                            dir_acc * 100,
+                            rmse_ratio,
+                        )
+                        mamba_phase_label = "CryptoMamba Forecast (ZEROED)"
+                else:
+                    logger.warning("CryptoMamba unavailable on this environment - forecast features zeroed out.")
+            else:
+                logger.info("CryptoMamba disabled by config - forecast features zeroed out.")
+
+            if mamba is not None:
+                mamba.release_gpu()
+            dash.add_phase(mamba_phase_label, mamba_phase_status)
+
+            # Combine a compact feature state; include forecast block only when it passed the quality gate.
+            feature_blocks = [ret_features, ta_15m, micro_15m]
+            if mamba_quality_ok:
+                feature_blocks.append(forecast_feats)
+            feature_array = np.concatenate(feature_blocks, axis=1)
             feature_array = np.nan_to_num(feature_array, nan=0.0, posinf=0.0, neginf=0.0)
             prices = close_15m.astype(np.float32)
             ohlcv_data = df_15m[["open", "high", "low", "close"]].values.astype(np.float32)
@@ -1939,7 +2002,7 @@ def _print_report(report: dict, start_time: float):
     total_time = time.time() - start_time
 
     logger.info("\n" + "=" * 70)
-    logger.info("GARIC — System Test Report")
+    logger.info("GARIC โ€” System Test Report")
     logger.info("=" * 70)
 
     n_ok = 0
@@ -1976,10 +2039,10 @@ def _print_report(report: dict, start_time: float):
     logger.info("=" * 70)
 
     if n_fail == 0:
-        logger.info("ALL PHASES PASSED — ระบบพร้อมใช้งาน")
+        logger.info("ALL PHASES PASSED โ€” เธฃเธฐเธเธเธเธฃเนเธญเธกเนเธเนเธเธฒเธ")
         logger.info("Next: python pipeline.py --mode train (full data, cloud GPU)")
     else:
-        logger.info(f"{n_fail} PHASES FAILED — ต้องแก้ไขก่อน deploy")
+        logger.info(f"{n_fail} PHASES FAILED โ€” เธ•เนเธญเธเนเธเนเนเธเธเนเธญเธ deploy")
 
 
 # =============================================================================
