@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 from decimal import Decimal
 from typing import Any
@@ -57,6 +58,64 @@ def _require_nautilus() -> None:
         raise ModuleNotFoundError(
             "nautilus_trader is required for Nautilus backtests"
         ) from _NAUTILUS_IMPORT_ERROR
+
+
+def _is_running(obj: object | None) -> bool:
+    if obj is None:
+        return False
+    try:
+        return bool(getattr(obj, "is_running", False))
+    except Exception:
+        return False
+
+
+def _is_disposed(obj: object | None) -> bool:
+    if obj is None:
+        return False
+    try:
+        return bool(getattr(obj, "is_disposed", False))
+    except Exception:
+        return False
+
+
+def _safe_dispose_engine(engine) -> None:
+    """Shut down a backtest engine safely on Windows and on failed runs.
+
+    Nautilus `run(streaming=False)` normally finalizes via `end()` itself, but if an
+    exception interrupts the run the engine can still be in a RUNNING state. Calling
+    `dispose()` directly in that case causes `InvalidStateTrigger('RUNNING -> DISPOSE')`.
+    """
+    if engine is None:
+        return
+
+    trader = getattr(engine, "trader", None)
+    kernel = getattr(engine, "kernel", None)
+    kernel_parts = [
+        getattr(kernel, "trader", None),
+        getattr(kernel, "data_engine", None),
+        getattr(kernel, "risk_engine", None),
+        getattr(kernel, "exec_engine", None),
+        getattr(kernel, "emulator", None),
+    ]
+    engine_running = _is_running(trader) or any(_is_running(part) for part in kernel_parts)
+
+    if engine_running:
+        try:
+            engine.end()
+        except Exception as exc:
+            logger.warning("Nautilus engine.end() during cleanup failed: %s", exc)
+
+    if _is_disposed(trader):
+        return
+
+    try:
+        engine.dispose()
+    except Exception as exc:
+        message = str(exc)
+        if "InvalidStateTrigger" in message:
+            logger.warning("Ignoring Nautilus dispose state conflict during cleanup: %s", message)
+            return
+        raise
 
 
 def _aggregate_to_15m(df: pd.DataFrame, minutes: int) -> pd.DataFrame:
@@ -351,7 +410,7 @@ def run_backtest_frame(
         state.update(status="ERROR", error=str(exc), event=f"Nautilus {mode} failed: {exc}")
         raise
     finally:
-        engine.dispose()
+        _safe_dispose_engine(engine)
 
 
 def run_backtest(config_path: str | None = None, limit_bars: int | None = None) -> dict:
@@ -396,6 +455,21 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="GARIC Nautilus backtest runner")
     parser.add_argument("--config", default="configs/nautilus.yaml")
     parser.add_argument("--limit-bars", type=int, default=None)
+    parser.add_argument("--frame-parquet", default=None)
+    parser.add_argument("--model-path", default=None)
+    parser.add_argument("--symbol", default="BTCUSDT")
+    parser.add_argument("--venue", default="BINANCE")
+    parser.add_argument("--bar-minutes", type=int, default=15)
+    parser.add_argument("--history-bars", type=int, default=160)
+    parser.add_argument("--request-history-days", type=int, default=3)
+    parser.add_argument("--trade-size", default="0.002")
+    parser.add_argument("--initial-balance-usdt", type=float, default=10000.0)
+    parser.add_argument("--leverage", type=float, default=1.0)
+    parser.add_argument("--state-path", default="checkpoints/nautilus_dashboard_state.json")
+    parser.add_argument("--mode", default="backtest")
+    parser.add_argument("--monthly-server-cost-usd", type=float, default=100.0)
+    parser.add_argument("--periods-per-day", type=int, default=96)
+    parser.add_argument("--summary-json", default=None)
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -406,7 +480,29 @@ def main() -> int:
             logging.FileHandler("nautilus.log", mode="w", encoding="utf-8"),
         ],
     )
-    run_backtest(args.config, limit_bars=args.limit_bars)
+    if args.frame_parquet:
+        frame = pd.read_parquet(args.frame_parquet)
+        summary = run_backtest_frame(
+            frame,
+            symbol=args.symbol,
+            model_path=str(args.model_path),
+            venue=args.venue,
+            bar_minutes=int(args.bar_minutes),
+            history_bars=int(args.history_bars),
+            request_history_days=int(args.request_history_days),
+            trade_size=str(args.trade_size),
+            initial_balance_usdt=float(args.initial_balance_usdt),
+            leverage=float(args.leverage),
+            state_path=str(args.state_path),
+            mode=str(args.mode),
+            monthly_server_cost_usd=float(args.monthly_server_cost_usd),
+            periods_per_day=int(args.periods_per_day),
+        )
+        if args.summary_json:
+            with open(args.summary_json, "w", encoding="utf-8") as f:
+                json.dump(summary, f, ensure_ascii=False, indent=2, default=str)
+    else:
+        run_backtest(args.config, limit_bars=args.limit_bars)
     return 0
 
 

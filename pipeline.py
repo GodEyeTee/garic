@@ -19,6 +19,9 @@ Usage:
 import logging
 import time
 import sys
+import copy
+import json
+import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -28,6 +31,7 @@ from configs import load_config
 from data.quality import clean_pipeline
 from features.builder import FeatureBuilder
 from models.forecast.naive import NaiveForecaster
+from models.rl.environment import build_agent_state
 from execution.backtest.runner import BacktestRunner, BacktestConfig
 
 logger = logging.getLogger(__name__)
@@ -191,6 +195,141 @@ def _compute_data_ranges(
     }
 
 
+def _robust_validation_score(scores: list[float] | tuple[float, ...]) -> float:
+    """Aggregate validation scores conservatively across multiple seed runs."""
+    arr = np.asarray(scores, dtype=np.float64)
+    if arr.size == 0 or not np.all(np.isfinite(arr)):
+        return float("-inf")
+    median = float(np.median(arr))
+    worst = float(np.min(arr))
+    return float(median + 0.25 * worst)
+
+
+def _aggregate_validation_metrics(metric_runs: list[dict], scores: list[float] | tuple[float, ...]) -> dict:
+    """Summarize repeated validation runs into a conservative representative metrics dict."""
+    if not metric_runs:
+        return {}
+
+    aggregated = dict(metric_runs[0])
+    numeric_keys = set()
+    for run in metric_runs:
+        numeric_keys.update(
+            key for key, value in run.items()
+            if isinstance(value, (int, float, np.integer, np.floating))
+        )
+
+    for key in numeric_keys:
+        values = [
+            float(run[key]) for run in metric_runs
+            if isinstance(run.get(key), (int, float, np.integer, np.floating))
+        ]
+        if len(values) != len(metric_runs):
+            continue
+        arr = np.asarray(values, dtype=np.float64)
+        if key in {"eval_dominant_action_ratio", "flat_ratio", "max_drawdown"}:
+            aggregated[key] = float(np.max(arr))
+        else:
+            aggregated[key] = float(np.median(arr))
+
+    score_arr = np.asarray(scores, dtype=np.float64)
+    finite_mask = np.isfinite(score_arr)
+    aggregated["validation_seed_runs"] = int(len(metric_runs))
+    aggregated["validation_seed_all_finite"] = 1.0 if bool(np.all(finite_mask)) else 0.0
+    if np.any(finite_mask):
+        finite_scores = score_arr[finite_mask]
+        aggregated["validation_score_median"] = float(np.median(finite_scores))
+        aggregated["validation_score_worst"] = float(np.min(finite_scores))
+    else:
+        aggregated["validation_score_median"] = float("-inf")
+        aggregated["validation_score_worst"] = float("-inf")
+    aggregated["validation_score_robust"] = _robust_validation_score(list(scores))
+    return aggregated
+
+
+def _combine_supervised_validation_scores(
+    episodic_score: float,
+    walkforward_metrics: dict,
+    trainer,
+    *,
+    max_dominant_action_ratio: float,
+    min_avg_trades_per_episode: float,
+    min_action_entropy: float,
+    walkforward_score_weight: float = 0.20,
+    walkforward_min_active_ratio: float = 0.25,
+    walkforward_inactivity_penalty_scale: float = 1.50,
+    walkforward_worst_net_penalty_scale: float = 4.0,
+    walkforward_worst_gross_penalty_scale: float = 3.0,
+    walkforward_worst_alpha_penalty_scale: float = 0.50,
+    walkforward_dominance_penalty_scale: float = 3.0,
+) -> tuple[float, float, dict]:
+    """Blend episodic validation with walk-forward stress testing without hard-failing on one flat window."""
+    if not np.isfinite(episodic_score):
+        return float("-inf"), float("-inf"), {}
+
+    walkforward_soft_score = float(
+        trainer.score_candidate(
+            walkforward_metrics,
+            max_dominant_action_ratio=1.0,
+            min_avg_trades_per_episode=0.0,
+            min_action_entropy=0.0,
+        )
+    )
+    if not np.isfinite(walkforward_soft_score):
+        walkforward_soft_score = -2.0
+
+    active_ratio = float(walkforward_metrics.get("walkforward_active_window_ratio", 0.0))
+    worst_net = float(walkforward_metrics.get("walkforward_min_total_return", walkforward_metrics.get("total_return", 0.0)))
+    worst_gross = float(
+        walkforward_metrics.get("walkforward_min_gross_total_return", walkforward_metrics.get("gross_total_return", 0.0))
+    )
+    worst_alpha = float(walkforward_metrics.get("walkforward_min_alpha", walkforward_metrics.get("outperformance_vs_bh", 0.0)))
+    worst_dom_ratio = float(
+        walkforward_metrics.get(
+            "walkforward_worst_dominant_action_ratio",
+            walkforward_metrics.get("eval_dominant_action_ratio", 1.0),
+        )
+    )
+    median_trades = float(
+        walkforward_metrics.get(
+            "walkforward_median_trades",
+            walkforward_metrics.get("avg_trades_per_episode", 0.0),
+        )
+    )
+
+    if active_ratio <= 0.0 and median_trades < max(min_avg_trades_per_episode * 0.5, 0.5):
+        return float("-inf"), walkforward_soft_score, {
+            "walkforward_active_window_ratio": active_ratio,
+            "walkforward_soft_score": walkforward_soft_score,
+            "walkforward_penalty": float("inf"),
+            "walkforward_bonus": 0.0,
+        }
+
+    penalty = 0.0
+    penalty += max(walkforward_min_active_ratio - active_ratio, 0.0) * walkforward_inactivity_penalty_scale
+    penalty += max(-worst_net, 0.0) * walkforward_worst_net_penalty_scale
+    penalty += max(-worst_gross, 0.0) * walkforward_worst_gross_penalty_scale
+    penalty += max(-worst_alpha, 0.0) * walkforward_worst_alpha_penalty_scale
+    penalty += max(worst_dom_ratio - max_dominant_action_ratio, 0.0) * walkforward_dominance_penalty_scale
+
+    bonus = active_ratio * 0.15
+    bonus += max(float(walkforward_metrics.get("walkforward_positive_net_ratio", 0.0)) - 0.50, 0.0) * 0.25
+    bonus += max(float(walkforward_metrics.get("walkforward_positive_alpha_ratio", 0.0)) - 0.50, 0.0) * 0.15
+
+    combined_score = (
+        float(episodic_score)
+        + (float(np.clip(walkforward_soft_score, -2.0, 2.0)) * walkforward_score_weight)
+        + bonus
+        - penalty
+    )
+    details = {
+        "walkforward_active_window_ratio": active_ratio,
+        "walkforward_soft_score": float(walkforward_soft_score),
+        "walkforward_penalty": float(penalty),
+        "walkforward_bonus": float(bonus),
+    }
+    return float(combined_score), float(walkforward_soft_score), details
+
+
 def _build_nautilus_frame(
     prices: np.ndarray,
     ohlcv_data: np.ndarray | None = None,
@@ -240,12 +379,16 @@ def _score_nautilus_summary(
 
     trades = float(summary.get("n_trades", 0.0))
     net_return = float(summary.get("total_return", 0.0))
+    gross_return = float(summary.get("gross_total_return", net_return))
     alpha = float(summary.get("outperformance_vs_bh", 0.0))
     win_rate = float(summary.get("win_rate", 0.0))
     flat_ratio = float(summary.get("flat_ratio", 1.0))
     dominant_ratio = float(summary.get("eval_dominant_action_ratio", 1.0))
     action_entropy = float(summary.get("eval_action_entropy", 0.0))
     max_drawdown = abs(float(summary.get("max_drawdown", 0.0)))
+    returns_stats = summary.get("stats_returns", {}) if isinstance(summary.get("stats_returns"), dict) else {}
+    sharpe = float(returns_stats.get("Sharpe Ratio (252 days)", 0.0) or 0.0)
+    wrong_side_penalty = max(float(summary.get("position_ratio", 0.0)) - 0.98, 0.0) * 0.5
 
     if trades < min_trades:
         return float("-inf")
@@ -255,18 +398,22 @@ def _score_nautilus_summary(
     if net_return < -0.10:
         return float("-inf")
 
-    # Reward profitability heavily
-    profit_bonus = max(net_return, 0.0) * 10.0
+    profit_bonus = max(net_return, 0.0) * 15.0
+    gross_bonus = max(gross_return, 0.0) * 8.0
     return (
-        alpha * 6.0
-        + net_return * 5.0
+        net_return * 10.0
+        + gross_return * 6.0
+        + sharpe * 0.20
+        + alpha * 1.5
         + profit_bonus
+        + gross_bonus
         + win_rate * 0.50
         + min(trades, 16.0) * 0.01
         + action_entropy * 0.20
         - max(flat_ratio - 0.95, 0.0) * 2.0
         - max(dominant_ratio - 0.85, 0.0) * 1.5
-        - max(max_drawdown - 0.15, 0.0) * 2.0
+        - max(max_drawdown - 0.15, 0.0) * 2.5
+        - wrong_side_penalty
     )
 
 
@@ -322,6 +469,190 @@ def _run_nautilus_backtest_segment(
     return summary
 
 
+def _run_nautilus_backtest_segment_subprocess(
+    *,
+    model_path: str,
+    frame_15m: pd.DataFrame,
+    segment_range: tuple[int, int],
+    config: dict,
+    label: str,
+) -> dict:
+    start, end = int(segment_range[0]), int(segment_range[1])
+    segment = frame_15m.iloc[start:end].reset_index(drop=True)
+    if len(segment) < 128:
+        raise ValueError(f"Nautilus {label} segment too short: {len(segment)} bars")
+
+    training_config = config.get("training", {})
+    nav_config = training_config.get("nautilus_validation", {})
+    trading_config = config.get("trading", {})
+    symbol = str(config.get("_active_symbol") or config.get("data", {}).get("pairs", ["BTCUSDT"])[0])
+    initial_balance = float(nav_config.get("initial_balance_usdt", 10_000.0))
+    leverage = float(nav_config.get("leverage", trading_config.get("leverage", 1.0)))
+    trade_size_pct = float(nav_config.get("trade_size_pct_of_equity", 1.0))
+    first_price = float(segment["close"].iloc[0])
+    trade_qty = max((initial_balance * trade_size_pct) / max(first_price, 1e-9), 1e-6)
+
+    safe_label = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in label)
+    segment_path = Path("checkpoints") / f"nautilus_segment_{safe_label}.parquet"
+    summary_path = Path("checkpoints") / f"nautilus_segment_{safe_label}_summary.json"
+    state_path = Path("checkpoints") / f"nautilus_{safe_label}.json"
+    segment.to_parquet(segment_path, index=False)
+    if summary_path.exists():
+        summary_path.unlink()
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "execution.nautilus.backtest_runner",
+        "--frame-parquet",
+        str(segment_path),
+        "--model-path",
+        str(model_path),
+        "--symbol",
+        symbol,
+        "--venue",
+        str(nav_config.get("venue", "BINANCE")),
+        "--bar-minutes",
+        str(int(nav_config.get("bar_minutes", 15))),
+        "--history-bars",
+        str(int(nav_config.get("history_bars", 160))),
+        "--request-history-days",
+        str(int(nav_config.get("request_history_days", 3))),
+        "--trade-size",
+        f"{trade_qty:.12f}",
+        "--initial-balance-usdt",
+        str(initial_balance),
+        "--leverage",
+        str(leverage),
+        "--state-path",
+        str(state_path),
+        "--mode",
+        f"train_{label}",
+        "--monthly-server-cost-usd",
+        str(float(trading_config.get("monthly_server_cost_usd", 100.0))),
+        "--periods-per-day",
+        str(int(trading_config.get("periods_per_day", 96))),
+        "--summary-json",
+        str(summary_path),
+    ]
+    collapse_probe_bars = max(int(nav_config.get("collapse_probe_bars", 0)), 0)
+    collapse_probe_min_flat_ratio = float(nav_config.get("collapse_probe_min_flat_ratio", 0.995))
+    collapse_probe_max_trades = max(int(nav_config.get("collapse_probe_max_trades", 0)), 0)
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(Path.cwd()),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    stdout_text = ""
+    stderr_text = ""
+    killed_for_collapse = False
+    collapse_state: dict | None = None
+
+    while True:
+        returncode = proc.poll()
+        if returncode is not None:
+            stdout_text, stderr_text = proc.communicate()
+            break
+
+        if collapse_probe_bars > 0 and state_path.exists():
+            try:
+                with open(state_path, "r", encoding="utf-8") as fh:
+                    runtime_state = json.load(fh)
+                action_counts = runtime_state.get("action_counts", {}) if isinstance(runtime_state, dict) else {}
+                total_actions = int(sum(int(action_counts.get(k, 0)) for k in ("short", "flat", "long")))
+                flat_actions = int(action_counts.get("flat", 0))
+                n_trades = int(runtime_state.get("n_trades", 0))
+                flat_ratio = float(flat_actions) / max(total_actions, 1)
+                if (
+                    total_actions >= collapse_probe_bars
+                    and n_trades <= collapse_probe_max_trades
+                    and flat_ratio >= collapse_probe_min_flat_ratio
+                ):
+                    killed_for_collapse = True
+                    collapse_state = runtime_state
+                    proc.terminate()
+                    try:
+                        stdout_text, stderr_text = proc.communicate(timeout=15)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        stdout_text, stderr_text = proc.communicate()
+                    break
+            except Exception:
+                pass
+
+        time.sleep(2.0)
+
+    if killed_for_collapse:
+        action_counts = collapse_state.get("action_counts", {}) if isinstance(collapse_state, dict) else {}
+        short_actions = int(action_counts.get("short", 0))
+        flat_actions = int(action_counts.get("flat", 0))
+        long_actions = int(action_counts.get("long", 0))
+        total_actions = max(short_actions + flat_actions + long_actions, 1)
+        flat_ratio = float(flat_actions) / float(total_actions)
+        position_ratio = 1.0 - flat_ratio
+        probabilities = np.array([short_actions, flat_actions, long_actions], dtype=np.float64) / float(total_actions)
+        entropy = float(-np.sum(np.where(probabilities > 0, probabilities * np.log(probabilities), 0.0)))
+        periods_per_month = max(int(trading_config.get("periods_per_day", 96)) * 30, 1)
+        server_cost_paid = float(total_actions / periods_per_month) * float(
+            trading_config.get("monthly_server_cost_usd", 100.0)
+        )
+        gross_total_return = 0.0
+        total_return = -server_cost_paid / max(initial_balance, 1e-9)
+        last_idx = min(total_actions, len(segment)) - 1
+        last_close = float(segment["close"].iloc[last_idx])
+        bh_eval_return = (last_close / max(first_price, 1e-9)) - 1.0
+        dominant_counts = [short_actions, flat_actions, long_actions]
+        dominant_action = int(np.argmax(dominant_counts))
+        dominant_ratio = float(max(dominant_counts)) / float(total_actions)
+        summary = {
+            "status": "EARLY_ABORT_COLLAPSED",
+            "early_abort_reason": "flat_inactive_probe",
+            "n_trades": int(collapse_state.get("n_trades", 0)) if isinstance(collapse_state, dict) else 0,
+            "n_wins": int(collapse_state.get("n_wins", 0)) if isinstance(collapse_state, dict) else 0,
+            "n_losses": int(collapse_state.get("n_losses", 0)) if isinstance(collapse_state, dict) else 0,
+            "win_rate": float(collapse_state.get("win_rate", 0.0)) if isinstance(collapse_state, dict) else 0.0,
+            "action_counts": {"short": short_actions, "flat": flat_actions, "long": long_actions},
+            "last_signal": float(collapse_state.get("action_value", 0.0)) if isinstance(collapse_state, dict) else 0.0,
+            "model_family": str(collapse_state.get("model_family", "")) if isinstance(collapse_state, dict) else "",
+            "model_path": str(collapse_state.get("model_path", model_path)) if isinstance(collapse_state, dict) else str(model_path),
+            "max_drawdown": float(collapse_state.get("max_drawdown", 0.0)) if isinstance(collapse_state, dict) else 0.0,
+            "flat_ratio": flat_ratio,
+            "position_ratio": position_ratio,
+            "eval_action_entropy": max(entropy, 0.0),
+            "eval_dominant_action": float(dominant_action),
+            "eval_dominant_action_ratio": dominant_ratio,
+            "eval_short_actions": float(short_actions),
+            "eval_flat_actions": float(flat_actions),
+            "eval_long_actions": float(long_actions),
+            "server_cost_paid": server_cost_paid,
+            "gross_total_return": gross_total_return,
+            "total_return": total_return,
+            "bh_eval_return": bh_eval_return,
+            "outperformance_vs_bh": total_return - bh_eval_return,
+            "avg_trades_per_episode": float(int(collapse_state.get("n_trades", 0))) if isinstance(collapse_state, dict) else 0.0,
+            "eval_episodes": 1,
+            "stdout_tail": stdout_text[-1000:],
+            "stderr_tail": stderr_text[-1000:],
+        }
+    else:
+        if proc.returncode != 0:
+            message = (stderr_text or "").strip() or (stdout_text or "").strip() or f"subprocess exit code {proc.returncode}"
+            raise RuntimeError(f"Nautilus subprocess validation failed for {label}: {message[-2000:]}")
+        if not summary_path.exists():
+            raise RuntimeError(f"Nautilus subprocess validation did not create summary file: {summary_path}")
+        with open(summary_path, "r", encoding="utf-8") as f:
+            summary = json.load(f)
+
+    summary["segment_label"] = label
+    summary["segment_range"] = [start, end]
+    summary["trade_size_qty"] = float(trade_qty)
+    summary["trade_size_notional_usdt"] = float(trade_qty * first_price)
+    summary["subprocess_validation"] = True
+    return summary
+
+
 # =============================================================================
 # Phase 4: MoE Routing
 # =============================================================================
@@ -365,9 +696,13 @@ def train_rl_agent(
     config: dict,
     dashboard=None,
 ) -> tuple[object | None, dict]:
-    """Train RL agent with PPO. Returns (model, metrics)."""
+    """Train the selected policy family and return (model, metrics)."""
     training_config = config.get("training", {})
     rl_config = training_config.get("rl", {})
+    primary_model = str(training_config.get("primary_model", "hybrid")).strip().lower()
+    ppo_enabled = bool(rl_config.get("enabled", True))
+    if primary_model in {"supervised", "supervised_logreg", "logreg", "supervised_only"}:
+        ppo_enabled = False
 
     total_timesteps = rl_config.get("total_timesteps", 10000)
     learning_rate = rl_config.get("learning_rate", 3e-4)
@@ -376,6 +711,7 @@ def train_rl_agent(
     batch_size = rl_config.get("batch_size", 32)
     n_epochs = rl_config.get("n_epochs", 5)
     algo = rl_config.get("algo", "PPO")
+    training_device = str(training_config.get("device", "auto"))
     supervised_config = training_config.get("supervised_fallback", {})
     eval_episodes = rl_config.get("eval_episodes", 8)
 
@@ -388,6 +724,8 @@ def train_rl_agent(
     # Trading params โ€” เนเธเนเธเนเธฒเน€เธ”เธตเธขเธงเธเธฑเธเธ—เธฑเนเธ Env เนเธฅเธฐ BacktestRunner
     trading_config = config.get("trading", {})
     validation_config = training_config.get("validation", {})
+    selection_windows = int(validation_config.get("selection_windows", 4))
+    selection_min_window_bars = int(validation_config.get("selection_min_window_bars", 4096))
     ranges = _compute_data_ranges(
         len(prices),
         test_ratio=validation_config.get("holdout_test_ratio", 0.20),
@@ -429,8 +767,16 @@ def train_rl_agent(
     if dashboard is not None:
         trainer._dashboard = dashboard
 
-    logger.info(f"Training {algo}: {total_timesteps} steps, lr={learning_rate}, "
-                f"batch={batch_size}, n_steps={n_steps}")
+    logger.info(
+        "%s %s: %d steps, lr=%s, batch=%d, n_steps=%d",
+        "Training" if ppo_enabled else "Configured RL candidate",
+        algo,
+        int(total_timesteps),
+        learning_rate,
+        int(batch_size),
+        int(n_steps),
+    )
+    logger.info("Requested training device: %s", training_device)
     logger.info(
         "Data split: train=[%d:%d) validation=[%d:%d) test=[%d:%d)",
         ranges["train"][0],
@@ -443,16 +789,31 @@ def train_rl_agent(
 
     _log_gpu_memory()
 
-    metrics = trainer.train(
-        total_timesteps=total_timesteps,
-        learning_rate=learning_rate,
-        n_steps=n_steps,
-        batch_size=batch_size,
-        n_epochs=n_epochs,
-        ent_coef=rl_config.get("ent_coef", 0.08),
-        eval_every_steps=rl_config.get("eval_every_steps", 50000),
-        eval_episodes=eval_episodes,
-    )
+    if ppo_enabled:
+        metrics = trainer.train(
+            total_timesteps=total_timesteps,
+            learning_rate=learning_rate,
+            n_steps=n_steps,
+            batch_size=batch_size,
+            n_epochs=n_epochs,
+            ent_coef=rl_config.get("ent_coef", 0.08),
+            eval_every_steps=rl_config.get("eval_every_steps", 50000),
+            eval_episodes=eval_episodes,
+            device=training_device,
+            collapse_eval_patience=rl_config.get("collapse_eval_patience", 4),
+            collapse_min_steps=rl_config.get("collapse_min_steps", 200000),
+        )
+    else:
+        metrics = {
+            "model_family": "ppo_disabled",
+            "selection_best_score": float("-inf"),
+            "selection_gate_passed": 0.0,
+            "ppo_disabled": 1.0,
+        }
+        logger.info(
+            "Primary model strategy '%s' -> skipping PPO training and selecting from supervised candidates only.",
+            primary_model or "hybrid",
+        )
 
     _log_gpu_memory()
 
@@ -460,7 +821,7 @@ def train_rl_agent(
     ppo_model = None
     selected_model = None
     ppo_model_path = Path("checkpoints/rl_agent_final.zip")
-    if ppo_model_path.exists():
+    if ppo_enabled and ppo_model_path.exists():
         try:
             from stable_baselines3 import PPO, SAC
             ModelClass = PPO if algo == "PPO" else SAC
@@ -470,27 +831,30 @@ def train_rl_agent(
             logger.warning(f"Could not load model: {e}")
     selected_model = ppo_model
     selected_metrics = dict(metrics)
-    selected_metrics["model_family"] = "ppo"
-    selected_metrics["model_path"] = str(ppo_model_path).replace("\\", "/")
+    if ppo_model is not None:
+        selected_metrics["model_family"] = "ppo"
+        selected_metrics["model_path"] = str(ppo_model_path).replace("\\", "/")
     candidate_records: list[dict] = []
 
     ppo_validation_score = float("-inf")
     ppo_validation_metrics = None
     if ppo_model is not None:
-        ppo_validation_metrics = trainer._eval_multi_episode(
+        ppo_validation_metrics = trainer._eval_walkforward_segments(
             ppo_model,
-            n_episodes=eval_episodes,
             segment_range=ranges["validation"],
-            log_episodes=False,
+            n_windows=selection_windows,
+            min_window_size=selection_min_window_bars,
         )
         ppo_validation_score = trainer._selection_score(ppo_validation_metrics)
         logger.info(
-            "PPO validation selection: score=%s alpha=%.4f net=%.4f trades=%.1f dominant_ratio=%.2f%%",
+            "PPO walk-forward selection: score=%s median_alpha=%.4f median_net=%.4f worst_net=%.4f trades=%.1f dominant_ratio=%.2f%% windows=%d",
             f"{ppo_validation_score:.4f}" if np.isfinite(ppo_validation_score) else "-inf",
             float(ppo_validation_metrics.get("outperformance_vs_bh", 0.0)),
             float(ppo_validation_metrics.get("total_return", 0.0)),
+            float(ppo_validation_metrics.get("walkforward_min_total_return", ppo_validation_metrics.get("total_return", 0.0))),
             float(ppo_validation_metrics.get("avg_trades_per_episode", 0.0)),
             float(ppo_validation_metrics.get("eval_dominant_action_ratio", 0.0) * 100.0),
+            int(ppo_validation_metrics.get("walkforward_window_count", 1)),
         )
         candidate_records.append(
             {
@@ -505,12 +869,22 @@ def train_rl_agent(
 
     if supervised_config.get("enabled", True):
         try:
-            from models.rl.supervised import train_supervised_action_model
+            from models.rl.supervised import build_constant_action_model, train_supervised_action_model
 
             confidence_grid = supervised_config.get("confidence_grid", [0.34, 0.38, 0.42, 0.46, 0.50])
+            long_confidence_grid = supervised_config.get("long_confidence_grid", confidence_grid)
+            short_confidence_grid = supervised_config.get("short_confidence_grid", confidence_grid)
             model_types = supervised_config.get("model_types", ["logreg", "extratrees"])
             if isinstance(model_types, str):
                 model_types = [model_types]
+            recent_train_bars = int(supervised_config.get("recent_train_bars", 0))
+            supervised_validation_episodes = int(supervised_config.get("validation_episodes", max(eval_episodes, 10)))
+            supervised_validation_seed_runs = max(int(supervised_config.get("validation_seed_runs", 1)), 1)
+            supervised_validation_seed_stride = max(int(supervised_config.get("validation_seed_stride", 500)), 1)
+            supervised_min_selection_score = float(supervised_config.get("min_selection_score", 0.0))
+            supervised_fallback_to_safe_flat = bool(supervised_config.get("fallback_to_safe_flat", True))
+            validation_seed_base = int(training_config.get("seed", 42)) + 1000
+            test_seed_base = int(training_config.get("seed", 42)) + 2000
 
             relaxed_min_avg_trades = float(
                 supervised_config.get("relaxed_min_avg_trades_per_episode", 0.5)
@@ -521,19 +895,66 @@ def train_rl_agent(
             relaxed_min_action_entropy = float(
                 supervised_config.get("relaxed_min_action_entropy", 0.0)
             )
+            regime_confidence_relief = float(
+                supervised_config.get("regime_confidence_relief", 0.0)
+            )
+            walkforward_score_weight = float(supervised_config.get("walkforward_score_weight", 0.20))
+            walkforward_min_active_ratio = float(supervised_config.get("walkforward_min_active_ratio", 0.25))
+            walkforward_inactivity_penalty_scale = float(
+                supervised_config.get("walkforward_inactivity_penalty_scale", 1.50)
+            )
+            walkforward_worst_net_penalty_scale = float(
+                supervised_config.get("walkforward_worst_net_penalty_scale", 4.0)
+            )
+            walkforward_worst_gross_penalty_scale = float(
+                supervised_config.get("walkforward_worst_gross_penalty_scale", 3.0)
+            )
+            walkforward_worst_alpha_penalty_scale = float(
+                supervised_config.get("walkforward_worst_alpha_penalty_scale", 0.50)
+            )
+            walkforward_dominance_penalty_scale = float(
+                supervised_config.get("walkforward_dominance_penalty_scale", 3.0)
+            )
 
             sup_best_model = None
             sup_best_meta = None
             sup_best_conf = None
+            sup_best_long_conf = None
+            sup_best_short_conf = None
             sup_best_score = float("-inf")
             sup_best_priority = -1
             sup_best_mode = "strict"
+            sup_best_validation_metrics = None
+            supervised_candidate_pool: list[dict] = []
+            supervised_candidate_pool_size = max(
+                int(training_config.get("nautilus_validation", {}).get("top_supervised_candidates", 3)),
+                1,
+            )
+            supervised_train_range = ranges["train"]
+            if recent_train_bars > 0:
+                train_end = int(ranges["train"][1])
+                train_start = max(int(ranges["train"][0]), train_end - recent_train_bars)
+                supervised_train_range = (train_start, train_end)
+            logger.info(
+                "Supervised fallback selection: train=[%d:%d) validation=[%d:%d) "
+                "recent_train_bars=%d validation_episodes=%d validation_seed_runs=%d min_selection_score=%.4f "
+                "walkforward_windows=%d",
+                int(supervised_train_range[0]),
+                int(supervised_train_range[1]),
+                int(ranges["validation"][0]),
+                int(ranges["validation"][1]),
+                recent_train_bars,
+                supervised_validation_episodes,
+                supervised_validation_seed_runs,
+                supervised_min_selection_score,
+                selection_windows,
+            )
 
             for model_type in model_types:
                 sup_model, sup_meta = train_supervised_action_model(
                     feature_array=feature_array,
                     prices=prices,
-                    train_range=ranges["train"],
+                    train_range=supervised_train_range,
                     validation_range=ranges["validation"],
                     model_type=model_type,
                     horizon=supervised_config.get("horizon", 16),
@@ -546,67 +967,264 @@ def train_rl_agent(
                     extra_trees_min_samples_leaf=supervised_config.get("extra_trees_min_samples_leaf", 32),
                     min_hold_steps=supervised_config.get("min_hold_steps", 16),
                     reversal_margin=supervised_config.get("reversal_margin", 0.08),
+                    entry_margin=supervised_config.get("entry_margin", 0.08),
+                    exit_to_flat_margin=supervised_config.get("exit_to_flat_margin", 0.05),
+                    max_hold_steps=supervised_config.get("max_hold_steps", 64),
+                    stop_loss_threshold=supervised_config.get("stop_loss_threshold", -0.012),
+                    drawdown_exit_threshold=supervised_config.get("drawdown_exit_threshold", 0.04),
+                    trend_alignment_threshold=supervised_config.get("trend_alignment_threshold", 0.0015),
+                    countertrend_margin=supervised_config.get("countertrend_margin", 0.08),
+                    regime_confidence_relief=regime_confidence_relief,
+                    flat_reentry_cooldown_steps=supervised_config.get("flat_reentry_cooldown_steps", 0),
+                    taker_fee=trading_config.get("taker_fee", 0.0005),
+                    slippage_bps=trading_config.get("slippage_bps", 1.0),
+                    leverage=trading_config.get("leverage", 1.0),
                     random_state=training_config.get("seed", 42),
                 )
 
-                for confidence in confidence_grid:
-                    sup_model.confidence_threshold = float(confidence)
-                    sup_val_metrics = trainer._eval_multi_episode(
-                        sup_model,
-                        n_episodes=eval_episodes,
-                        segment_range=ranges["validation"],
-                        log_episodes=False,
-                    )
-                    strict_score = trainer.score_candidate(sup_val_metrics)
-                    relaxed_score = trainer.score_candidate(
-                        sup_val_metrics,
-                        max_dominant_action_ratio=relaxed_max_dominant_ratio,
-                        min_avg_trades_per_episode=relaxed_min_avg_trades,
-                        min_action_entropy=relaxed_min_action_entropy,
-                    )
-                    logger.info(
-                        "Supervised validation: model=%s conf=%.2f strict=%s relaxed=%s alpha=%.4f net=%.4f trades=%.1f dominant_ratio=%.2f%%",
-                        model_type,
-                        float(confidence),
-                        f"{strict_score:.4f}" if np.isfinite(strict_score) else "-inf",
-                        f"{relaxed_score:.4f}" if np.isfinite(relaxed_score) else "-inf",
-                        float(sup_val_metrics.get("outperformance_vs_bh", 0.0)),
-                        float(sup_val_metrics.get("total_return", 0.0)),
-                        float(sup_val_metrics.get("avg_trades_per_episode", 0.0)),
-                        float(sup_val_metrics.get("eval_dominant_action_ratio", 0.0) * 100.0),
-                    )
-                    candidate_mode = None
-                    candidate_score = float("-inf")
-                    candidate_priority = -1
-                    if np.isfinite(strict_score):
-                        candidate_mode = "strict"
-                        candidate_score = float(strict_score)
-                        candidate_priority = 1
-                    elif np.isfinite(relaxed_score):
-                        candidate_mode = "relaxed"
-                        candidate_score = float(relaxed_score)
-                        candidate_priority = 0
+                for long_confidence in long_confidence_grid:
+                    for short_confidence in short_confidence_grid:
+                        sup_model.confidence_threshold = float(min(float(long_confidence), float(short_confidence)))
+                        sup_model.long_confidence_threshold = float(long_confidence)
+                        sup_model.short_confidence_threshold = float(short_confidence)
+                        sup_val_runs: list[dict] = []
+                        strict_scores: list[float] = []
+                        relaxed_scores: list[float] = []
+                        for seed_idx in range(supervised_validation_seed_runs):
+                            seed_base = validation_seed_base + seed_idx * supervised_validation_seed_stride
+                            sup_val_metrics = trainer._eval_multi_episode(
+                                sup_model,
+                                n_episodes=supervised_validation_episodes,
+                                segment_range=ranges["validation"],
+                                log_episodes=False,
+                                seed_base=seed_base,
+                            )
+                            sup_val_runs.append(dict(sup_val_metrics))
+                            strict_scores.append(float(trainer.score_candidate(sup_val_metrics)))
+                            relaxed_scores.append(float(trainer.score_candidate(
+                                sup_val_metrics,
+                                max_dominant_action_ratio=relaxed_max_dominant_ratio,
+                                min_avg_trades_per_episode=relaxed_min_avg_trades,
+                                min_action_entropy=relaxed_min_action_entropy,
+                            )))
+                        walkforward_metrics = trainer._eval_walkforward_segments(
+                            sup_model,
+                            segment_range=ranges["validation"],
+                            n_windows=selection_windows,
+                            min_window_size=selection_min_window_bars,
+                        )
+                        walkforward_strict_score = float(trainer.score_candidate(walkforward_metrics))
+                        walkforward_relaxed_score = float(trainer.score_candidate(
+                            walkforward_metrics,
+                            max_dominant_action_ratio=relaxed_max_dominant_ratio,
+                            min_avg_trades_per_episode=relaxed_min_avg_trades,
+                            min_action_entropy=relaxed_min_action_entropy,
+                        ))
+                        strict_score = _robust_validation_score(strict_scores)
+                        relaxed_score = _robust_validation_score(relaxed_scores)
+                        strict_combined_score, walkforward_strict_soft_score, strict_wf_details = _combine_supervised_validation_scores(
+                            strict_score,
+                            walkforward_metrics,
+                            trainer,
+                            max_dominant_action_ratio=trainer.selection_max_dominant_action_ratio,
+                            min_avg_trades_per_episode=trainer.selection_min_avg_trades_per_episode,
+                            min_action_entropy=trainer.selection_min_action_entropy,
+                            walkforward_score_weight=walkforward_score_weight,
+                            walkforward_min_active_ratio=walkforward_min_active_ratio,
+                            walkforward_inactivity_penalty_scale=walkforward_inactivity_penalty_scale,
+                            walkforward_worst_net_penalty_scale=walkforward_worst_net_penalty_scale,
+                            walkforward_worst_gross_penalty_scale=walkforward_worst_gross_penalty_scale,
+                            walkforward_worst_alpha_penalty_scale=walkforward_worst_alpha_penalty_scale,
+                            walkforward_dominance_penalty_scale=walkforward_dominance_penalty_scale,
+                        )
+                        relaxed_combined_score, walkforward_relaxed_soft_score, relaxed_wf_details = _combine_supervised_validation_scores(
+                            relaxed_score,
+                            walkforward_metrics,
+                            trainer,
+                            max_dominant_action_ratio=relaxed_max_dominant_ratio,
+                            min_avg_trades_per_episode=relaxed_min_avg_trades,
+                            min_action_entropy=relaxed_min_action_entropy,
+                            walkforward_score_weight=walkforward_score_weight,
+                            walkforward_min_active_ratio=walkforward_min_active_ratio,
+                            walkforward_inactivity_penalty_scale=walkforward_inactivity_penalty_scale,
+                            walkforward_worst_net_penalty_scale=walkforward_worst_net_penalty_scale,
+                            walkforward_worst_gross_penalty_scale=walkforward_worst_gross_penalty_scale,
+                            walkforward_worst_alpha_penalty_scale=walkforward_worst_alpha_penalty_scale,
+                            walkforward_dominance_penalty_scale=walkforward_dominance_penalty_scale,
+                        )
+                        strict_metrics = _aggregate_validation_metrics(sup_val_runs, strict_scores)
+                        relaxed_metrics = _aggregate_validation_metrics(sup_val_runs, relaxed_scores)
+                        for metric_bundle, wf_score, wf_details in (
+                            (strict_metrics, walkforward_strict_soft_score, strict_wf_details),
+                            (relaxed_metrics, walkforward_relaxed_soft_score, relaxed_wf_details),
+                        ):
+                            metric_bundle["walkforward_window_count"] = int(
+                                walkforward_metrics.get("walkforward_window_count", 1)
+                            )
+                            metric_bundle["walkforward_min_total_return"] = float(
+                                walkforward_metrics.get(
+                                    "walkforward_min_total_return",
+                                    walkforward_metrics.get("total_return", 0.0),
+                                )
+                            )
+                            metric_bundle["walkforward_min_gross_total_return"] = float(
+                                walkforward_metrics.get(
+                                    "walkforward_min_gross_total_return",
+                                    walkforward_metrics.get("gross_total_return", 0.0),
+                                )
+                            )
+                            metric_bundle["walkforward_min_alpha"] = float(
+                                walkforward_metrics.get(
+                                    "walkforward_min_alpha",
+                                    walkforward_metrics.get("outperformance_vs_bh", 0.0),
+                                )
+                            )
+                            metric_bundle["walkforward_net_std"] = float(
+                                walkforward_metrics.get("walkforward_net_std", 0.0)
+                            )
+                            metric_bundle["walkforward_gross_std"] = float(
+                                walkforward_metrics.get("walkforward_gross_std", 0.0)
+                            )
+                            metric_bundle["walkforward_selection_score"] = float(wf_score)
+                            metric_bundle["walkforward_active_window_ratio"] = float(
+                                walkforward_metrics.get("walkforward_active_window_ratio", 0.0)
+                            )
+                            metric_bundle["walkforward_active_window_count"] = float(
+                                walkforward_metrics.get("walkforward_active_window_count", 0.0)
+                            )
+                            metric_bundle["walkforward_positive_net_ratio"] = float(
+                                walkforward_metrics.get("walkforward_positive_net_ratio", 0.0)
+                            )
+                            metric_bundle["walkforward_positive_alpha_ratio"] = float(
+                                walkforward_metrics.get("walkforward_positive_alpha_ratio", 0.0)
+                            )
+                            metric_bundle["walkforward_worst_dominant_action_ratio"] = float(
+                                walkforward_metrics.get(
+                                    "walkforward_worst_dominant_action_ratio",
+                                    walkforward_metrics.get("eval_dominant_action_ratio", 1.0),
+                                )
+                            )
+                            metric_bundle["walkforward_penalty"] = float(wf_details.get("walkforward_penalty", 0.0))
+                            metric_bundle["walkforward_bonus"] = float(wf_details.get("walkforward_bonus", 0.0))
+                            metric_bundle["supervised_validation_brier"] = float(
+                                sup_meta.get("validation_brier", float("nan"))
+                            )
+                        logger.info(
+                            "Supervised validation: model=%s long_conf=%.2f short_conf=%.2f strict=%s relaxed=%s "
+                            "wf_strict=%s wf_relaxed=%s strict_combined=%s relaxed_combined=%s seed_runs=%d "
+                            "alpha=%.4f net=%.4f gross=%.4f trades=%.1f dominant_ratio=%.2f%% "
+                            "wf_active=%.2f%% wf_penalty=%.4f brier=%.4f episodes=%d",
+                            model_type,
+                            float(long_confidence),
+                            float(short_confidence),
+                            f"{strict_score:.4f}" if np.isfinite(strict_score) else "-inf",
+                            f"{relaxed_score:.4f}" if np.isfinite(relaxed_score) else "-inf",
+                            f"{walkforward_strict_soft_score:.4f}" if np.isfinite(walkforward_strict_soft_score) else "-inf",
+                            f"{walkforward_relaxed_soft_score:.4f}" if np.isfinite(walkforward_relaxed_soft_score) else "-inf",
+                            f"{strict_combined_score:.4f}" if np.isfinite(strict_combined_score) else "-inf",
+                            f"{relaxed_combined_score:.4f}" if np.isfinite(relaxed_combined_score) else "-inf",
+                            supervised_validation_seed_runs,
+                            float(relaxed_metrics.get("outperformance_vs_bh", 0.0)),
+                            float(relaxed_metrics.get("total_return", 0.0)),
+                            float(relaxed_metrics.get("gross_total_return", 0.0)),
+                            float(relaxed_metrics.get("avg_trades_per_episode", 0.0)),
+                            float(relaxed_metrics.get("eval_dominant_action_ratio", 0.0) * 100.0),
+                            float(relaxed_metrics.get("walkforward_active_window_ratio", 0.0) * 100.0),
+                            float(relaxed_metrics.get("walkforward_penalty", 0.0)),
+                            float(relaxed_metrics.get("supervised_validation_brier", float("nan"))),
+                            int(relaxed_metrics.get("eval_episodes", supervised_validation_episodes)),
+                        )
+                        candidate_mode = None
+                        candidate_score = float("-inf")
+                        candidate_priority = -1
+                        candidate_validation_metrics = None
+                        candidate_options = []
+                        if np.isfinite(strict_combined_score):
+                            candidate_options.append(("strict", float(strict_combined_score), 1, strict_metrics))
+                        if np.isfinite(relaxed_combined_score):
+                            candidate_options.append(("relaxed", float(relaxed_combined_score), 0, relaxed_metrics))
+                        if candidate_options:
+                            candidate_mode, candidate_score, candidate_priority, candidate_validation_metrics = max(
+                                candidate_options,
+                                key=lambda item: (
+                                    item[1],
+                                    item[2],
+                                    -float(item[3].get("supervised_validation_brier", float("inf"))),
+                                ),
+                            )
 
-                    if candidate_mode is not None and (
-                        candidate_score > sup_best_score
-                        or (np.isclose(candidate_score, sup_best_score) and candidate_priority > sup_best_priority)
-                    ):
-                        sup_best_model = sup_model
-                        sup_best_meta = dict(sup_meta)
-                        sup_best_conf = float(confidence)
-                        sup_best_score = float(candidate_score)
-                        sup_best_priority = int(candidate_priority)
-                        sup_best_mode = str(candidate_mode)
+                        if candidate_mode is not None and (
+                            candidate_score > sup_best_score
+                            or (np.isclose(candidate_score, sup_best_score) and candidate_priority > sup_best_priority)
+                        ):
+                            sup_best_model = sup_model
+                            sup_best_meta = dict(sup_meta)
+                            sup_best_conf = float(min(float(long_confidence), float(short_confidence)))
+                            sup_best_long_conf = float(long_confidence)
+                            sup_best_short_conf = float(short_confidence)
+                            sup_best_score = float(candidate_score)
+                            sup_best_priority = int(candidate_priority)
+                            sup_best_mode = str(candidate_mode)
+                            sup_best_validation_metrics = dict(candidate_validation_metrics or relaxed_metrics)
+                        if candidate_mode is not None and np.isfinite(candidate_score):
+                            candidate_name = (
+                                f"{model_type}_{candidate_mode}_"
+                                f"lc{float(long_confidence):.2f}_sc{float(short_confidence):.2f}"
+                            )
+                            candidate_snapshot = copy.deepcopy(sup_model)
+                            candidate_snapshot.confidence_threshold = float(
+                                min(float(long_confidence), float(short_confidence))
+                            )
+                            candidate_snapshot.long_confidence_threshold = float(long_confidence)
+                            candidate_snapshot.short_confidence_threshold = float(short_confidence)
+                            supervised_candidate_pool.append(
+                                {
+                                    "model": candidate_snapshot,
+                                    "meta": dict(sup_meta),
+                                    "score": float(candidate_score),
+                                    "priority": int(candidate_priority),
+                                    "mode": str(candidate_mode),
+                                    "name": candidate_name,
+                                    "confidence": float(min(float(long_confidence), float(short_confidence))),
+                                    "long_confidence": float(long_confidence),
+                                    "short_confidence": float(short_confidence),
+                                    "validation_metrics": dict(candidate_validation_metrics or relaxed_metrics),
+                                }
+                            )
+                            supervised_candidate_pool.sort(
+                                key=lambda item: (
+                                    float(item["score"]),
+                                    int(item["priority"]),
+                                    -float(item["validation_metrics"].get("supervised_validation_brier", float("inf"))),
+                                ),
+                                reverse=True,
+                            )
+                            if len(supervised_candidate_pool) > supervised_candidate_pool_size:
+                                supervised_candidate_pool = supervised_candidate_pool[:supervised_candidate_pool_size]
 
-            if sup_best_model is not None and sup_best_conf is not None:
+            supervised_candidate_eligible = (
+                sup_best_model is not None
+                and sup_best_conf is not None
+                and np.isfinite(sup_best_score)
+                and sup_best_score >= supervised_min_selection_score
+            )
+
+            if sup_best_model is not None and sup_best_conf is not None and supervised_candidate_eligible:
                 sup_best_model.confidence_threshold = float(sup_best_conf)
+                sup_best_model.long_confidence_threshold = float(
+                    sup_best_long_conf if sup_best_long_conf is not None else sup_best_conf
+                )
+                sup_best_model.short_confidence_threshold = float(
+                    sup_best_short_conf if sup_best_short_conf is not None else sup_best_conf
+                )
                 supervised_path = sup_best_model.save("checkpoints/rl_agent_supervised.joblib")
                 supervised_metrics = None
                 logger.info(
-                    "Saved supervised fallback -> %s (mode=%s confidence=%.2f validation_score=%s)",
+                    "Saved supervised fallback -> %s (mode=%s long_conf=%.2f short_conf=%.2f validation_score=%s)",
                     supervised_path,
                     sup_best_mode,
-                    float(sup_best_conf),
+                    float(sup_best_long_conf if sup_best_long_conf is not None else sup_best_conf),
+                    float(sup_best_short_conf if sup_best_short_conf is not None else sup_best_conf),
                     f"{sup_best_score:.4f}" if np.isfinite(sup_best_score) else "-inf",
                 )
 
@@ -622,6 +1240,7 @@ def train_rl_agent(
                         n_episodes=10,
                         segment_range=ranges["test"],
                         log_episodes=True,
+                        seed_base=test_seed_base,
                     )
                     trainer._save_chart(sup_best_model, supervised_metrics)
                     supervised_metrics["selection_gate_passed"] = 1.0
@@ -629,12 +1248,38 @@ def train_rl_agent(
                     supervised_metrics["model_family"] = f"supervised_{sup_best_meta.get('model_type', 'fallback')}"
                     supervised_metrics["model_path"] = str(supervised_path).replace("\\", "/")
                     supervised_metrics["supervised_confidence_threshold"] = float(sup_best_conf)
+                    supervised_metrics["supervised_long_confidence_threshold"] = float(
+                        sup_best_long_conf if sup_best_long_conf is not None else sup_best_conf
+                    )
+                    supervised_metrics["supervised_short_confidence_threshold"] = float(
+                        sup_best_short_conf if sup_best_short_conf is not None else sup_best_conf
+                    )
                     supervised_metrics["supervised_label_threshold"] = float(sup_best_meta.get("label_threshold", 0.0))
                     supervised_metrics["supervised_model_type"] = str(sup_best_meta.get("model_type", "fallback"))
+                    supervised_metrics["supervised_validation_brier"] = float(
+                        sup_best_meta.get("validation_brier", float("nan"))
+                    )
                     supervised_metrics["selection_mode"] = sup_best_mode
+                    supervised_metrics["selection_engine"] = "episodic_validation_multiseed_walkforward"
+                    if sup_best_validation_metrics is not None:
+                        supervised_metrics["validation_score_median"] = float(
+                            sup_best_validation_metrics.get("validation_score_median", float("nan"))
+                        )
+                        supervised_metrics["validation_score_worst"] = float(
+                            sup_best_validation_metrics.get("validation_score_worst", float("nan"))
+                        )
+                        supervised_metrics["validation_score_robust"] = float(
+                            sup_best_validation_metrics.get("validation_score_robust", float("nan"))
+                        )
+                        supervised_metrics["validation_seed_runs"] = float(
+                            sup_best_validation_metrics.get("validation_seed_runs", supervised_validation_seed_runs)
+                        )
                     logger.info(
-                        "Using supervised fallback model: mode=%s validation_score=%s ppo_validation_score=%s",
+                        "Using supervised fallback model: mode=%s long_conf=%.2f short_conf=%.2f "
+                        "validation_score=%s ppo_validation_score=%s",
                         sup_best_mode,
+                        float(sup_best_long_conf if sup_best_long_conf is not None else sup_best_conf),
+                        float(sup_best_short_conf if sup_best_short_conf is not None else sup_best_conf),
                         f"{sup_best_score:.4f}" if np.isfinite(sup_best_score) else "-inf",
                         f"{ppo_validation_score:.4f}" if np.isfinite(ppo_validation_score) else "-inf",
                     )
@@ -647,19 +1292,97 @@ def train_rl_agent(
                         f"{sup_best_score:.4f}" if np.isfinite(sup_best_score) else "-inf",
                         f"{ppo_validation_score:.4f}" if np.isfinite(ppo_validation_score) else "-inf",
                     )
+                for idx, candidate_info in enumerate(supervised_candidate_pool):
+                    candidate_model = candidate_info["model"]
+                    candidate_meta = candidate_info["meta"]
+                    candidate_mode_value = str(candidate_info["mode"])
+                    candidate_score_value = float(candidate_info["score"])
+                    candidate_conf_value = float(candidate_info["confidence"])
+                    candidate_long_conf_value = float(candidate_info["long_confidence"])
+                    candidate_short_conf_value = float(candidate_info["short_confidence"])
+                    candidate_validation_metrics = dict(candidate_info["validation_metrics"])
+                    candidate_path = (
+                        supervised_path
+                        if idx == 0
+                        else candidate_model.save(
+                            f"checkpoints/rl_agent_supervised_{candidate_info['name']}.joblib"
+                        )
+                    )
+                    is_selected_env_candidate = (
+                        np.isclose(candidate_score_value, sup_best_score)
+                        and np.isclose(candidate_long_conf_value, float(sup_best_long_conf or sup_best_conf or 0.0))
+                        and np.isclose(candidate_short_conf_value, float(sup_best_short_conf or sup_best_conf or 0.0))
+                    )
+                    candidate_records.append(
+                        {
+                            "family": f"supervised_{candidate_meta.get('model_type', 'fallback')}",
+                            "candidate_name": str(candidate_info.get("name", f"candidate_{idx + 1}")),
+                            "model": candidate_model,
+                            "model_path": str(candidate_path).replace("\\", "/"),
+                            "display_metrics": (
+                                dict(supervised_metrics) if (is_selected_env_candidate and supervised_metrics is not None) else None
+                            ),
+                            "env_validation_score": float(candidate_score_value),
+                            "env_validation_metrics": candidate_validation_metrics,
+                            "selection_mode": candidate_mode_value,
+                            "supervised_confidence_threshold": float(candidate_conf_value),
+                            "supervised_long_confidence_threshold": float(candidate_long_conf_value),
+                            "supervised_short_confidence_threshold": float(candidate_short_conf_value),
+                            "supervised_label_threshold": float(candidate_meta.get("label_threshold", 0.0)),
+                            "supervised_model_type": str(candidate_meta.get("model_type", "fallback")),
+                        }
+                    )
+            elif sup_best_model is not None and sup_best_conf is not None:
+                logger.warning(
+                    "Best supervised candidate score %.4f is below the minimum %.4f. "
+                    "It will not replace the current selected policy.",
+                    float(sup_best_score),
+                    float(supervised_min_selection_score),
+                )
+
+            if (
+                supervised_fallback_to_safe_flat
+                and (selected_model is None or not np.isfinite(ppo_validation_score))
+                and (
+                    sup_best_model is None
+                    or sup_best_conf is None
+                    or not supervised_candidate_eligible
+                )
+            ):
+                safe_flat_model = build_constant_action_model(
+                    feature_dim=int(feature_array.shape[1]),
+                    action=1,
+                    metadata={"model_type": "safe_flat", "reason": "no_profitable_candidate"},
+                )
+                safe_flat_path = safe_flat_model.save("checkpoints/rl_agent_safe_flat.joblib")
+                safe_flat_metrics = trainer._eval_multi_episode(
+                    safe_flat_model,
+                    n_episodes=10,
+                    segment_range=ranges["test"],
+                    log_episodes=True,
+                    seed_base=test_seed_base,
+                )
+                trainer._save_chart(safe_flat_model, safe_flat_metrics)
+                safe_flat_metrics["selection_gate_passed"] = 1.0
+                safe_flat_metrics["selection_best_score"] = 0.0
+                safe_flat_metrics["model_family"] = "safe_flat"
+                safe_flat_metrics["model_path"] = str(safe_flat_path).replace("\\", "/")
+                safe_flat_metrics["selection_mode"] = "safety"
+                selected_model = safe_flat_model
+                selected_metrics = safe_flat_metrics
                 candidate_records.append(
                     {
-                        "family": f"supervised_{sup_best_meta.get('model_type', 'fallback')}",
-                        "model": sup_best_model,
-                        "model_path": str(supervised_path).replace("\\", "/"),
-                        "display_metrics": dict(supervised_metrics) if supervised_metrics is not None else None,
-                        "env_validation_score": float(sup_best_score),
+                        "family": "safe_flat",
+                        "model": safe_flat_model,
+                        "model_path": str(safe_flat_path).replace("\\", "/"),
+                        "display_metrics": dict(safe_flat_metrics),
+                        "env_validation_score": 0.0,
                         "env_validation_metrics": None,
-                        "selection_mode": sup_best_mode,
-                        "supervised_confidence_threshold": float(sup_best_conf),
-                        "supervised_label_threshold": float(sup_best_meta.get("label_threshold", 0.0)),
-                        "supervised_model_type": str(sup_best_meta.get("model_type", "fallback")),
+                        "selection_mode": "safety",
                     }
+                )
+                logger.warning(
+                    "No supervised candidate cleared the minimum score. Falling back to safe flat policy."
                 )
         except Exception as e:
             logger.exception("Supervised fallback training failed: %s", e)
@@ -675,19 +1398,46 @@ def train_rl_agent(
         else:
             min_trades = float(nautilus_config.get("selection_min_trades", 1.0))
             max_dom = float(nautilus_config.get("selection_max_dominant_action_ratio", 0.995))
+            min_nautilus_selection_score = float(nautilus_config.get("min_selection_score", 0.0))
             use_for_selection = bool(nautilus_config.get("use_for_model_selection", True))
             evaluate_final_test = bool(nautilus_config.get("evaluate_final_test", True))
+            use_subprocess_validation = bool(nautilus_config.get("subprocess_on_windows", True)) and sys.platform.startswith("win")
+            if use_subprocess_validation:
+                logger.info(
+                    "Using subprocess Nautilus validation on Windows to avoid logger re-initialization crashes."
+                )
             best_candidate = None
             best_nautilus_score = float("-inf")
 
             for candidate in candidate_records:
+                candidate_name = str(candidate.get("candidate_name", candidate.get("family", "candidate")))
+                if str(candidate.get("family", "")) == "safe_flat":
+                    candidate["nautilus_validation"] = {"skipped": "safe_flat_candidate"}
+                    candidate["nautilus_validation_score"] = float("-inf")
+                    logger.info("Skipping Nautilus validation for safe_flat candidate.")
+                    continue
+                env_score = float(candidate.get("env_validation_score", float("-inf")))
+                if not np.isfinite(env_score):
+                    logger.info(
+                        "Skipping Nautilus validation for %s because fast-env score is non-finite (%s)",
+                        candidate.get("family", "unknown"),
+                        "-inf" if not np.isfinite(env_score) else f"{env_score:.4f}",
+                    )
+                    candidate["nautilus_validation"] = {"skipped": "non_finite_fast_env_score"}
+                    candidate["nautilus_validation_score"] = float("-inf")
+                    continue
                 try:
-                    validation_summary = _run_nautilus_backtest_segment(
+                    validation_runner = (
+                        _run_nautilus_backtest_segment_subprocess
+                        if use_subprocess_validation
+                        else _run_nautilus_backtest_segment
+                    )
+                    validation_summary = validation_runner(
                         model_path=candidate["model_path"],
                         frame_15m=frame_15m,
                         segment_range=ranges["validation"],
                         config=config,
-                        label=f"validation_{candidate['family']}",
+                        label=f"validation_{candidate_name}",
                     )
                     validation_score = _score_nautilus_summary(
                         validation_summary,
@@ -697,15 +1447,19 @@ def train_rl_agent(
                     candidate["nautilus_validation"] = validation_summary
                     candidate["nautilus_validation_score"] = float(validation_score)
                     logger.info(
-                        "Nautilus validation: family=%s score=%s net=%.4f gross=%.4f alpha=%.4f "
-                        "trades=%d dominant_ratio=%.2f%%",
+                        "Nautilus validation: family=%s candidate=%s long_conf=%.2f short_conf=%.2f "
+                        "score=%s net=%.4f gross=%.4f alpha=%.4f trades=%d dominant_ratio=%.2f%% status=%s",
                         candidate["family"],
+                        candidate_name,
+                        float(candidate.get("supervised_long_confidence_threshold", candidate.get("supervised_confidence_threshold", 0.0))),
+                        float(candidate.get("supervised_short_confidence_threshold", candidate.get("supervised_confidence_threshold", 0.0))),
                         f"{validation_score:.4f}" if np.isfinite(validation_score) else "-inf",
                         float(validation_summary.get("total_return", 0.0)),
                         float(validation_summary.get("gross_total_return", 0.0)),
                         float(validation_summary.get("outperformance_vs_bh", 0.0)),
                         int(validation_summary.get("n_trades", 0)),
                         float(validation_summary.get("eval_dominant_action_ratio", 0.0) * 100.0),
+                        str(validation_summary.get("status", "UNKNOWN")),
                     )
                     if np.isfinite(validation_score) and validation_score > best_nautilus_score:
                         best_nautilus_score = float(validation_score)
@@ -721,12 +1475,18 @@ def train_rl_agent(
 
             if best_candidate is not None:
                 logger.info(
-                    "Best Nautilus candidate: family=%s score=%.4f use_for_selection=%s",
+                    "Best Nautilus candidate: family=%s score=%.4f use_for_selection=%s min_selection_score=%.4f",
                     best_candidate["family"],
                     float(best_nautilus_score),
                     use_for_selection,
+                    min_nautilus_selection_score,
                 )
-                if use_for_selection and best_candidate["model"] is not None:
+                if (
+                    use_for_selection
+                    and best_candidate["model"] is not None
+                    and np.isfinite(best_nautilus_score)
+                    and best_nautilus_score >= min_nautilus_selection_score
+                ):
                     selected_model = best_candidate["model"]
                     if best_candidate.get("display_metrics") is None:
                         selected_metrics = trainer._eval_multi_episode(
@@ -742,9 +1502,32 @@ def train_rl_agent(
                     selected_metrics["model_family"] = str(best_candidate["family"])
                     selected_metrics["model_path"] = str(best_candidate["model_path"])
                     selected_metrics["selection_engine"] = "nautilus_validation"
+                    selected_metrics["selection_mode"] = str(best_candidate.get("selection_mode", "unknown"))
+                    if str(best_candidate["family"]).startswith("supervised_"):
+                        selected_metrics["supervised_confidence_threshold"] = float(
+                            best_candidate.get("supervised_confidence_threshold", 0.0)
+                        )
+                        selected_metrics["supervised_long_confidence_threshold"] = float(
+                            best_candidate.get("supervised_long_confidence_threshold", 0.0)
+                        )
+                        selected_metrics["supervised_short_confidence_threshold"] = float(
+                            best_candidate.get("supervised_short_confidence_threshold", 0.0)
+                        )
+                        selected_metrics["supervised_label_threshold"] = float(
+                            best_candidate.get("supervised_label_threshold", 0.0)
+                        )
+                        selected_metrics["supervised_model_type"] = str(
+                            best_candidate.get("supervised_model_type", "fallback")
+                        )
                     logger.info(
                         "Selecting final model using Nautilus validation -> %s",
                         best_candidate["family"],
+                    )
+                elif use_for_selection:
+                    logger.warning(
+                        "Best Nautilus validation score %.4f is below the minimum %.4f. Keeping fast-env selection.",
+                        float(best_nautilus_score),
+                        float(min_nautilus_selection_score),
                     )
 
                 selected_metrics["nautilus_validation"] = dict(best_candidate["nautilus_validation"])
@@ -752,12 +1535,17 @@ def train_rl_agent(
 
                 if evaluate_final_test:
                     try:
-                        final_summary = _run_nautilus_backtest_segment(
+                        final_runner = (
+                            _run_nautilus_backtest_segment_subprocess
+                            if use_subprocess_validation
+                            else _run_nautilus_backtest_segment
+                        )
+                        final_summary = final_runner(
                             model_path=str(best_candidate["model_path"]),
                             frame_15m=frame_15m,
                             segment_range=ranges["test"],
                             config=config,
-                            label=f"test_{best_candidate['family']}",
+                            label=f"test_{str(best_candidate.get('candidate_name', best_candidate['family']))}",
                         )
                         selected_metrics["nautilus_test"] = dict(final_summary)
                         logger.info(
@@ -815,32 +1603,68 @@ def backtest_with_model(
     signals = np.zeros(n)
 
     if model is not None:
-        # 3 actions: 0=Short, 1=Flat, 2=Long
         position = 0.0
         entry_price = 0.0
         flat_steps = 0
         pos_steps = 0
+        last_turnover = 0.0
+        initial_balance = 10_000.0
+        balance = initial_balance
+        peak_balance = initial_balance
+        leverage = float(trading_config.get("leverage", 1.0))
+        fee_rate = float(trading_config.get("taker_fee", 0.0005)) + float(trading_config.get("slippage_bps", 1.0)) / 10000.0
+        server_cost_usd_per_step = (
+            float(trading_config.get("monthly_server_cost_usd", 100.0))
+            / max(float(trading_config.get("periods_per_day", 96)) * 30.0, 1.0)
+        )
         for i in range(n):
             price_now = pr_eval[i]
             upnl = 0.0
             if position != 0 and entry_price > 0:
-                upnl = position * (price_now / entry_price - 1.0)
+                upnl = position * (price_now / entry_price - 1.0) * leverage
+            drawdown = max((peak_balance - balance) / max(peak_balance, 1e-9), 0.0)
+            vol_start = max(0, i - 32)
+            price_window = np.maximum(pr_eval[vol_start:i + 1], 1e-9)
+            rolling_vol = float(np.std(np.diff(np.log(price_window)))) if price_window.size >= 2 else 0.0
 
-            obs = np.concatenate([
-                fa_eval[i],
-                np.array([position, upnl, flat_steps / 100.0, pos_steps / 100.0], dtype=np.float32),
-            ])
+            obs = np.concatenate(
+                [
+                    fa_eval[i],
+                    build_agent_state(
+                        position=position,
+                        upnl=upnl,
+                        equity_ratio=(balance / max(initial_balance, 1e-9)) - 1.0,
+                        drawdown=drawdown,
+                        rolling_volatility=rolling_vol,
+                        turnover_last_step=last_turnover,
+                        flat_steps=flat_steps,
+                        pos_steps=pos_steps,
+                    ),
+                ]
+            )
             action, _ = model.predict(obs, deterministic=True)
             if isinstance(action, np.ndarray):
                 a = int(action.item()) if action.ndim == 0 else int(action[0])
             else:
                 a = int(action)
+            old_position = position
             if a == 0:
                 position = -1.0
             elif a == 2:
                 position = 1.0
             else:
                 position = 0.0
+            turnover = abs(position - old_position)
+            last_turnover = float(turnover)
+
+            if i > 0:
+                prev_price = pr_eval[i - 1]
+                price_ret = (price_now / prev_price - 1.0) if prev_price > 0 else 0.0
+                gross_step_return = old_position * price_ret * leverage - turnover * fee_rate
+                server_cost_pct = server_cost_usd_per_step / max(balance, 1.0)
+                balance *= (1.0 + gross_step_return - server_cost_pct)
+                balance = max(balance, 0.0)
+                peak_balance = max(peak_balance, balance)
 
             prev_position = signals[i - 1] if i > 0 else 0.0
             if position == 0:
@@ -2053,9 +2877,9 @@ def main():
     import argparse
     import warnings
 
-    parser = argparse.ArgumentParser(description="GARIC Pipeline")
+    parser = argparse.ArgumentParser(description="GARIC train/test pipeline")
     parser.add_argument("--config", default=None)
-    parser.add_argument("--mode", choices=["train", "test", "paper", "live"], default="test")
+    parser.add_argument("--mode", choices=["train", "test"], default="test")
     parser.add_argument("--no-cache", action="store_true", help="Force recompute features (ignore cache)")
     args = parser.parse_args()
 
@@ -2085,14 +2909,6 @@ def main():
         run_test_pipeline(args.config)
     elif args.mode == "train":
         run_training_pipeline(args.config, no_cache=args.no_cache)
-    elif args.mode == "paper":
-        logger.info("Starting paper trading...")
-        from execution.live.trading_engine import TradingEngine
-        engine = TradingEngine(paper_mode=True)
-        engine.start()
-    elif args.mode == "live":
-        logger.error("Live mode requires API keys. Use:")
-        logger.error("  python -m execution.live.trading_engine --mode live --api-key KEY --api-secret SECRET")
 
 
 if __name__ == "__main__":

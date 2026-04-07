@@ -101,5 +101,19 @@ class NautilusStateWriter:
                 del events[:-40]
 
         tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp_path.write_text(json.dumps(_to_builtin(self.state), ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp_path.replace(self.path)
+        payload = json.dumps(_to_builtin(self.state), ensure_ascii=False, indent=2)
+        tmp_path.write_text(payload, encoding="utf-8")
+        for _ in range(5):
+            try:
+                tmp_path.replace(self.path)
+                return
+            except PermissionError:
+                time.sleep(0.05)
+        try:
+            self.path.write_text(payload, encoding="utf-8")
+        finally:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass

@@ -9,6 +9,7 @@ import pytest
 
 pytest.importorskip("nautilus_trader")
 
+from execution.nautilus.backtest_runner import _safe_dispose_engine
 from execution.nautilus.features import NautilusFeatureBuilder
 from execution.nautilus.model import ACTION_TO_DIRECTION
 from execution.nautilus.state import NautilusStateWriter
@@ -104,6 +105,91 @@ def test_nautilus_state_writer_reset_clears_previous_history(tmp_path: Path):
     assert payload["symbol"] == "BTCUSDT"
     assert payload["history"]["ts"] == []
     assert payload["recent_events"][-1]["message"] == "new"
+
+
+def test_nautilus_state_writer_falls_back_when_replace_is_locked(tmp_path: Path, monkeypatch):
+    path = tmp_path / "state.json"
+    writer = NautilusStateWriter(path, max_history=4)
+
+    original_replace = Path.replace
+    calls = {"count": 0}
+
+    def flaky_replace(self, target):
+        calls["count"] += 1
+        if str(self).endswith(".tmp") and calls["count"] <= 5:
+            raise PermissionError("locked")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", flaky_replace)
+    writer.update(status="RUNNING", event="locked-write")
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["status"] == "RUNNING"
+    assert payload["recent_events"][-1]["message"] == "locked-write"
+
+
+def test_safe_dispose_engine_ends_running_engine_before_dispose():
+    calls = []
+
+    class StubPart:
+        def __init__(self, running=False):
+            self.is_running = running
+
+    class StubTrader(StubPart):
+        def __init__(self, running=False, disposed=False):
+            super().__init__(running=running)
+            self.is_disposed = disposed
+
+    class StubKernel:
+        def __init__(self):
+            self.trader = StubTrader(running=True)
+            self.data_engine = StubPart(running=False)
+            self.risk_engine = StubPart(running=False)
+            self.exec_engine = StubPart(running=False)
+            self.emulator = StubPart(running=False)
+
+    class StubEngine:
+        def __init__(self):
+            self.kernel = StubKernel()
+            self.trader = self.kernel.trader
+
+        def end(self):
+            calls.append("end")
+            self.trader.is_running = False
+
+        def dispose(self):
+            calls.append("dispose")
+            self.trader.is_disposed = True
+
+    engine = StubEngine()
+    _safe_dispose_engine(engine)
+    assert calls == ["end", "dispose"]
+
+
+def test_safe_dispose_engine_ignores_invalid_state_conflict():
+    class StubTrader:
+        is_running = False
+        is_disposed = False
+
+    class StubKernel:
+        trader = StubTrader()
+        data_engine = StubTrader()
+        risk_engine = StubTrader()
+        exec_engine = StubTrader()
+        emulator = StubTrader()
+
+    class StubEngine:
+        def __init__(self):
+            self.trader = StubTrader()
+            self.kernel = StubKernel()
+
+        def end(self):
+            raise AssertionError("end should not be called when engine is not running")
+
+        def dispose(self):
+            raise RuntimeError("InvalidStateTrigger('RUNNING -> DISPOSE') state RUNNING")
+
+    _safe_dispose_engine(StubEngine())
 
 
 def test_nautilus_strategy_position_lifecycle_updates_trade_stats():

@@ -90,6 +90,7 @@ class RLTrainer:
         ohlcv_data=None,
         segment_range=None,
         balanced_sampling=None,
+        max_episode_steps_override=None,
     ):
         from models.rl.environment import CryptoFuturesEnv
         segment_start, segment_end = self._normalize_range(segment_range)
@@ -108,7 +109,11 @@ class RLTrainer:
             funding_interval=self.funding_interval,
             maintenance_margin=self.maintenance_margin,
             min_trade_pct=self.min_trade_pct,
-            max_episode_steps=self.max_episode_steps,
+            max_episode_steps=(
+                self.max_episode_steps
+                if max_episode_steps_override is None
+                else max(int(max_episode_steps_override), 1)
+            ),
             monthly_server_cost_usd=self.monthly_server_cost_usd,
             periods_per_day=self.periods_per_day,
             segment_start=segment_start,
@@ -116,6 +121,20 @@ class RLTrainer:
             balanced_sampling=balanced_sampling,
             **env_kwargs,
         )
+
+    def _run_eval_episode(self, model, env, *, seed: int | None = None) -> tuple[dict, dict[int, int], float]:
+        obs, _ = env.reset(seed=seed)
+        action_counts = {0: 0, 1: 0, 2: 0}
+        rewards = []
+        while True:
+            action, _ = model.predict(obs, deterministic=True)
+            action_int = int(action.item()) if isinstance(action, np.ndarray) else int(action)
+            action_counts[action_int] = action_counts.get(action_int, 0) + 1
+            obs, reward, terminated, truncated, _ = env.step(action)
+            rewards.append(float(reward))
+            if terminated or truncated:
+                break
+        return env.get_metrics(), action_counts, float(np.sum(rewards))
 
     def train(
         self,
@@ -127,6 +146,9 @@ class RLTrainer:
         ent_coef: float = 0.02,
         eval_every_steps: int = 50_000,
         eval_episodes: int = 8,
+        device: str = "auto",
+        collapse_eval_patience: int = 4,
+        collapse_min_steps: int = 200_000,
         **kwargs,
     ) -> dict:
         try:
@@ -153,6 +175,35 @@ class RLTrainer:
         warnings.filterwarnings("ignore", message=".*mini-batch.*")
         warnings.filterwarnings("ignore", message=".*GPU.*MlpPolicy.*")
 
+        requested_device = str(device or "auto").strip().lower()
+        resolved_device = requested_device
+        cuda_available = False
+        torch_version = ""
+        torch_cuda_version = ""
+        try:
+            import torch
+
+            torch_version = str(getattr(torch, "__version__", ""))
+            torch_cuda_version = str(getattr(torch.version, "cuda", "") or "")
+            cuda_available = bool(torch.cuda.is_available())
+            if requested_device == "auto":
+                resolved_device = "cuda" if cuda_available else "cpu"
+            elif requested_device.startswith("cuda") and not cuda_available:
+                logger.warning(
+                    "Requested PPO device '%s' but CUDA is unavailable. Falling back to CPU.",
+                    requested_device,
+                )
+                resolved_device = "cpu"
+        except Exception:
+            if requested_device == "auto":
+                resolved_device = "cpu"
+            elif requested_device.startswith("cuda"):
+                logger.warning(
+                    "Requested PPO device '%s' but torch.cuda check failed. Falling back to CPU.",
+                    requested_device,
+                )
+                resolved_device = "cpu"
+
         model = PPO(
             "MlpPolicy", env,
             learning_rate=learning_rate,
@@ -165,13 +216,21 @@ class RLTrainer:
             gamma=0.99,
             gae_lambda=0.95,
             clip_range=0.2,
-            device="auto",  # Changed to use GPU if available
+            device=resolved_device,
             policy_kwargs={"net_arch": dict(pi=[256, 256], vf=[256, 256])},
             verbose=0,  # *** ปิด SB3 print — ใช้ dashboard แทน ***
         )
 
         logger.info(f"PPO: features={n_feat}, ent_coef={ent_coef}, n_steps={actual_n_steps}, "
                      f"ep_len={self.max_episode_steps}, total={total_timesteps}")
+        logger.info(
+            "PPO device: requested=%s resolved=%s cuda_available=%s torch=%s torch_cuda=%s",
+            requested_device,
+            resolved_device,
+            cuda_available,
+            torch_version,
+            torch_cuda_version or "none",
+        )
         logger.info(
             "Training config: lr=%.6f batch=%d epochs=%d leverage=%.2f min_trade_pct=%.4f "
             "server_cost=$%.2f/mo periods_per_day=%d",
@@ -219,6 +278,11 @@ class RLTrainer:
             self.selection_min_avg_trades_per_episode,
             self.selection_min_action_entropy,
         )
+        logger.info(
+            "Collapse early-stop: patience=%d min_steps=%d",
+            int(max(collapse_eval_patience, 0)),
+            int(max(collapse_min_steps, 0)),
+        )
 
         # Custom callback: update dashboard + checkpoint
         from stable_baselines3.common.callbacks import BaseCallback
@@ -240,6 +304,9 @@ class RLTrainer:
                 self.best_score = -np.inf
                 self.best_path = None
                 self.best_base_path = None
+                self.collapse_eval_count = 0
+                self.stopped_early = False
+                self.stop_reason = ""
 
             def _on_step(self) -> bool:
                 # Update more frequently to catch intra-episode stats before reset!
@@ -368,6 +435,35 @@ class RLTrainer:
                             float(score),
                         )
                     self._last_eval_step = self.num_timesteps
+                    collapsed_eval = (
+                        self.num_timesteps >= int(max(collapse_min_steps, 0))
+                        and float(metrics.get("flat_ratio", 0.0)) >= 0.995
+                        and float(metrics.get("avg_trades_per_episode", metrics.get("n_trades", 0.0))) < 0.25
+                        and float(metrics.get("eval_dominant_action_ratio", 0.0)) >= 0.995
+                        and float(metrics.get("eval_action_entropy", 0.0)) <= 0.01
+                    )
+                    if collapsed_eval:
+                        self.collapse_eval_count += 1
+                        logger.warning(
+                            "Collapsed eval detected (%d/%d) at step=%d: flat_ratio=%.2f%% trades=%.2f entropy=%.3f dominant_ratio=%.2f%%",
+                            self.collapse_eval_count,
+                            int(max(collapse_eval_patience, 0)),
+                            self.num_timesteps,
+                            float(metrics.get("flat_ratio", 0.0) * 100.0),
+                            float(metrics.get("avg_trades_per_episode", metrics.get("n_trades", 0.0))),
+                            float(metrics.get("eval_action_entropy", 0.0)),
+                            float(metrics.get("eval_dominant_action_ratio", 0.0) * 100.0),
+                        )
+                        if int(max(collapse_eval_patience, 0)) > 0 and self.collapse_eval_count >= int(max(collapse_eval_patience, 0)):
+                            self.stopped_early = True
+                            self.stop_reason = "collapsed_policy"
+                            logger.warning(
+                                "Early stopping PPO after %d collapsed validation checkpoints. Moving on to model selection.",
+                                self.collapse_eval_count,
+                            )
+                            return False
+                    else:
+                        self.collapse_eval_count = 0
                 return True
 
         # Get dashboard from pipeline (passed via _dashboard key in self)
@@ -396,6 +492,8 @@ class RLTrainer:
         metrics = self._eval_multi_episode(model, n_episodes=10, segment_range=self.test_range)
         metrics["selection_gate_passed"] = 1.0 if selection_gate_passed else 0.0
         metrics["selection_best_score"] = float(cb.best_score) if np.isfinite(cb.best_score) else float("-inf")
+        metrics["ppo_early_stopped"] = 1.0 if cb.stopped_early else 0.0
+        metrics["ppo_stop_reason"] = cb.stop_reason or ""
         logger.info(f"Eval ({10} episodes avg): {metrics}")
 
         # === Save chart ===
@@ -423,6 +521,11 @@ class RLTrainer:
         action_entropy = float(metrics.get("eval_action_entropy", 0.0))
         dominant_action_ratio = float(metrics.get("eval_dominant_action_ratio", 1.0))
         wrong_side_moves = float(metrics.get("wrong_side_moves", 0.0))
+        worst_net_return = float(metrics.get("walkforward_min_total_return", net_return))
+        worst_gross_return = float(metrics.get("walkforward_min_gross_total_return", gross_return))
+        worst_alpha = float(metrics.get("walkforward_min_alpha", alpha))
+        walkforward_net_std = float(metrics.get("walkforward_net_std", 0.0))
+        walkforward_gross_std = float(metrics.get("walkforward_gross_std", 0.0))
 
         max_dominant_action_ratio = (
             self.selection_max_dominant_action_ratio
@@ -453,22 +556,32 @@ class RLTrainer:
         collapse_penalty = max(dominant_action_ratio - 0.75, 0.0) * 2.0
         collapse_penalty += max(flat_ratio - 0.90, 0.0) * 1.5
 
-        trade_bonus = min(avg_trades, 12.0) * 0.01
-        turnover_penalty = max(avg_trades - 32.0, 0.0) * 0.010
+        trade_bonus = min(avg_trades, 8.0) * 0.015
+        turnover_penalty = max(avg_trades - 10.0, 0.0) * 0.020
+        turnover_penalty += max(avg_trades - 20.0, 0.0) * 0.030
         loss_penalty = max(-net_return, 0.0) * 8.0
-        # Reward profitability heavily
-        profit_bonus = max(net_return, 0.0) * 10.0
+        profit_bonus = max(net_return, 0.0) * 12.0
+        gross_bonus = max(gross_return, 0.0) * 8.0
+        wrong_side_penalty = wrong_side_moves * 0.05
         return (
-            sharpe * 4.0
-            + alpha * 4.0
-            + net_return * 3.0
+            sharpe * 3.0
+            + alpha * 1.5
+            + net_return * 6.0
+            + gross_return * 4.0
+            + worst_net_return * 4.0
+            + worst_gross_return * 3.0
+            + worst_alpha * 0.75
             + profit_bonus
-            - max_drawdown * 3.0
+            + gross_bonus
+            - max_drawdown * 4.0
             + action_entropy * 0.15
             + trade_bonus
             - collapse_penalty
             - turnover_penalty
             - loss_penalty
+            - wrong_side_penalty
+            - walkforward_net_std * 2.0
+            - walkforward_gross_std * 1.5
         )
 
     def _selection_score(self, metrics: dict) -> float:
@@ -480,6 +593,7 @@ class RLTrainer:
         n_episodes: int = 10,
         segment_range: tuple[int, int] | None = None,
         log_episodes: bool = True,
+        seed_base: int | None = None,
     ) -> dict:
         """Run multiple episodes, aggregate metrics."""
         all_metrics = []
@@ -494,18 +608,8 @@ class RLTrainer:
 
         for ep in range(n_episodes):
             env = self.create_env(segment_range=active_range, balanced_sampling=False)
-            obs, _ = env.reset()
-            action_counts = {0: 0, 1: 0, 2: 0}
-            rewards = []
-            while True:
-                action, _ = model.predict(obs, deterministic=True)
-                action_int = int(action.item()) if isinstance(action, np.ndarray) else int(action)
-                action_counts[action_int] = action_counts.get(action_int, 0) + 1
-                obs, r, t, tr, info = env.step(action)
-                rewards.append(float(r))
-                if t or tr:
-                    break
-            m = env.get_metrics()
+            seed = None if seed_base is None else int(seed_base) + ep
+            m, action_counts, reward_sum = self._run_eval_episode(model, env, seed=seed)
             all_metrics.append(m)
             total_equity.extend(env.equity_curve)
             prices_slice = self.price_series[env._start: env._start + len(env.equity_curve) - 1]
@@ -516,7 +620,7 @@ class RLTrainer:
             server_costs.append(float(m.get("server_cost_paid", 0.0)))
             missed_moves.append(float(m.get("missed_moves", 0.0)))
             wrong_side_moves.append(float(m.get("wrong_side_moves", 0.0)))
-            reward_sums.append(float(np.sum(rewards)))
+            reward_sums.append(float(reward_sum))
             for key, value in action_counts.items():
                 total_action_counts[key] = total_action_counts.get(key, 0) + int(value)
             if log_episodes:
@@ -541,7 +645,7 @@ class RLTrainer:
                     int(action_counts.get(0, 0)),
                     int(action_counts.get(1, 0)),
                     int(action_counts.get(2, 0)),
-                    float(np.sum(rewards)),
+                    float(reward_sum),
                 )
 
         # Average metrics and sum trade counts
@@ -619,6 +723,241 @@ class RLTrainer:
             float(avg.get("eval_dominant_action_ratio", 0.0) * 100.0),
         )
         return avg
+
+    def _eval_full_segment(
+        self,
+        model,
+        segment_range: tuple[int, int] | None = None,
+        *,
+        log_episode: bool = False,
+    ) -> dict:
+        active_range = self._normalize_range(segment_range or self.test_range)
+        segment_len = max(active_range[1] - active_range[0], 1)
+        env = self.create_env(
+            segment_range=active_range,
+            balanced_sampling=False,
+            max_episode_steps_override=max(segment_len - 1, 1),
+        )
+        metrics, action_counts, reward_sum = self._run_eval_episode(model, env)
+        total_actions = max(sum(action_counts.values()), 1)
+        action_probs = np.array(
+            [
+                action_counts.get(0, 0),
+                action_counts.get(1, 0),
+                action_counts.get(2, 0),
+            ],
+            dtype=np.float64,
+        ) / float(total_actions)
+        nonzero_probs = action_probs[action_probs > 0.0]
+        entropy = float(-np.sum(nonzero_probs * np.log(nonzero_probs)) / np.log(3.0)) if nonzero_probs.size else 0.0
+        if abs(entropy) < 1e-12:
+            entropy = 0.0
+        dominant_idx = int(np.argmax(action_probs))
+        dominant_ratio = float(np.max(action_probs))
+
+        prices_slice = self.price_series[env._start: env._start + len(env.equity_curve) - 1]
+        bh_eval_return = float(prices_slice[-1] / prices_slice[0] - 1.0) if len(prices_slice) >= 2 else 0.0
+        metrics = dict(metrics)
+        metrics["avg_trades_per_episode"] = float(metrics.get("n_trades", 0.0))
+        metrics["bh_eval_return"] = float(bh_eval_return)
+        metrics["total_server_cost_paid"] = float(metrics.get("server_cost_paid", 0.0))
+        metrics["total_missed_moves"] = float(metrics.get("missed_moves", 0.0))
+        metrics["total_wrong_side_moves"] = float(metrics.get("wrong_side_moves", 0.0))
+        metrics["outperformance_vs_bh"] = float(metrics.get("total_return", 0.0) - bh_eval_return)
+        metrics["avg_reward_sum"] = float(reward_sum)
+        metrics["eval_short_actions"] = float(action_counts.get(0, 0))
+        metrics["eval_flat_actions"] = float(action_counts.get(1, 0))
+        metrics["eval_long_actions"] = float(action_counts.get(2, 0))
+        metrics["eval_episodes"] = 1
+        metrics["eval_range_start"] = int(active_range[0])
+        metrics["eval_range_end"] = int(active_range[1])
+        metrics["eval_range_len"] = int(active_range[1] - active_range[0])
+        metrics["eval_action_entropy"] = float(entropy)
+        metrics["eval_dominant_action"] = float(dominant_idx)
+        metrics["eval_dominant_action_ratio"] = float(dominant_ratio)
+
+        logger.info(
+            "Eval full segment [%d:%d): net=%.4f gross=%.4f dd=%.4f trades=%d win_rate=%.2f%% "
+            "flat_ratio=%.2f%% pos_ratio=%.2f%% server_cost=$%.2f missed_moves=%.4f "
+            "wrong_side_moves=%.4f bh_eval=%.4f alpha=%.4f action_entropy=%.3f "
+            "dominant_action=%d dominant_ratio=%.2f%%",
+            int(active_range[0]),
+            int(active_range[1]),
+            float(metrics.get("total_return", 0.0)),
+            float(metrics.get("gross_total_return", 0.0)),
+            float(metrics.get("max_drawdown", 0.0)),
+            int(metrics.get("n_trades", 0)),
+            float(metrics.get("win_rate", 0.0) * 100.0),
+            float(metrics.get("flat_ratio", 0.0) * 100.0),
+            float(metrics.get("position_ratio", 0.0) * 100.0),
+            float(metrics.get("server_cost_paid", 0.0)),
+            float(metrics.get("missed_moves", 0.0)),
+            float(metrics.get("wrong_side_moves", 0.0)),
+            float(metrics.get("bh_eval_return", 0.0)),
+            float(metrics.get("outperformance_vs_bh", 0.0)),
+            float(metrics.get("eval_action_entropy", 0.0)),
+            int(metrics.get("eval_dominant_action", 1)),
+            float(metrics.get("eval_dominant_action_ratio", 0.0) * 100.0),
+        )
+        if log_episode:
+            logger.info(
+                "Eval full segment actions: {short:%d, flat:%d, long:%d} reward_sum=%.4f",
+                int(action_counts.get(0, 0)),
+                int(action_counts.get(1, 0)),
+                int(action_counts.get(2, 0)),
+                float(reward_sum),
+            )
+        return metrics
+
+    def _build_walkforward_windows(
+        self,
+        segment_range: tuple[int, int] | None = None,
+        *,
+        n_windows: int = 4,
+        min_window_size: int = 4096,
+    ) -> list[tuple[int, int]]:
+        active_range = self._normalize_range(segment_range or self.eval_range)
+        range_len = max(active_range[1] - active_range[0], 1)
+        n_windows = max(int(n_windows), 1)
+        min_window_size = max(int(min_window_size), 64)
+        if n_windows <= 1 or range_len < (min_window_size * 2):
+            return [active_range]
+
+        max_windows = max(range_len // min_window_size, 1)
+        n_actual = min(n_windows, max_windows)
+        if n_actual <= 1:
+            return [active_range]
+
+        window_step = range_len // n_actual
+        windows: list[tuple[int, int]] = []
+        cursor = active_range[0]
+        for idx in range(n_actual):
+            end = active_range[1] if idx == n_actual - 1 else min(cursor + window_step, active_range[1])
+            if end - cursor >= max(min_window_size, 32):
+                windows.append((cursor, end))
+            cursor = end
+        return windows or [active_range]
+
+    def _eval_walkforward_segments(
+        self,
+        model,
+        segment_range: tuple[int, int] | None = None,
+        *,
+        n_windows: int = 4,
+        min_window_size: int = 4096,
+    ) -> dict:
+        windows = self._build_walkforward_windows(
+            segment_range=segment_range,
+            n_windows=n_windows,
+            min_window_size=min_window_size,
+        )
+        metrics_list = [self._eval_full_segment(model, segment_range=window, log_episode=False) for window in windows]
+        if len(metrics_list) == 1:
+            metrics = dict(metrics_list[0])
+            active = bool(
+                float(metrics.get("avg_trades_per_episode", metrics.get("n_trades", 0.0))) >= 1.0
+                and float(metrics.get("flat_ratio", 1.0)) < 0.999
+                and float(metrics.get("eval_dominant_action_ratio", 1.0)) < 0.9995
+            )
+            metrics["walkforward_window_count"] = 1
+            metrics["walkforward_min_total_return"] = float(metrics.get("total_return", 0.0))
+            metrics["walkforward_min_gross_total_return"] = float(metrics.get("gross_total_return", 0.0))
+            metrics["walkforward_min_alpha"] = float(metrics.get("outperformance_vs_bh", 0.0))
+            metrics["walkforward_net_std"] = 0.0
+            metrics["walkforward_gross_std"] = 0.0
+            metrics["walkforward_active_window_ratio"] = 1.0 if active else 0.0
+            metrics["walkforward_active_window_count"] = 1 if active else 0
+            metrics["walkforward_positive_net_ratio"] = 1.0 if float(metrics.get("total_return", 0.0)) > 0.0 else 0.0
+            metrics["walkforward_positive_alpha_ratio"] = (
+                1.0 if float(metrics.get("outperformance_vs_bh", 0.0)) > 0.0 else 0.0
+            )
+            metrics["walkforward_worst_dominant_action_ratio"] = float(
+                metrics.get("eval_dominant_action_ratio", 1.0)
+            )
+            metrics["walkforward_median_trades"] = float(
+                metrics.get("avg_trades_per_episode", metrics.get("n_trades", 0.0))
+            )
+            metrics["walkforward_windows"] = [[int(windows[0][0]), int(windows[0][1])]]
+            return metrics
+
+        def _arr(key: str, default: float = 0.0) -> np.ndarray:
+            return np.asarray([float(m.get(key, default)) for m in metrics_list], dtype=np.float64)
+
+        net = _arr("total_return")
+        gross = _arr("gross_total_return")
+        alpha = _arr("outperformance_vs_bh")
+        dd = np.abs(_arr("max_drawdown"))
+        sharpe = _arr("sharpe")
+        sortino = _arr("sortino")
+        trades = _arr("avg_trades_per_episode")
+        win_rate = _arr("win_rate")
+        flat_ratio = _arr("flat_ratio")
+        pos_ratio = _arr("position_ratio")
+        entropy = _arr("eval_action_entropy")
+        dom_ratio = _arr("eval_dominant_action_ratio")
+        missed = _arr("missed_moves")
+        wrong_side = _arr("wrong_side_moves")
+        reward_sum = _arr("avg_reward_sum")
+        server_cost = _arr("server_cost_paid")
+        active_mask = (trades >= 1.0) & (flat_ratio < 0.999) & (dom_ratio < 0.9995)
+        positive_net_mask = net > 0.0
+        positive_alpha_mask = alpha > 0.0
+
+        dominant_idx = int(np.argmax(dom_ratio))
+        combined = dict(metrics_list[dominant_idx])
+        combined.update(
+            {
+                "sharpe": float(np.median(sharpe)),
+                "sortino": float(np.median(sortino)),
+                "max_drawdown": float(np.max(dd)),
+                "total_return": float(np.median(net)),
+                "gross_total_return": float(np.median(gross)),
+                "flat_ratio": float(np.median(flat_ratio)),
+                "position_ratio": float(np.median(pos_ratio)),
+                "n_trades": float(np.median(trades)),
+                "win_rate": float(np.median(win_rate)),
+                "missed_moves": float(np.median(missed)),
+                "wrong_side_moves": float(np.median(wrong_side)),
+                "server_cost_paid": float(np.median(server_cost)),
+                "avg_trades_per_episode": float(np.median(trades)),
+                "outperformance_vs_bh": float(np.median(alpha)),
+                "avg_reward_sum": float(np.median(reward_sum)),
+                "eval_action_entropy": float(np.median(entropy)),
+                "eval_dominant_action_ratio": float(np.max(dom_ratio)),
+                "walkforward_window_count": int(len(metrics_list)),
+                "walkforward_min_total_return": float(np.min(net)),
+                "walkforward_min_gross_total_return": float(np.min(gross)),
+                "walkforward_min_alpha": float(np.min(alpha)),
+                "walkforward_net_std": float(np.std(net)),
+                "walkforward_gross_std": float(np.std(gross)),
+                "walkforward_active_window_ratio": float(np.mean(active_mask.astype(np.float64))),
+                "walkforward_active_window_count": int(np.sum(active_mask)),
+                "walkforward_positive_net_ratio": float(np.mean(positive_net_mask.astype(np.float64))),
+                "walkforward_positive_alpha_ratio": float(np.mean(positive_alpha_mask.astype(np.float64))),
+                "walkforward_worst_dominant_action_ratio": float(np.max(dom_ratio)),
+                "walkforward_median_trades": float(np.median(trades)),
+                "walkforward_windows": [[int(start), int(end)] for start, end in windows],
+            }
+        )
+        logger.info(
+            "Walk-forward summary [%d:%d): windows=%d median_net=%.4f worst_net=%.4f "
+            "median_gross=%.4f worst_gross=%.4f median_alpha=%.4f worst_alpha=%.4f "
+            "median_trades=%.2f active_windows=%d/%d worst_dom_ratio=%.2f%%",
+            int(windows[0][0]),
+            int(windows[-1][1]),
+            int(len(windows)),
+            float(np.median(net)),
+            float(np.min(net)),
+            float(np.median(gross)),
+            float(np.min(gross)),
+            float(np.median(alpha)),
+            float(np.min(alpha)),
+            float(np.median(trades)),
+            int(np.sum(active_mask)),
+            int(len(windows)),
+            float(np.max(dom_ratio) * 100.0),
+        )
+        return combined
 
     def _save_chart(self, model, metrics: dict):
         """Save RL vs Buy&Hold comparison chart."""

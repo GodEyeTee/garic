@@ -6,8 +6,11 @@ import pandas as pd
 from features.builder import FeatureBuilder
 from pipeline import (
     _aggregate_ohlcv_15m,
+    _aggregate_validation_metrics,
     _build_nautilus_frame,
+    _combine_supervised_validation_scores,
     _compute_data_ranges,
+    _robust_validation_score,
     _run_nautilus_backtest_segment,
     _score_nautilus_summary,
     add_naive_forecast,
@@ -43,6 +46,88 @@ class TestPipelineHelpers:
         assert ranges["train"] == (0, 72)
         assert ranges["validation"] == (72, 80)
         assert ranges["test"] == (80, 100)
+
+    def test_robust_validation_score_requires_all_finite(self):
+        assert _robust_validation_score([1.0, 2.0, 3.0]) == 2.0 + 0.25 * 1.0
+        assert _robust_validation_score([1.0, float("-inf"), 3.0]) == float("-inf")
+
+    def test_aggregate_validation_metrics_is_conservative(self):
+        metrics = [
+            {
+                "total_return": 0.01,
+                "gross_total_return": 0.015,
+                "flat_ratio": 0.98,
+                "eval_dominant_action_ratio": 0.97,
+                "max_drawdown": 0.03,
+                "avg_trades_per_episode": 2.0,
+            },
+            {
+                "total_return": 0.02,
+                "gross_total_return": 0.025,
+                "flat_ratio": 0.96,
+                "eval_dominant_action_ratio": 0.95,
+                "max_drawdown": 0.02,
+                "avg_trades_per_episode": 4.0,
+            },
+        ]
+        out = _aggregate_validation_metrics(metrics, [0.5, 1.5])
+        assert out["total_return"] == 0.015
+        assert out["gross_total_return"] == 0.02
+        assert out["flat_ratio"] == 0.98
+        assert out["eval_dominant_action_ratio"] == 0.97
+        assert out["max_drawdown"] == 0.03
+        assert out["avg_trades_per_episode"] == 3.0
+        assert out["validation_score_median"] == 1.0
+        assert out["validation_score_worst"] == 0.5
+        assert out["validation_score_robust"] == 1.0 + 0.25 * 0.5
+
+    def test_combine_supervised_validation_scores_softens_one_flat_window(self):
+        class DummyTrainer:
+            def score_candidate(self, metrics, **kwargs):
+                return float(metrics.get("soft_score", -0.5))
+
+        combined, walkforward_soft, details = _combine_supervised_validation_scores(
+            1.40,
+            {
+                "soft_score": -0.90,
+                "walkforward_active_window_ratio": 0.50,
+                "walkforward_min_total_return": -0.015,
+                "walkforward_min_gross_total_return": 0.0,
+                "walkforward_min_alpha": -0.20,
+                "walkforward_worst_dominant_action_ratio": 1.0,
+                "walkforward_median_trades": 2.0,
+                "walkforward_positive_net_ratio": 0.50,
+                "walkforward_positive_alpha_ratio": 0.50,
+            },
+            DummyTrainer(),
+            max_dominant_action_ratio=0.99,
+            min_avg_trades_per_episode=0.5,
+            min_action_entropy=0.0,
+        )
+
+        assert np.isfinite(combined)
+        assert walkforward_soft == -0.90
+        assert details["walkforward_active_window_ratio"] == 0.50
+
+    def test_combine_supervised_validation_scores_rejects_fully_inactive_walkforward(self):
+        class DummyTrainer:
+            def score_candidate(self, metrics, **kwargs):
+                return -0.5
+
+        combined, _, _ = _combine_supervised_validation_scores(
+            1.20,
+            {
+                "walkforward_active_window_ratio": 0.0,
+                "walkforward_median_trades": 0.0,
+                "walkforward_min_total_return": -0.015,
+            },
+            DummyTrainer(),
+            max_dominant_action_ratio=0.99,
+            min_avg_trades_per_episode=0.5,
+            min_action_entropy=0.0,
+        )
+
+        assert combined == float("-inf")
 
     def test_aggregate_ohlcv_15m_vectorized_values(self):
         df = pd.DataFrame(

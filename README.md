@@ -1,146 +1,59 @@
 # GARIC
 
-GARIC is a trading research project for Binance USDT-M futures. It combines:
+GARIC is a Windows-first Binance USDT-M futures research repo. It trains PPO in a fast internal environment, validates candidates with NautilusTrader, and can run Nautilus backtest, paper, and live flows from the same workspace.
 
-- a fast internal training environment for PPO and supervised fallback models
-- a browser-first training dashboard
-- a NautilusTrader execution layer for event-driven backtest, paper, and live paths
-- a cost model that separates `gross` trading performance from `net` performance after server cost
+## Canonical Workflow
 
-The project is designed for Windows and can run from the existing project `venv`.
+Use `garic.bat` or `python garic.py` as the only user-facing entrypoint.
 
-## Current Status (2026-03-23)
+| Goal | Recommended command | Notes |
+| --- | --- | --- |
+| Best current local training run | `garic.bat train --profile best --no-cache` | Starts the training dashboard and runs the full local recipe |
+| Quick validation run | `garic.bat test` | Uses the lightweight smoke profile |
+| Nautilus backtest | `garic.bat backtest` | Starts the Nautilus dashboard by default |
+| Nautilus paper trading | `garic.bat paper` | Uses `configs/nautilus.yaml` unless overridden |
+| Nautilus live trading | `garic.bat live` | Requires `BINANCE_API_KEY` and `BINANCE_API_SECRET` |
 
-### Reward v2 — Simplified for Profitability
+Equivalent Python form:
 
-The reward function was completely redesigned to fix PPO collapse (agent learning to always stay flat).
-
-**Previous reward (v1)** had 12 conflicting penalty terms:
-- missed_move_penalty (40x), wrong_side_penalty (20x), alpha benchmark, server cost multiplier (6x), flat penalty, same position penalty, closed trade bonus — all fighting each other
-- Result: PPO collapsed to 100% flat, 0 trades, 0 reward
-
-**New reward (v2)** uses only 2 clean components:
-- `pnl × 200` — net PnL from trading (fees + funding included)
-- `abs(market_move) × 30` — opportunity cost when flat (proportional to actual price movement)
-- Server cost tracked in balance only, not in reward (sunk cost the agent can't control)
-- No double-counting, no alpha benchmark comparison
-
-**Incentive ordering**: correct position (+) > flat (−) > wrong position (−−)
-
-### CryptoMamba Forecast — With Accuracy Validation
-
-CryptoMamba (Mamba SSM) generates 5 forecast features for the RL model.
-
-**Previous**: no accuracy validation — trained and used blindly, predictions could be pure noise
-
-**Current**:
-- Per-window normalization (matches inference behavior exactly)
-- Train/validation split (80/20) with early stopping
-- Quality gate: directional accuracy > 50% AND RMSE < naive baseline
-- If quality gate fails → forecast features zeroed out automatically
-- Model size: d_model=64, n_layers=4, context=128 bars (~50K params, fits RTX 2060)
-
-### Data Coverage
-
-- **Source**: Binance USDT-M futures, 1-minute candles
-- **Range**: 2020-01-01 to 2026-02-28 (6.2 years, 3.2M rows)
-- **Decision timeframe**: 15-minute candles (216K bars)
-- **Split**: Train 72% (2020-01 → 2024-06) / Val 8% (2024-06 → 2024-12) / Test 20% (2024-12 → 2026-02)
-
-### Model Selection Gates
-
-Models must pass these gates to be selected:
-
-- Net return > -10% (hard reject if losing too much)
-- Dominant action ratio < 85% (must use diverse actions)
-- Action entropy > 0.05 (must explore)
-- Average trades per episode > 1.5
-
-Profitability is heavily weighted in the scoring function.
-
-### Feature Cache Validation
-
-Pipeline now validates cached features against raw data size. Stale caches from test runs (e.g. 13K rows instead of 216K) are automatically invalidated and rebuilt.
-
-### Test Suite
-
-63 tests passing across all modules.
-
-## Architecture
-
-GARIC currently uses two execution layers on purpose:
-
-1. Fast training environment
-   - Used for PPO rollouts and fast model iteration
-   - Lets training finish in practical time
-   - Uses the same portfolio/server-cost logic as the internal backtest path
-
-2. NautilusTrader validation and execution
-   - Used for more realistic event-driven validation during model selection
-   - Used for standalone Nautilus backtest
-   - Used for Nautilus paper/live execution
-
-Important:
-
-- GARIC does **not** use Nautilus as the per-step PPO gym environment
-- That would be far too slow for RL training
-- Instead, training now uses Nautilus in the place where it matters most:
-  - candidate validation
-  - final model selection
-  - held-out realistic test
-
-## How Nautilus Is Used In This Project
-
-### 1. During training
-
-When you run the training pipeline, GARIC now:
-
-- trains PPO in the fast internal env
-- optionally trains supervised fallback candidates
-- scores those candidates on the internal validation split
-- runs Nautilus validation on candidate model files
-- uses the Nautilus result to help select the final model
-- runs a Nautilus held-out test on the selected model
-
-This logic lives mainly in:
-
-- `pipeline.py`
-- `execution/nautilus/backtest_runner.py`
-- `execution/nautilus/strategy.py`
-
-The Nautilus-backed training validation is controlled by:
-
-- `configs/train_rtx2060.yaml`
-- `configs/default.yaml`
-- `configs/test_rtx2060.yaml`
-
-Look for this section in config:
-
-```yaml
-training:
-  nautilus_validation:
-    enabled: true
-    use_for_model_selection: true
-    evaluate_final_test: true
+```powershell
+python garic.py train --profile best --no-cache
 ```
 
-### 2. As a standalone execution engine
+Defaults:
 
-Nautilus is also exposed directly for:
+- `train`, `backtest`, `paper`, and `live` start the Streamlit dashboard automatically.
+- Add `--cli` to skip the dashboard and run the underlying module directly.
+- Add `--config <yaml>` to override the profile mapping.
+- Add `--no-browser` if you want the dashboard server without auto-opening a tab.
 
-- local event-driven backtest
-- Binance paper mode
-- Binance live mode
+## Recommended Local Recipe
 
-That path loads GARIC models directly from:
+1. Validate the environment and code path first:
 
-- `checkpoints/rl_agent_final.zip`
-- `checkpoints/rl_agent_best.zip`
-- `checkpoints/rl_agent_supervised.joblib`
+   ```powershell
+   garic.bat test
+   ```
+
+2. Run the best current local training recipe:
+
+   ```powershell
+   garic.bat train --profile best --no-cache
+   ```
+
+3. Review the outputs in `checkpoints/`, `pipeline.log`, and `dashboard.log`.
+
+`best` is the current recommended local profile in this repo. It maps to `configs/train_rtx2060.yaml` and currently means:
+
+- BTCUSDT only
+- 1,000,000 PPO timesteps
+- balanced regime sampling
+- strict checkpoint selection gates
+- Nautilus validation enabled for model selection
 
 ## Installation
 
-Create and activate the project virtual environment:
+Create and activate a project virtual environment:
 
 ```powershell
 python -m venv venv
@@ -148,96 +61,56 @@ venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-If you already have the project `venv`, reuse it.
+Notes:
 
-## Recommended Windows Workflow
+- `requirements.txt` is the full environment for training, dashboards, and Nautilus.
+- `requirements-minimal.txt` is not enough for full training or execution.
+- `garic.bat` automatically prefers `venv\Scripts\python.exe`, then `.venv\Scripts\python.exe`, then `python` from PATH.
+- If GARIC says no compatible Python environment was found, recreate the project venv and reinstall `requirements.txt`.
 
-### Train with browser dashboard
+If historical data is missing, the training pipeline can download Binance Futures OHLCV automatically into `data/raw/`.
 
-```powershell
-python run_training_browser.py --config configs\train_rtx2060.yaml
-```
+## Config Model
 
-Or train directly (first run use `--no-cache` to rebuild features with full data):
+GARIC always loads `configs/default.yaml` first. Any config you pass with `--config` is deep-merged on top of it.
 
-```powershell
-python pipeline.py --mode train --config configs\train_rtx2060.yaml --no-cache
-```
+Friendly profile mappings:
 
-### Run Nautilus backtest directly
+- `best` -> `configs/train_rtx2060.yaml`
+- `smoke` -> `configs/test_rtx2060.yaml`
+- `cloud` -> `configs/default.yaml`
 
-```powershell
-python run_nautilus_browser.py --mode backtest
-```
+Execution commands (`backtest`, `paper`, `live`) use `configs/nautilus.yaml` by default.
 
-### Run Nautilus paper mode
+## What `train` Actually Does
 
-```powershell
-python run_nautilus_browser.py --mode paper
-```
+When you run `garic.py train`, GARIC:
 
-### Run Nautilus live mode
+1. loads and cleans Binance 1-minute futures data
+2. aggregates it to 15-minute decision bars
+3. builds the compact market feature stack
+4. optionally adds CryptoMamba forecast features if enabled and if they pass quality checks
+5. trains PPO in the fast internal environment
+6. evaluates checkpoints with internal selection gates
+7. runs Nautilus validation on candidate models
+8. selects the final model and writes artifacts to `checkpoints/`
 
-```powershell
-python run_nautilus_browser.py --mode live
-```
+The training path is intentionally split into two layers:
 
-Live mode requires `BINANCE_API_KEY` and `BINANCE_API_SECRET`.
+- Fast internal environment for practical PPO training speed
+- NautilusTrader for more realistic candidate validation and final execution paths
 
-## Main Project Commands
+## Current Defaults That Matter
 
-Run tests:
+- `pipeline.py` is the train/test engine only. Use `garic.py backtest|paper|live` for execution.
+- Reward is v3: equity return after costs, minus drawdown-increase and turnover penalties.
+- Base market feature stack is 25 dims: 5 returns + 15 TA + 5 microstructure.
+- Agent state adds 8 dims, so the policy sees 33 dims when forecast features are disabled.
+- CryptoMamba forecast features exist, but are disabled by default in the shipped profiles.
+- Supervised fallback exists, but is disabled by default in the shipped profiles.
+- Nautilus validation is enabled in the training profiles and is used during model selection.
 
-```powershell
-pytest tests\
-```
-
-Run the Nautilus browser dashboard only:
-
-```powershell
-streamlit run monitoring\nautilus\dashboard.py
-```
-
-Run the training browser dashboard only:
-
-```powershell
-streamlit run monitoring\training\dashboard.py
-```
-
-## Current Model/Metric Rules
-
-### Action space
-
-The policy is discrete: `Short`, `Flat`, `Long`
-
-### Feature stack
-
-The current observation uses:
-
-- `30` market features (TA 15 + Micro 5 + Returns 4 + CryptoMamba forecast 5 + Vol 1)
-- `4` agent-state features (position, unrealized PnL, flat steps, position steps)
-
-### Reward v2
-
-```
-reward = pnl × pnl_reward_scale           (default 200)
-       − abs(market_move) × opp_cost_scale (default 30, only when flat)
-```
-
-Server cost is applied to balance tracking only (not reward). Episode-end penalty of 3.0 for zero-trade episodes forces exploration.
-
-### Cost model
-
-- `gross_total_return` = trading result before server cost
-- `total_return` = net result after server cost
-- if the model does nothing, equity still decays from server costs
-- taker fee: 0.05% + slippage: 1 bps per trade
-
-### Why Nautilus validation matters
-
-The fast env is good for training speed, but it can still overvalue collapsed policies. Nautilus validation helps expose whether a model is just holding one direction, overtrading, or winning only because of a narrow synthetic path.
-
-## Outputs
+## Main Outputs
 
 Important runtime files:
 
@@ -249,43 +122,29 @@ Important runtime files:
 - `checkpoints/rl_agent_final.zip`
 - `checkpoints/rl_agent_best.zip`
 - `checkpoints/rl_agent_supervised.joblib`
-- `checkpoints/crypto_mamba_15m.pt`
+- `checkpoints/crypto_mamba_15m.pt` when forecast features are enabled
 
-## Repository Layout
+## Key Files
 
-```text
-garic/
-  configs/
-  data/
-  execution/
-    backtest/
-    live/
-    nautilus/
-  features/
-  models/
-    forecast/
-    rl/
-    moe/
-  monitoring/
-    training/
-    live/
-    nautilus/
-  risk/
-  tests/
-  pipeline.py
-  run_training_browser.py
-  run_nautilus_browser.py
+- `garic.py`: unified launcher
+- `garic.bat`: Windows launcher that prefers the project virtual environment
+- `pipeline.py`: train/test pipeline engine
+- `run_training_browser.py`: lower-level training dashboard launcher
+- `run_nautilus_browser.py`: lower-level Nautilus dashboard launcher
+- `configs/default.yaml`: base config
+- `configs/train_rtx2060.yaml`: recommended local training override
+- `configs/test_rtx2060.yaml`: lightweight smoke-test override
+- `configs/nautilus.yaml`: default Nautilus execution config
+
+## Legacy Entry Points
+
+`run_training_browser.py`, `run_nautilus_browser.py`, and `pipeline.py` still exist because the unified launcher calls them internally. They are lower-level tools now.
+
+For day-to-day use, stick to:
+
+```powershell
+garic.bat <command>
 ```
-
-## Verified Status
-
-Verified on Windows project `venv` (Python 3.12, PyTorch 2.10+cu128, RTX 2060):
-
-- 63/63 pytest suite passing
-- Reward v2 confirmed: correct position > flat > wrong position
-- PPO no longer collapses to flat (entropy 0.938, diverse actions)
-- CryptoMamba quality gate working (rejects noise, accepts real patterns)
-- Feature cache validation prevents stale data
 
 ## License
 
@@ -296,7 +155,7 @@ It is licensed under the custom `LICENSE` in this repo. Practical rules:
 - non-commercial use only
 - attribution to `GodEyeTee` is required
 - modification and derivative works are not allowed
-- commercial/profit use requires a separate paid license
+- commercial or profit use requires a separate paid license
 
 ## Disclaimer
 

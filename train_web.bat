@@ -1,3 +1,3 @@
 @echo off
 setlocal
-python "%~dp0run_training_browser.py" %*
+call "%~dp0garic.bat" train %*
