@@ -26,15 +26,16 @@ class FeatureSnapshot:
 class NautilusFeatureBuilder:
     """Build the compact GARIC feature vector from 15m bars."""
 
-    def __init__(self, history_bars: int = 160, include_forecast: bool = False):
-        self.history_bars = max(int(history_bars), 128)
+    def __init__(self, history_bars: int = 384, include_forecast: bool = False):
+        # Use a longer history so rolling indicators match the training path more closely.
+        self.history_bars = max(int(history_bars), 256)
         self.return_periods = (1, 4, 16, 48, 96)
         self.forecaster = NaiveForecaster()
         self.include_forecast = bool(include_forecast)
 
     @property
     def warmup_bars(self) -> int:
-        return max(self.history_bars, 128)
+        return max(self.history_bars, 256)
 
     def build_latest(self, df: pd.DataFrame) -> FeatureSnapshot:
         frame = df.tail(self.history_bars).copy()

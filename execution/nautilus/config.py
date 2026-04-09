@@ -15,11 +15,13 @@ DEFAULT_CONFIG: dict = {
         "instrument_id": "BTCUSDT-PERP.BINANCE",
         "venue": "BINANCE",
         "bar_minutes": 15,
-        "history_bars": 160,
-        "request_history_days": 3,
+        "history_bars": 384,
+        "request_history_days": 8,
         "trade_size": "0.002",
         "initial_balance_usdt": 10_000.0,
         "leverage": 1,
+        "monthly_server_cost_usd": 100.0,
+        "periods_per_day": 96,
         "model_path": "",
         "data_path": "",
         "state_path": "checkpoints/nautilus_dashboard_state.json",
@@ -30,6 +32,11 @@ DEFAULT_CONFIG: dict = {
         "api_secret_env": "BINANCE_API_SECRET",
         "close_positions_on_stop": True,
         "reduce_only_on_stop": True,
+        "backtest_log_level": "ERROR",
+        "backtest_bypass_logging": False,
+        "backtest_state_update_interval_bars": 1,
+        "backtest_publish_event_details": True,
+        "backtest_publish_warmup_updates": True,
     },
 }
 
@@ -58,10 +65,12 @@ def load_nautilus_config(path: str | None = None) -> dict:
     cfg["dashboard_log_path"] = str(Path(cfg.get("dashboard_log_path", "nautilus_dashboard.log")))
     cfg["trade_size"] = str(cfg.get("trade_size", "0.002"))
     cfg["bar_minutes"] = int(cfg.get("bar_minutes", 15))
-    cfg["history_bars"] = int(cfg.get("history_bars", 160))
-    cfg["request_history_days"] = int(cfg.get("request_history_days", 3))
+    cfg["history_bars"] = int(cfg.get("history_bars", 384))
+    cfg["request_history_days"] = int(cfg.get("request_history_days", 8))
     cfg["initial_balance_usdt"] = float(cfg.get("initial_balance_usdt", 10_000.0))
     cfg["leverage"] = int(cfg.get("leverage", 1))
+    cfg["monthly_server_cost_usd"] = float(cfg.get("monthly_server_cost_usd", 100.0))
+    cfg["periods_per_day"] = int(cfg.get("periods_per_day", 96))
     cfg["environment"] = str(cfg.get("environment", "LIVE")).upper()
     return config
 
@@ -99,4 +108,3 @@ def load_live_credentials(config: dict) -> tuple[str, str]:
     api_key = os.getenv(cfg.get("api_key_env", "BINANCE_API_KEY"), "").strip()
     api_secret = os.getenv(cfg.get("api_secret_env", "BINANCE_API_SECRET"), "").strip()
     return api_key, api_secret
-

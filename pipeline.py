@@ -21,7 +21,9 @@ import time
 import sys
 import copy
 import json
+import os
 import subprocess
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -330,6 +332,238 @@ def _combine_supervised_validation_scores(
     return float(combined_score), float(walkforward_soft_score), details
 
 
+def _score_sparse_supervised_watchlist_candidate(metrics: dict) -> float:
+    """Soft score for sparse candidates that merit realistic Nautilus validation."""
+    net_return = float(metrics.get("total_return", 0.0))
+    gross_return = float(metrics.get("gross_total_return", net_return))
+    alpha = float(metrics.get("outperformance_vs_bh", 0.0))
+    max_drawdown = abs(float(metrics.get("max_drawdown", 0.0)))
+    avg_trades = float(metrics.get("avg_trades_per_episode", metrics.get("n_trades", 0.0)))
+    action_entropy = float(metrics.get("eval_action_entropy", 0.0))
+    dominant_action_ratio = float(metrics.get("eval_dominant_action_ratio", 1.0))
+    flat_ratio = float(metrics.get("flat_ratio", 1.0))
+    worst_net_return = float(metrics.get("walkforward_min_total_return", net_return))
+    worst_gross_return = float(metrics.get("walkforward_min_gross_total_return", gross_return))
+    worst_alpha = float(metrics.get("walkforward_min_alpha", alpha))
+    active_ratio = float(metrics.get("walkforward_active_window_ratio", 0.0))
+    positive_net_ratio = float(metrics.get("walkforward_positive_net_ratio", 0.0))
+    positive_alpha_ratio = float(metrics.get("walkforward_positive_alpha_ratio", 0.0))
+    brier = float(metrics.get("supervised_validation_brier", float("inf")))
+    trade_density = float(metrics.get("trade_density", 0.0))
+
+    if avg_trades < 0.5 and active_ratio <= 0.0:
+        return float("-inf")
+    if (
+        gross_return <= 0.0
+        and worst_gross_return <= 0.0
+        and positive_net_ratio <= 0.0
+        and positive_alpha_ratio < 0.5
+    ):
+        return float("-inf")
+    if net_return <= -0.01 and worst_net_return <= -0.01 and positive_net_ratio <= 0.0:
+        return float("-inf")
+
+    turnover_penalty = max(avg_trades - 4.0, 0.0) * 0.05
+    turnover_penalty += max(avg_trades - 8.0, 0.0) * 0.08
+    turnover_penalty += max(trade_density - 0.01, 0.0) * 8.0
+    turnover_penalty += max(trade_density - 0.02, 0.0) * 14.0
+    dominance_penalty = max(dominant_action_ratio - 0.95, 0.0) * 6.0
+    flat_penalty = max(flat_ratio - 0.985, 0.0) * 1.5
+    flat_penalty += max(flat_ratio - 0.995, 0.0) * 4.0
+    score = (
+        net_return * 8.0
+        + gross_return * 10.0
+        + alpha * 2.0
+        + worst_net_return * 4.0
+        + worst_gross_return * 5.0
+        + worst_alpha * 1.0
+        + active_ratio * 0.75
+        + positive_net_ratio * 0.60
+        + positive_alpha_ratio * 0.40
+        - max_drawdown * 5.0
+        - turnover_penalty
+        - dominance_penalty
+        - flat_penalty
+        + action_entropy * 0.10
+    )
+    if np.isfinite(brier):
+        score -= max(brier - 0.75, 0.0) * 0.25
+    return float(score)
+
+
+def _score_anchor_supervised_probe_candidate(metrics: dict) -> float:
+    """Allow very conservative high-threshold candidates to reach Nautilus once."""
+    net_return = float(metrics.get("total_return", 0.0))
+    gross_return = float(metrics.get("gross_total_return", net_return))
+    alpha = float(metrics.get("outperformance_vs_bh", 0.0))
+    avg_trades = float(metrics.get("avg_trades_per_episode", metrics.get("n_trades", 0.0)))
+    dominant_action_ratio = float(metrics.get("eval_dominant_action_ratio", 1.0))
+    flat_ratio = float(metrics.get("flat_ratio", 1.0))
+    max_drawdown = abs(float(metrics.get("max_drawdown", 0.0)))
+    worst_net_return = float(metrics.get("walkforward_min_total_return", net_return))
+    worst_gross_return = float(metrics.get("walkforward_min_gross_total_return", gross_return))
+
+    if gross_return < -0.0025 or worst_gross_return < -0.0040:
+        return float("-inf")
+    if net_return < -0.0040 or worst_net_return < -0.0080:
+        return float("-inf")
+    if avg_trades > 2.0:
+        return float("-inf")
+
+    return float(
+        gross_return * 8.0
+        + net_return * 6.0
+        + alpha * 1.5
+        - max_drawdown * 3.0
+        - max(flat_ratio - 0.999, 0.0) * 0.5
+        - max(dominant_action_ratio - 0.995, 0.0) * 2.0
+        - max(avg_trades - 1.0, 0.0) * 0.10
+    )
+
+
+def _is_collapsed_supervised_probe_metrics(metrics: dict) -> bool:
+    """Return True when a supervised probe is effectively flat/collapsed."""
+    avg_trades = float(metrics.get("avg_trades_per_episode", metrics.get("n_trades", 0.0)))
+    flat_ratio = float(metrics.get("flat_ratio", 1.0))
+    dominant_ratio = float(metrics.get("eval_dominant_action_ratio", 1.0))
+    action_entropy = float(metrics.get("eval_action_entropy", 0.0))
+    position_ratio = float(metrics.get("position_ratio", 0.0))
+    gross_return = float(metrics.get("gross_total_return", metrics.get("total_return", 0.0)))
+    return bool(
+        avg_trades <= 0.10
+        and flat_ratio >= 0.999
+        and dominant_ratio >= 0.999
+        and action_entropy <= 0.01
+        and position_ratio <= 0.001
+        and abs(gross_return) <= 0.0025
+    )
+
+
+def _derive_calibrated_confidence_grid(
+    side_calibration: dict | None,
+    fallback_grid: list[float] | tuple[float, ...],
+    *,
+    min_edge: float,
+    min_positive_rate: float,
+    min_active_window_ratio: float = 0.50,
+    respect_fallback_floor: bool = True,
+    anchor_thresholds: list[float] | tuple[float, ...] | None = None,
+    preserve_top_fallback_count: int = 2,
+    top_k: int = 3,
+) -> list[float]:
+    fallback = sorted({round(float(v), 2) for v in fallback_grid if np.isfinite(v)})
+    fallback_floor = fallback[0] if fallback else 0.0
+    anchors = sorted(
+        {
+            round(float(v), 2)
+            for v in (anchor_thresholds or [])
+            if np.isfinite(v)
+        }
+    )
+    if respect_fallback_floor and fallback:
+        anchors = [value for value in anchors if value + 1e-6 >= fallback_floor]
+    if not isinstance(side_calibration, dict):
+        return sorted(set(fallback).union(anchors))
+
+    threshold_rows = side_calibration.get("thresholds", [])
+    if not isinstance(threshold_rows, list):
+        return fallback
+
+    scored: list[tuple[float, float]] = []
+    relaxed_positive_rate = max(float(min_positive_rate) - 0.05, 0.40)
+    relaxed_min_edge = min(float(min_edge), 0.0)
+    for row in threshold_rows:
+        threshold = round(float(row.get("threshold", 0.0)), 2)
+        if respect_fallback_floor and fallback and threshold + 1e-6 < fallback_floor:
+            continue
+        mean_edge = float(row.get("robust_mean_edge", row.get("mean_edge", 0.0)))
+        positive_rate = float(row.get("robust_positive_rate", row.get("positive_rate", 0.0)))
+        active_window_ratio = float(row.get("active_window_ratio", 1.0))
+        count = int(row.get("count", 0))
+        if (
+            mean_edge < relaxed_min_edge
+            or positive_rate < relaxed_positive_rate
+            or active_window_ratio < min_active_window_ratio
+        ):
+            continue
+        quality = (
+            mean_edge * 1200.0
+            + positive_rate * 1.25
+            + active_window_ratio * 0.45
+            + threshold * 0.35
+            - float(row.get("edge_std", 0.0)) * 4.0
+            + np.log1p(max(count, 1)) * 0.03
+        )
+        scored.append((quality, threshold))
+
+    if not scored:
+        for row in threshold_rows:
+            threshold = round(float(row.get("threshold", 0.0)), 2)
+            if respect_fallback_floor and fallback and threshold + 1e-6 < fallback_floor:
+                continue
+            mean_edge = float(row.get("robust_mean_edge", row.get("mean_edge", 0.0)))
+            positive_rate = float(row.get("robust_positive_rate", row.get("positive_rate", 0.0)))
+            active_window_ratio = float(row.get("active_window_ratio", 1.0))
+            count = int(row.get("count", 0))
+            quality = (
+                mean_edge * 800.0
+                + positive_rate * 1.0
+                + active_window_ratio * 0.35
+                + threshold * 0.30
+                - float(row.get("edge_std", 0.0)) * 3.0
+                + np.log1p(max(count, 1)) * 0.02
+            )
+            scored.append((quality, threshold))
+
+    selected = [threshold for _, threshold in sorted(scored, key=lambda item: item[0], reverse=True)[:top_k]]
+    if not selected:
+        return sorted(set(fallback).union(anchors))
+
+    merged = set(selected)
+    fallback_lookup = {value: idx for idx, value in enumerate(fallback)}
+    for threshold in selected:
+        idx = fallback_lookup.get(threshold)
+        if idx is None:
+            continue
+        if idx - 1 >= 0:
+            merged.add(fallback[idx - 1])
+        if idx + 1 < len(fallback):
+            merged.add(fallback[idx + 1])
+
+    if fallback:
+        preserve_top_fallback_count = max(int(preserve_top_fallback_count), 0)
+        if preserve_top_fallback_count > 0:
+            merged.update(fallback[-preserve_top_fallback_count:])
+        else:
+            merged.add(fallback[-1])
+    merged.update(anchors)
+    return sorted(merged)
+
+
+def _build_supervised_search_grid(
+    calibrated_grid: list[float] | tuple[float, ...],
+    *,
+    exploration_grid: list[float] | tuple[float, ...] | None = None,
+    anchor_grid: list[float] | tuple[float, ...] | None = None,
+) -> list[float]:
+    values = {
+        round(float(v), 2)
+        for v in list(calibrated_grid or [])
+        if np.isfinite(v)
+    }
+    values.update(
+        round(float(v), 2)
+        for v in list(exploration_grid or [])
+        if np.isfinite(v)
+    )
+    values.update(
+        round(float(v), 2)
+        for v in list(anchor_grid or [])
+        if np.isfinite(v)
+    )
+    return sorted(values)
+
+
 def _build_nautilus_frame(
     prices: np.ndarray,
     ohlcv_data: np.ndarray | None = None,
@@ -368,6 +602,747 @@ def _build_nautilus_frame(
     return frame.reset_index(drop=True)
 
 
+def _prepare_nautilus_segment_frame(
+    frame_15m: pd.DataFrame,
+    segment_range: tuple[int, int],
+    *,
+    history_bars: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, int, int, int]:
+    start, end = int(segment_range[0]), int(segment_range[1])
+    if end <= start:
+        raise ValueError(f"Invalid Nautilus segment range: [{start}:{end})")
+    warmup_bars = max(int(history_bars) - 1, 0)
+    padded_start = max(0, start - warmup_bars)
+    prepared = frame_15m.iloc[padded_start:end].reset_index(drop=True)
+    target = frame_15m.iloc[start:end].reset_index(drop=True)
+    score_start_index = start - padded_start
+    if len(target) < 128:
+        raise ValueError(f"Nautilus target segment too short: {len(target)} bars")
+    if len(prepared) <= score_start_index:
+        raise ValueError(
+            f"Nautilus prepared segment has no scored region: prepared={len(prepared)} score_start={score_start_index}"
+        )
+    return prepared, target, padded_start, start, score_start_index
+
+
+def _apply_nautilus_target_slice_metrics(
+    summary: dict,
+    *,
+    target_frame: pd.DataFrame,
+    target_start: int,
+    target_end: int,
+    prepared_start: int,
+    score_start_index: int,
+    initial_balance: float,
+    monthly_server_cost_usd: float,
+    periods_per_day: int,
+) -> dict:
+    adjusted = dict(summary)
+    target_bars = int(len(target_frame))
+    server_cost_paid = 0.0
+    if monthly_server_cost_usd > 0.0 and periods_per_day > 0 and target_bars > 0:
+        server_cost_paid = float(monthly_server_cost_usd) * (
+            float(target_bars) / float(periods_per_day * 30)
+        )
+
+    gross_total_return = float(adjusted.get("gross_total_return", adjusted.get("total_return", 0.0)))
+    net_total_return = gross_total_return - (server_cost_paid / max(float(initial_balance), 1e-9))
+    bh_eval_return = 0.0
+    if target_bars >= 2:
+        first_price = float(target_frame["close"].iloc[0])
+        last_price = float(target_frame["close"].iloc[-1])
+        if first_price > 0.0:
+            bh_eval_return = last_price / first_price - 1.0
+
+    adjusted["server_cost_paid"] = float(server_cost_paid)
+    adjusted["gross_total_return"] = float(gross_total_return)
+    adjusted["total_return"] = float(net_total_return)
+    adjusted["bh_eval_return"] = float(bh_eval_return)
+    adjusted["outperformance_vs_bh"] = float(net_total_return - bh_eval_return)
+    adjusted["segment_range"] = [int(target_start), int(target_end)]
+    adjusted["segment_input_range"] = [int(prepared_start), int(target_end)]
+    adjusted["segment_score_start_index"] = int(score_start_index)
+    adjusted["segment_target_bars"] = int(target_bars)
+    adjusted["segment_warmup_bars"] = int(max(score_start_index, 0))
+    adjusted["trade_density"] = float(adjusted.get("n_trades", 0.0)) / max(float(target_bars), 1.0)
+    return _normalize_nautilus_summary_metrics(adjusted)
+
+
+def _normalize_nautilus_summary_metrics(summary: dict) -> dict:
+    """Recompute execution metrics from action counts / position events when available."""
+    normalized = dict(summary)
+    backtest = normalized.get("backtest", {})
+    if not isinstance(backtest, dict):
+        backtest = {}
+
+    total_orders = int(
+        normalized.get(
+            "total_orders",
+            backtest.get("total_orders", 0),
+        )
+        or 0
+    )
+    total_positions = int(
+        normalized.get(
+            "total_positions",
+            backtest.get("total_positions", 0),
+        )
+        or 0
+    )
+    n_trades = max(
+        int(normalized.get("n_trades", 0) or 0),
+        int(backtest.get("n_trades", 0) or 0),
+        total_positions,
+    )
+
+    n_wins = max(
+        int(normalized.get("n_wins", 0) or 0),
+        int(backtest.get("n_wins", 0) or 0),
+    )
+    n_losses = max(
+        int(normalized.get("n_losses", 0) or 0),
+        int(backtest.get("n_losses", 0) or 0),
+    )
+    total_closed = n_wins + n_losses
+    win_rate = (
+        float(n_wins / total_closed)
+        if total_closed > 0
+        else float(normalized.get("win_rate", backtest.get("win_rate", 0.0)) or 0.0)
+    )
+
+    action_counts = normalized.get("action_counts")
+    if not isinstance(action_counts, dict):
+        action_counts = backtest.get("action_counts", {})
+    if not isinstance(action_counts, dict):
+        action_counts = {}
+    combined_action_counts = {
+        "short": int(action_counts.get("short", normalized.get("eval_short_actions", 0.0)) or 0),
+        "flat": int(action_counts.get("flat", normalized.get("eval_flat_actions", 0.0)) or 0),
+        "long": int(action_counts.get("long", normalized.get("eval_long_actions", 0.0)) or 0),
+    }
+    total_actions = int(sum(combined_action_counts.values()))
+
+    if total_actions > 0:
+        probs = np.array(
+            [
+                combined_action_counts["short"],
+                combined_action_counts["flat"],
+                combined_action_counts["long"],
+            ],
+            dtype=np.float64,
+        ) / float(total_actions)
+        nonzero = probs[probs > 0]
+        entropy = float(-np.sum(nonzero * np.log(nonzero)) / np.log(3.0))
+        if abs(entropy) < 1e-12:
+            entropy = 0.0
+        dominant_action = int(np.argmax(probs))
+        dominant_ratio = float(np.max(probs))
+        flat_ratio = float(combined_action_counts["flat"] / total_actions)
+        position_ratio = float(
+            (combined_action_counts["short"] + combined_action_counts["long"]) / total_actions
+        )
+    else:
+        entropy = float(normalized.get("eval_action_entropy", backtest.get("eval_action_entropy", 0.0)) or 0.0)
+        if abs(entropy) < 1e-12:
+            entropy = 0.0
+        dominant_action = int(
+            normalized.get("eval_dominant_action", backtest.get("eval_dominant_action", 1.0)) or 1
+        )
+        dominant_ratio = float(
+            normalized.get(
+                "eval_dominant_action_ratio",
+                backtest.get("eval_dominant_action_ratio", 1.0),
+            )
+            or 1.0
+        )
+        flat_ratio = float(normalized.get("flat_ratio", backtest.get("flat_ratio", 1.0)) or 1.0)
+        position_ratio = float(
+            normalized.get("position_ratio", backtest.get("position_ratio", 0.0)) or 0.0
+        )
+
+    target_bars = int(normalized.get("segment_target_bars", 0) or 0)
+    trade_density = (
+        float(n_trades) / max(float(target_bars), 1.0)
+        if target_bars > 0
+        else float(normalized.get("trade_density", 0.0) or 0.0)
+    )
+
+    normalized.update(
+        {
+            "total_orders": int(total_orders),
+            "total_positions": int(total_positions),
+            "n_trades": int(n_trades),
+            "n_wins": int(n_wins),
+            "n_losses": int(n_losses),
+            "win_rate": float(win_rate),
+            "action_counts": dict(combined_action_counts),
+            "flat_ratio": float(flat_ratio),
+            "position_ratio": float(position_ratio),
+            "eval_action_entropy": float(entropy),
+            "eval_dominant_action": float(dominant_action),
+            "eval_dominant_action_ratio": float(dominant_ratio),
+            "eval_short_actions": float(combined_action_counts["short"]),
+            "eval_flat_actions": float(combined_action_counts["flat"]),
+            "eval_long_actions": float(combined_action_counts["long"]),
+            "avg_trades_per_episode": float(
+                max(float(normalized.get("avg_trades_per_episode", 0.0) or 0.0), float(n_trades))
+            ),
+            "trade_density": float(trade_density),
+        }
+    )
+    return normalized
+
+
+def _estimate_directional_trade_counts(summary: dict) -> tuple[int, int]:
+    """Approximate long/short trade counts from action mix when explicit counts are unavailable."""
+    n_longs = int(summary.get("n_longs", 0) or 0)
+    n_shorts = int(summary.get("n_shorts", 0) or 0)
+    if n_longs > 0 or n_shorts > 0:
+        return n_longs, n_shorts
+
+    n_trades = int(summary.get("n_trades", 0) or 0)
+    if n_trades <= 0:
+        return 0, 0
+
+    action_counts = summary.get("action_counts", {})
+    if not isinstance(action_counts, dict):
+        action_counts = {}
+    long_actions = float(action_counts.get("long", summary.get("eval_long_actions", 0.0)) or 0.0)
+    short_actions = float(action_counts.get("short", summary.get("eval_short_actions", 0.0)) or 0.0)
+    directional_actions = max(long_actions + short_actions, 0.0)
+    if directional_actions <= 0.0:
+        return 0, 0
+
+    est_longs = int(round(float(n_trades) * (long_actions / directional_actions)))
+    est_longs = max(0, min(est_longs, n_trades))
+    est_shorts = max(0, n_trades - est_longs)
+    return est_longs, est_shorts
+
+
+def _promote_nautilus_test_metrics(metrics: dict, final_summary: dict) -> dict:
+    """Promote execution-aligned Nautilus held-out test metrics to top-level display fields."""
+    promoted = dict(metrics or {})
+    if "env_eval_metrics" not in promoted:
+        promoted["env_eval_metrics"] = copy.deepcopy(dict(metrics or {}))
+
+    normalized = _normalize_nautilus_summary_metrics(dict(final_summary or {}))
+    promoted["nautilus_test"] = dict(normalized)
+    promoted["metrics_source"] = "nautilus_test"
+    promoted["metrics_source_label"] = "Nautilus held-out test"
+
+    top_level_keys = [
+        "total_return",
+        "gross_total_return",
+        "bh_eval_return",
+        "outperformance_vs_bh",
+        "n_trades",
+        "n_wins",
+        "n_losses",
+        "win_rate",
+        "server_cost_paid",
+        "flat_ratio",
+        "position_ratio",
+        "eval_action_entropy",
+        "eval_dominant_action",
+        "eval_dominant_action_ratio",
+        "eval_short_actions",
+        "eval_flat_actions",
+        "eval_long_actions",
+        "avg_trades_per_episode",
+        "max_drawdown",
+        "trade_density",
+        "total_orders",
+        "total_positions",
+        "segment_range",
+        "segment_input_range",
+        "segment_score_start_index",
+        "segment_target_bars",
+        "segment_warmup_bars",
+        "status",
+    ]
+    for key in top_level_keys:
+        if key in normalized:
+            promoted[key] = copy.deepcopy(normalized[key])
+
+    stats_returns = normalized.get("stats_returns", {})
+    if isinstance(stats_returns, dict):
+        if "Sharpe Ratio (252 days)" in stats_returns:
+            promoted["sharpe"] = float(stats_returns.get("Sharpe Ratio (252 days)", 0.0))
+        if "Sortino Ratio (252 days)" in stats_returns:
+            promoted["sortino"] = float(stats_returns.get("Sortino Ratio (252 days)", 0.0))
+
+    n_longs, n_shorts = _estimate_directional_trade_counts(normalized)
+    promoted["n_longs"] = float(n_longs)
+    promoted["n_shorts"] = float(n_shorts)
+    promoted["eval_episodes"] = int(normalized.get("eval_episodes", 1) or 1)
+    return promoted
+
+
+def _aggregate_nautilus_window_summaries(
+    summaries: list[dict],
+    scores: list[float],
+    windows: list[tuple[int, int]],
+) -> tuple[dict, float]:
+    if not summaries:
+        return {}, float("-inf")
+
+    normalized_summaries = [_normalize_nautilus_summary_metrics(item) for item in summaries]
+
+    if len(normalized_summaries) == 1:
+        summary = dict(normalized_summaries[0])
+        score = float(scores[0]) if scores else float("-inf")
+        summary["nautilus_window_count"] = 1
+        summary["nautilus_score_median"] = score
+        summary["nautilus_score_worst"] = score
+        summary["nautilus_score_robust"] = score
+        summary["nautilus_min_total_return"] = float(summary.get("total_return", 0.0))
+        summary["nautilus_min_gross_total_return"] = float(summary.get("gross_total_return", 0.0))
+        summary["nautilus_min_alpha"] = float(summary.get("outperformance_vs_bh", 0.0))
+        summary["nautilus_active_window_ratio"] = 1.0 if score != float("-inf") else 0.0
+        summary["nautilus_median_trade_density"] = float(summary.get("trade_density", 0.0))
+        summary["nautilus_worst_dominant_action_ratio"] = float(summary.get("eval_dominant_action_ratio", 1.0))
+        summary["nautilus_windows"] = [[int(windows[0][0]), int(windows[0][1])]] if windows else []
+        return summary, score
+
+    def _arr(key: str, default: float = 0.0) -> np.ndarray:
+        return np.asarray([float(item.get(key, default)) for item in normalized_summaries], dtype=np.float64)
+
+    score_arr = np.asarray(scores, dtype=np.float64)
+    finite_scores = score_arr[np.isfinite(score_arr)]
+    robust_score = float("-inf")
+    active_ratio = 0.0
+    if finite_scores.size > 0:
+        robust_score = float(np.median(finite_scores) + 0.5 * np.min(finite_scores))
+        active_ratio = float(finite_scores.size / max(len(scores), 1))
+        robust_score -= max(0.75 - active_ratio, 0.0) * 6.0
+
+    net = _arr("total_return")
+    gross = _arr("gross_total_return")
+    alpha = _arr("outperformance_vs_bh")
+    dd = np.abs(_arr("max_drawdown"))
+    trades = _arr("n_trades")
+    trade_density = _arr("trade_density")
+    win_rate = _arr("win_rate")
+    flat_ratio = _arr("flat_ratio", 1.0)
+    pos_ratio = _arr("position_ratio")
+    entropy = _arr("eval_action_entropy")
+    dom_ratio = _arr("eval_dominant_action_ratio", 1.0)
+    server_cost = _arr("server_cost_paid")
+    dominant_idx = int(np.argmax(np.where(np.isfinite(score_arr), score_arr, -np.inf))) if np.isfinite(score_arr).any() else 0
+    total_target_bars = float(
+        np.sum([float(item.get("segment_target_bars", 0.0)) for item in normalized_summaries])
+    )
+    total_trades = float(
+        np.sum(
+            [
+                max(
+                    float(item.get("n_trades", 0.0)),
+                    float(item.get("total_positions", 0.0)),
+                )
+                for item in normalized_summaries
+            ]
+        )
+    )
+    total_wins = int(np.sum([int(item.get("n_wins", 0)) for item in normalized_summaries]))
+    total_losses = int(np.sum([int(item.get("n_losses", 0)) for item in normalized_summaries]))
+    total_orders = int(np.sum([int(item.get("total_orders", 0)) for item in normalized_summaries]))
+    total_positions = int(np.sum([int(item.get("total_positions", 0)) for item in normalized_summaries]))
+    combined_action_counts = {"short": 0, "flat": 0, "long": 0}
+    for item in normalized_summaries:
+        counts = item.get("action_counts", {})
+        if not isinstance(counts, dict):
+            continue
+        for key in ("short", "flat", "long"):
+            combined_action_counts[key] += int(counts.get(key, 0))
+    total_actions = sum(combined_action_counts.values())
+    if total_actions > 0:
+        probs = np.array(
+            [
+                combined_action_counts["short"],
+                combined_action_counts["flat"],
+                combined_action_counts["long"],
+            ],
+            dtype=np.float64,
+        ) / float(total_actions)
+        nonzero = probs[probs > 0]
+        combined_action_entropy = float(-np.sum(nonzero * np.log(nonzero)) / np.log(3.0))
+        if abs(combined_action_entropy) < 1e-12:
+            combined_action_entropy = 0.0
+        combined_dominant_idx = int(np.argmax(probs))
+        combined_dominant_ratio = float(np.max(probs))
+        combined_flat_ratio = float(combined_action_counts["flat"] / total_actions)
+        combined_position_ratio = float(
+            (combined_action_counts["short"] + combined_action_counts["long"]) / total_actions
+        )
+    else:
+        combined_action_entropy = float(np.median(entropy))
+        combined_dominant_idx = int(np.argmax(np.array([0.0, 1.0, 0.0])))
+        combined_dominant_ratio = 1.0
+        combined_flat_ratio = float(np.median(flat_ratio))
+        combined_position_ratio = float(np.median(pos_ratio))
+    weighted_trade_density = (
+        total_trades / max(total_target_bars, 1.0)
+        if total_target_bars > 0.0
+        else float(np.median(trade_density))
+    )
+    aggregate_win_rate = (
+        float(total_wins / max(total_wins + total_losses, 1))
+        if (total_wins + total_losses) > 0
+        else float(np.median(win_rate))
+    )
+
+    combined = dict(normalized_summaries[dominant_idx])
+    combined.update(
+        {
+            "total_return": float(np.median(net)),
+            "gross_total_return": float(np.median(gross)),
+            "outperformance_vs_bh": float(np.median(alpha)),
+            "max_drawdown": float(np.max(dd)),
+            "total_orders": int(total_orders),
+            "total_positions": int(total_positions),
+            "n_trades": float(total_trades),
+            "n_wins": int(total_wins),
+            "n_losses": int(total_losses),
+            "win_rate": float(aggregate_win_rate),
+            "flat_ratio": float(combined_flat_ratio),
+            "position_ratio": float(combined_position_ratio),
+            "eval_action_entropy": float(combined_action_entropy),
+            "eval_dominant_action": float(combined_dominant_idx),
+            "eval_dominant_action_ratio": float(combined_dominant_ratio),
+            "eval_short_actions": float(combined_action_counts["short"]),
+            "eval_flat_actions": float(combined_action_counts["flat"]),
+            "eval_long_actions": float(combined_action_counts["long"]),
+            "action_counts": dict(combined_action_counts),
+            "server_cost_paid": float(np.median(server_cost)),
+            "trade_density": float(weighted_trade_density),
+            "nautilus_window_count": int(len(normalized_summaries)),
+            "nautilus_score_median": float(np.median(finite_scores)) if finite_scores.size > 0 else float("-inf"),
+            "nautilus_score_worst": float(np.min(finite_scores)) if finite_scores.size > 0 else float("-inf"),
+            "nautilus_score_robust": float(robust_score),
+            "nautilus_min_total_return": float(np.min(net)),
+            "nautilus_min_gross_total_return": float(np.min(gross)),
+            "nautilus_min_alpha": float(np.min(alpha)),
+            "nautilus_active_window_ratio": float(active_ratio),
+            "nautilus_median_trade_density": float(np.median(trade_density)),
+            "nautilus_worst_dominant_action_ratio": float(np.max(dom_ratio)),
+            "nautilus_windows": [[int(start), int(end)] for start, end in windows],
+        }
+    )
+    return combined, robust_score
+
+
+def _select_nautilus_candidate_subset(
+    candidate_records: list[dict],
+    *,
+    limit: int,
+) -> list[dict]:
+    if limit <= 0 or len(candidate_records) <= limit:
+        return list(candidate_records)
+
+    def _metric(candidate: dict, key: str, default: float = 0.0) -> float:
+        metrics = candidate.get("env_validation_metrics")
+        if not isinstance(metrics, dict):
+            return float(default)
+        return float(metrics.get(key, default))
+
+    def _sort_key(candidate: dict) -> tuple[float, float, float, float]:
+        return (
+            float(candidate.get("env_validation_score", float("-inf"))),
+            _metric(candidate, "walkforward_selection_score", float("-inf")),
+            _metric(candidate, "total_return", float("-inf")),
+            -_metric(candidate, "supervised_validation_brier", float("inf")),
+        )
+
+    def _candidate_id(candidate: dict) -> str:
+        return f"{candidate.get('candidate_name', '')}|{candidate.get('model_path', '')}"
+
+    def _confidence(candidate: dict, key: str) -> float:
+        return float(candidate.get(key, candidate.get("supervised_confidence_threshold", 0.0)))
+
+    def _min_confidence(candidate: dict) -> float:
+        return min(
+            _confidence(candidate, "supervised_long_confidence_threshold"),
+            _confidence(candidate, "supervised_short_confidence_threshold"),
+        )
+
+    def _avg_trades(candidate: dict) -> float:
+        return _metric(candidate, "avg_trades_per_episode", float("inf"))
+
+    def _walkforward_active_ratio(candidate: dict) -> float:
+        return _metric(candidate, "walkforward_active_window_ratio", 0.0)
+
+    def _gross_return(candidate: dict) -> float:
+        return _metric(candidate, "gross_total_return", float("-inf"))
+
+    def _worst_gross_return(candidate: dict) -> float:
+        return _metric(
+            candidate,
+            "walkforward_min_gross_total_return",
+            _gross_return(candidate),
+        )
+
+    ordered = sorted(candidate_records, key=_sort_key, reverse=True)
+    selected: list[dict] = []
+    seen_ids: set[str] = set()
+
+    def _append_candidate(candidate: dict | None) -> None:
+        if candidate is None:
+            return
+        candidate_id = _candidate_id(candidate)
+        if candidate_id in seen_ids:
+            return
+        seen_ids.add(candidate_id)
+        selected.append(candidate)
+
+    def _best_remaining(metric_keys: tuple[str, ...]) -> dict | None:
+        pool = [item for item in ordered if _candidate_id(item) not in seen_ids]
+        if not pool:
+            return None
+        return max(
+            pool,
+            key=lambda item: tuple(_metric(item, key, float("-inf")) for key in metric_keys),
+        )
+
+    def _best_remaining_by_key(key_fn) -> dict | None:
+        pool = [item for item in ordered if _candidate_id(item) not in seen_ids]
+        if not pool:
+            return None
+        return max(pool, key=key_fn)
+
+    def _append_best_active_sparse_candidate() -> None:
+        pool = [
+            item
+            for item in ordered
+            if _candidate_id(item) not in seen_ids
+            and _walkforward_active_ratio(item) > 0.0
+        ]
+        if not pool:
+            return
+        candidate = max(
+            pool,
+            key=lambda item: (
+                _walkforward_active_ratio(item),
+                1.0 if _worst_gross_return(item) > -0.003 else 0.0,
+                1.0 if _gross_return(item) > 0.0 else 0.0,
+                -_confidence(item, "supervised_short_confidence_threshold"),
+                -abs(_avg_trades(item) - 4.0),
+                float(item.get("env_validation_score", float("-inf"))),
+            ),
+        )
+        _append_candidate(candidate)
+
+    _append_candidate(ordered[0] if ordered else None)
+
+    def _append_next_stricter_short_candidate() -> None:
+        if not selected:
+            return
+        current_short_conf = _confidence(
+            selected[0],
+            "supervised_short_confidence_threshold",
+        )
+        pool = [
+            item
+            for item in ordered
+            if _candidate_id(item) not in seen_ids
+            and _confidence(item, "supervised_short_confidence_threshold") > current_short_conf + 1e-6
+        ]
+        if not pool:
+            return
+        target_short_conf = min(
+            _confidence(item, "supervised_short_confidence_threshold") for item in pool
+        )
+        candidate = max(
+            pool,
+            key=lambda item, target=target_short_conf: (
+                1.0
+                if np.isclose(
+                    _confidence(item, "supervised_short_confidence_threshold"),
+                    target,
+                )
+                else 0.0,
+                _walkforward_active_ratio(item),
+                1.0
+                if _metric(
+                    item,
+                    "walkforward_min_gross_total_return",
+                    _metric(item, "gross_total_return", float("-inf")),
+                )
+                > -0.002
+                else 0.0,
+                _metric(item, "gross_total_return", float("-inf")),
+                -abs(_avg_trades(item) - 4.0),
+                float(item.get("env_validation_score", float("-inf"))),
+            ),
+        )
+        _append_candidate(candidate)
+
+    def _append_best_by_confidence(key: str) -> None:
+        values = sorted({_confidence(item, key) for item in ordered}, reverse=True)
+        for value in values:
+            candidate = _best_remaining_by_key(
+                lambda item, conf=value: (
+                    1.0 if np.isclose(_confidence(item, key), conf) else 0.0,
+                    float(item.get("env_validation_score", float("-inf"))),
+                    _gross_return(item),
+                    -_avg_trades(item),
+                )
+            )
+            if candidate is None or not np.isclose(_confidence(candidate, key), value):
+                continue
+            _append_candidate(candidate)
+            if len(selected) >= limit:
+                return
+
+    def _append_extreme_by_confidence(key: str, *, highest: bool) -> None:
+        values = sorted({_confidence(item, key) for item in ordered}, reverse=highest)
+        for value in values:
+            pool = [
+                item
+                for item in ordered
+                if _candidate_id(item) not in seen_ids
+                and np.isclose(_confidence(item, key), value)
+            ]
+            if not pool:
+                continue
+            candidate = max(
+                pool,
+                key=lambda item: (
+                    _walkforward_active_ratio(item),
+                    1.0 if _gross_return(item) > 0.0 else 0.0,
+                    1.0 if _worst_gross_return(item) > -0.003 else 0.0,
+                    -abs(_avg_trades(item) - 4.0),
+                    float(item.get("env_validation_score", float("-inf"))),
+                ),
+            )
+            _append_candidate(candidate)
+            return
+
+    _append_best_active_sparse_candidate()
+    _append_next_stricter_short_candidate()
+    _append_extreme_by_confidence("supervised_short_confidence_threshold", highest=True)
+    _append_extreme_by_confidence("supervised_long_confidence_threshold", highest=True)
+    _append_extreme_by_confidence("supervised_short_confidence_threshold", highest=False)
+    _append_extreme_by_confidence("supervised_long_confidence_threshold", highest=False)
+    _append_candidate(
+        _best_remaining_by_key(
+            lambda item: (
+                _min_confidence(item),
+                1.0 if _gross_return(item) > 0.0 else 0.0,
+                _walkforward_active_ratio(item),
+                -_avg_trades(item),
+                float(item.get("env_validation_score", float("-inf"))),
+            )
+        )
+    )
+    _append_candidate(_best_remaining(("walkforward_min_total_return", "walkforward_min_gross_total_return", "total_return")))
+    _append_candidate(
+        _best_remaining_by_key(
+            lambda item: (
+                _confidence(item, "supervised_long_confidence_threshold")
+                + _confidence(item, "supervised_short_confidence_threshold"),
+                _gross_return(item),
+                float(item.get("env_validation_score", float("-inf"))),
+                -_avg_trades(item),
+            )
+        )
+    )
+    _append_candidate(
+        _best_remaining_by_key(
+            lambda item: (
+                _walkforward_active_ratio(item),
+                1.0 if _gross_return(item) > 0.0 else 0.0,
+                -_avg_trades(item),
+                _gross_return(item),
+                float(item.get("env_validation_score", float("-inf"))),
+            )
+        )
+    )
+    _append_candidate(_best_remaining(("gross_total_return", "total_return", "outperformance_vs_bh")))
+    _append_best_by_confidence("supervised_long_confidence_threshold")
+    _append_best_by_confidence("supervised_short_confidence_threshold")
+
+    for candidate in ordered:
+        if len(selected) >= limit:
+            break
+        _append_candidate(candidate)
+
+    return selected[:limit]
+
+
+def _prune_supervised_candidate_pool(candidate_pool: list[dict]) -> list[dict]:
+    if not candidate_pool:
+        return []
+
+    def _metric(candidate: dict, key: str, default: float = 0.0) -> float:
+        metrics = candidate.get("validation_metrics")
+        if not isinstance(metrics, dict):
+            return float(default)
+        return float(metrics.get(key, default))
+
+    def _behavior_key(candidate: dict) -> tuple:
+        model_type = str(candidate.get("meta", {}).get("model_type", "fallback"))
+        long_conf = round(float(candidate.get("long_confidence", candidate.get("confidence", 0.0))), 2)
+        short_conf = round(float(candidate.get("short_confidence", candidate.get("confidence", 0.0))), 2)
+        long_actions = round(_metric(candidate, "eval_long_actions", 0.0), 1)
+        short_actions = round(_metric(candidate, "eval_short_actions", 0.0), 1)
+        active_ratio = round(_metric(candidate, "walkforward_active_window_ratio", 0.0), 2)
+        avg_trades = round(_metric(candidate, "avg_trades_per_episode", _metric(candidate, "n_trades", 0.0)), 1)
+        dominant_ratio = round(_metric(candidate, "eval_dominant_action_ratio", 1.0), 2)
+        gross_return = round(_metric(candidate, "gross_total_return", 0.0), 4)
+        net_return = round(_metric(candidate, "total_return", 0.0), 4)
+
+        if long_actions <= 0.0 and short_actions > 0.0:
+            action_mode = "short_only"
+        elif short_actions <= 0.0 and long_actions > 0.0:
+            action_mode = "long_only"
+        elif short_actions <= 0.0 and long_actions <= 0.0:
+            action_mode = "flat_only"
+        else:
+            action_mode = "mixed"
+
+        return (
+            model_type,
+            action_mode,
+            long_conf,
+            short_conf,
+            active_ratio,
+            avg_trades,
+            dominant_ratio,
+            gross_return,
+            net_return,
+        )
+
+    deduped: dict[tuple, dict] = {}
+    for candidate in candidate_pool:
+        key = _behavior_key(candidate)
+        incumbent = deduped.get(key)
+        if incumbent is None:
+            deduped[key] = candidate
+            continue
+        incumbent_key = (
+            float(incumbent.get("score", float("-inf"))),
+            int(incumbent.get("priority", -999)),
+            -_metric(incumbent, "supervised_validation_brier", float("inf")),
+        )
+        candidate_key = (
+            float(candidate.get("score", float("-inf"))),
+            int(candidate.get("priority", -999)),
+            -_metric(candidate, "supervised_validation_brier", float("inf")),
+        )
+        if candidate_key > incumbent_key:
+            deduped[key] = candidate
+
+    return sorted(
+        deduped.values(),
+        key=lambda item: (
+            float(item.get("score", float("-inf"))),
+            int(item.get("priority", -999)),
+            -_metric(item, "supervised_validation_brier", float("inf")),
+        ),
+        reverse=True,
+    )
+
+
 def _score_nautilus_summary(
     summary: dict,
     *,
@@ -386,13 +1361,29 @@ def _score_nautilus_summary(
     dominant_ratio = float(summary.get("eval_dominant_action_ratio", 1.0))
     action_entropy = float(summary.get("eval_action_entropy", 0.0))
     max_drawdown = abs(float(summary.get("max_drawdown", 0.0)))
+    worst_net_return = float(summary.get("nautilus_min_total_return", net_return))
+    worst_gross_return = float(summary.get("nautilus_min_gross_total_return", gross_return))
+    worst_alpha = float(summary.get("nautilus_min_alpha", alpha))
+    active_window_ratio = float(summary.get("nautilus_active_window_ratio", 1.0))
+    trade_density = float(summary.get("trade_density", summary.get("nautilus_median_trade_density", 0.0)))
     returns_stats = summary.get("stats_returns", {}) if isinstance(summary.get("stats_returns"), dict) else {}
     sharpe = float(returns_stats.get("Sharpe Ratio (252 days)", 0.0) or 0.0)
     wrong_side_penalty = max(float(summary.get("position_ratio", 0.0)) - 0.98, 0.0) * 0.5
+    sparse_active_override = _allows_sparse_active_nautilus_override(
+        summary,
+        min_trades=min_trades,
+        max_dominant_action_ratio=max_dominant_action_ratio,
+    )
 
     if trades < min_trades:
         return float("-inf")
-    if dominant_ratio > max_dominant_action_ratio and trades <= (min_trades + 1.0):
+    if active_window_ratio < 0.5 and not sparse_active_override:
+        return float("-inf")
+    if dominant_ratio > max_dominant_action_ratio and trades <= (min_trades + 1.0) and not sparse_active_override:
+        return float("-inf")
+    if gross_return < -0.002 and worst_gross_return < -0.005:
+        return float("-inf")
+    if net_return < -0.005 and worst_net_return < -0.01:
         return float("-inf")
     # Reject models that lose more than 10%
     if net_return < -0.10:
@@ -400,20 +1391,106 @@ def _score_nautilus_summary(
 
     profit_bonus = max(net_return, 0.0) * 15.0
     gross_bonus = max(gross_return, 0.0) * 8.0
+    turnover_penalty = max(trade_density - 0.02, 0.0) * 8.0
+    turnover_penalty += max(trade_density - 0.05, 0.0) * 18.0
     return (
         net_return * 10.0
         + gross_return * 6.0
+        + worst_net_return * 6.0
+        + worst_gross_return * 4.0
+        + worst_alpha * 1.5
         + sharpe * 0.20
         + alpha * 1.5
         + profit_bonus
         + gross_bonus
         + win_rate * 0.50
         + min(trades, 16.0) * 0.01
+        + active_window_ratio * 0.80
         + action_entropy * 0.20
+        - max(-gross_return, 0.0) * 14.0
+        - max(-net_return, 0.0) * 10.0
+        - max(-worst_gross_return, 0.0) * 10.0
+        - max(-worst_net_return, 0.0) * 8.0
         - max(flat_ratio - 0.95, 0.0) * 2.0
         - max(dominant_ratio - 0.85, 0.0) * 1.5
         - max(max_drawdown - 0.15, 0.0) * 2.5
         - wrong_side_penalty
+        - turnover_penalty
+    )
+
+
+def _allows_sparse_active_nautilus_override(
+    summary: dict,
+    *,
+    min_trades: float = 1.0,
+    max_dominant_action_ratio: float = 0.995,
+) -> bool:
+    trades = float(summary.get("n_trades", 0.0))
+    net_return = float(summary.get("total_return", 0.0))
+    gross_return = float(summary.get("gross_total_return", net_return))
+    worst_net_return = float(summary.get("nautilus_min_total_return", net_return))
+    worst_gross_return = float(summary.get("nautilus_min_gross_total_return", gross_return))
+    active_window_ratio = float(summary.get("nautilus_active_window_ratio", 0.0))
+    dominant_ratio = float(summary.get("eval_dominant_action_ratio", 1.0))
+    trade_density = float(summary.get("trade_density", summary.get("nautilus_median_trade_density", 0.0)))
+    max_drawdown = abs(float(summary.get("max_drawdown", 0.0)))
+
+    return bool(
+        trades >= max(min_trades + 1.0, 2.0)
+        and active_window_ratio >= (1.0 / 3.0)
+        and gross_return >= -0.0005
+        and worst_gross_return >= -0.0015
+        and net_return >= -0.0025
+        and worst_net_return >= -0.0035
+        and dominant_ratio <= min(max_dominant_action_ratio, 0.985)
+        and trade_density <= 0.01
+        and max_drawdown <= 0.02
+    )
+
+
+def _score_nautilus_rejected_fallback(summary: dict) -> float:
+    if not isinstance(summary, dict) or summary.get("error"):
+        return float("-inf")
+
+    preliminary_score = float(summary.get("nautilus_score_preliminary", float("-inf")))
+    if not np.isfinite(preliminary_score):
+        return float("-inf")
+
+    trades = float(summary.get("n_trades", 0.0))
+    net_return = float(summary.get("total_return", 0.0))
+    gross_return = float(summary.get("gross_total_return", net_return))
+    alpha = float(summary.get("outperformance_vs_bh", 0.0))
+    worst_net_return = float(summary.get("nautilus_min_total_return", net_return))
+    worst_gross_return = float(summary.get("nautilus_min_gross_total_return", gross_return))
+    active_window_ratio = float(summary.get("nautilus_active_window_ratio", 0.0))
+    trade_density = float(summary.get("nautilus_median_trade_density", summary.get("trade_density", 0.0)))
+    dominant_ratio = float(summary.get("eval_dominant_action_ratio", 1.0))
+    max_drawdown = abs(float(summary.get("max_drawdown", 0.0)))
+
+    if trades < 1.0 or active_window_ratio <= 0.0:
+        return float("-inf")
+    if active_window_ratio < 0.25:
+        return float("-inf")
+    if gross_return < -0.005 or net_return < -0.010:
+        return float("-inf")
+    if worst_gross_return < -0.010 or worst_net_return < -0.015:
+        return float("-inf")
+
+    turnover_penalty = max(trade_density - 0.01, 0.0) * 18.0
+    turnover_penalty += max(trade_density - 0.02, 0.0) * 28.0
+
+    return float(
+        preliminary_score * 0.35
+        + gross_return * 8.0
+        + net_return * 6.0
+        + worst_gross_return * 5.0
+        + worst_net_return * 4.0
+        + alpha * 1.2
+        + active_window_ratio * 0.75
+        - trade_density * 14.0
+        - turnover_penalty
+        - max(dominant_ratio - 0.93, 0.0) * 5.0
+        - max_drawdown * 4.0
     )
 
 
@@ -427,19 +1504,26 @@ def _run_nautilus_backtest_segment(
 ) -> dict:
     from execution.nautilus.backtest_runner import run_backtest_frame
 
-    start, end = int(segment_range[0]), int(segment_range[1])
-    segment = frame_15m.iloc[start:end].reset_index(drop=True)
-    if len(segment) < 128:
-        raise ValueError(f"Nautilus {label} segment too short: {len(segment)} bars")
-
     training_config = config.get("training", {})
     nav_config = training_config.get("nautilus_validation", {})
     trading_config = config.get("trading", {})
+    backtest_log_level = str(nav_config.get("backtest_log_level", "ERROR"))
+    backtest_bypass_logging = bool(nav_config.get("backtest_bypass_logging", False))
+    backtest_state_update_interval_bars = max(int(nav_config.get("backtest_state_update_interval_bars", 64)), 1)
+    backtest_publish_event_details = bool(nav_config.get("backtest_publish_event_details", False))
+    backtest_publish_warmup_updates = bool(nav_config.get("backtest_publish_warmup_updates", False))
+    history_bars = int(nav_config.get("history_bars", 384))
+    segment, target_segment, prepared_start, target_start, score_start_index = _prepare_nautilus_segment_frame(
+        frame_15m,
+        segment_range,
+        history_bars=history_bars,
+    )
+    start, end = int(segment_range[0]), int(segment_range[1])
     symbol = str(config.get("_active_symbol") or config.get("data", {}).get("pairs", ["BTCUSDT"])[0])
     initial_balance = float(nav_config.get("initial_balance_usdt", 10_000.0))
     leverage = float(nav_config.get("leverage", trading_config.get("leverage", 1.0)))
     trade_size_pct = float(nav_config.get("trade_size_pct_of_equity", 1.0))
-    first_price = float(segment["close"].iloc[0])
+    first_price = float(target_segment["close"].iloc[0])
     trade_qty = max((initial_balance * trade_size_pct) / max(first_price, 1e-9), 1e-6)
     state_name = f"nautilus_{label}_{Path(model_path).stem}.json"
     state_path = str(Path("checkpoints") / state_name)
@@ -450,20 +1534,36 @@ def _run_nautilus_backtest_segment(
         model_path=model_path,
         venue=str(nav_config.get("venue", "BINANCE")),
         bar_minutes=int(nav_config.get("bar_minutes", 15)),
-        history_bars=int(nav_config.get("history_bars", 160)),
-        request_history_days=int(nav_config.get("request_history_days", 3)),
+        history_bars=history_bars,
+        request_history_days=int(nav_config.get("request_history_days", 8)),
         trade_size=f"{trade_qty:.12f}",
         initial_balance_usdt=initial_balance,
         leverage=leverage,
         state_path=state_path,
         mode=f"train_{label}",
+        trading_start_bar_index=score_start_index,
         close_positions_on_stop=True,
         reduce_only_on_stop=True,
         monthly_server_cost_usd=float(trading_config.get("monthly_server_cost_usd", 100.0)),
         periods_per_day=int(trading_config.get("periods_per_day", 96)),
+        log_level=backtest_log_level,
+        bypass_logging=backtest_bypass_logging,
+        state_update_interval_bars=backtest_state_update_interval_bars,
+        publish_event_details=backtest_publish_event_details,
+        publish_warmup_updates=backtest_publish_warmup_updates,
+    )
+    summary = _apply_nautilus_target_slice_metrics(
+        summary,
+        target_frame=target_segment,
+        target_start=target_start,
+        target_end=end,
+        prepared_start=prepared_start,
+        score_start_index=score_start_index,
+        initial_balance=initial_balance,
+        monthly_server_cost_usd=float(trading_config.get("monthly_server_cost_usd", 100.0)),
+        periods_per_day=int(trading_config.get("periods_per_day", 96)),
     )
     summary["segment_label"] = label
-    summary["segment_range"] = [start, end]
     summary["trade_size_qty"] = float(trade_qty)
     summary["trade_size_notional_usdt"] = float(trade_qty * first_price)
     return summary
@@ -477,31 +1577,61 @@ def _run_nautilus_backtest_segment_subprocess(
     config: dict,
     label: str,
 ) -> dict:
-    start, end = int(segment_range[0]), int(segment_range[1])
-    segment = frame_15m.iloc[start:end].reset_index(drop=True)
-    if len(segment) < 128:
-        raise ValueError(f"Nautilus {label} segment too short: {len(segment)} bars")
-
     training_config = config.get("training", {})
     nav_config = training_config.get("nautilus_validation", {})
     trading_config = config.get("trading", {})
+    backtest_log_level = str(nav_config.get("backtest_log_level", "ERROR"))
+    backtest_bypass_logging = bool(nav_config.get("backtest_bypass_logging", False))
+    backtest_state_update_interval_bars = max(int(nav_config.get("backtest_state_update_interval_bars", 64)), 1)
+    backtest_publish_event_details = bool(nav_config.get("backtest_publish_event_details", False))
+    backtest_publish_warmup_updates = bool(nav_config.get("backtest_publish_warmup_updates", False))
+    history_bars = int(nav_config.get("history_bars", 384))
+    segment, target_segment, prepared_start, target_start, score_start_index = _prepare_nautilus_segment_frame(
+        frame_15m,
+        segment_range,
+        history_bars=history_bars,
+    )
+    start, end = int(segment_range[0]), int(segment_range[1])
     symbol = str(config.get("_active_symbol") or config.get("data", {}).get("pairs", ["BTCUSDT"])[0])
     initial_balance = float(nav_config.get("initial_balance_usdt", 10_000.0))
     leverage = float(nav_config.get("leverage", trading_config.get("leverage", 1.0)))
     trade_size_pct = float(nav_config.get("trade_size_pct_of_equity", 1.0))
-    first_price = float(segment["close"].iloc[0])
+    first_price = float(target_segment["close"].iloc[0])
     trade_qty = max((initial_balance * trade_size_pct) / max(first_price, 1e-9), 1e-6)
 
     safe_label = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in label)
     segment_path = Path("checkpoints") / f"nautilus_segment_{safe_label}.parquet"
     summary_path = Path("checkpoints") / f"nautilus_segment_{safe_label}_summary.json"
     state_path = Path("checkpoints") / f"nautilus_{safe_label}.json"
+    log_path = Path("checkpoints") / f"nautilus_{safe_label}.log"
     segment.to_parquet(segment_path, index=False)
     if summary_path.exists():
         summary_path.unlink()
+    if log_path.exists():
+        log_path.unlink()
+
+    def _load_json_dict(path: Path) -> dict | None:
+        if not path.exists():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _log_tail(limit_chars: int = 4000) -> str:
+        if not log_path.exists():
+            return ""
+        try:
+            data = log_path.read_bytes()
+        except Exception:
+            return ""
+        return data.decode("utf-8", errors="replace")[-limit_chars:]
 
     cmd = [
         sys.executable,
+        "-X",
+        "utf8",
         "-m",
         "execution.nautilus.backtest_runner",
         "--frame-parquet",
@@ -515,9 +1645,9 @@ def _run_nautilus_backtest_segment_subprocess(
         "--bar-minutes",
         str(int(nav_config.get("bar_minutes", 15))),
         "--history-bars",
-        str(int(nav_config.get("history_bars", 160))),
+        str(history_bars),
         "--request-history-days",
-        str(int(nav_config.get("request_history_days", 3))),
+        str(int(nav_config.get("request_history_days", 8))),
         "--trade-size",
         f"{trade_qty:.12f}",
         "--initial-balance-usdt",
@@ -528,61 +1658,115 @@ def _run_nautilus_backtest_segment_subprocess(
         str(state_path),
         "--mode",
         f"train_{label}",
+        "--trading-start-bar-index",
+        str(int(score_start_index)),
         "--monthly-server-cost-usd",
         str(float(trading_config.get("monthly_server_cost_usd", 100.0))),
         "--periods-per-day",
         str(int(trading_config.get("periods_per_day", 96))),
         "--summary-json",
         str(summary_path),
+        "--log-path",
+        str(log_path),
+        "--log-level",
+        backtest_log_level,
+        "--state-update-interval-bars",
+        str(backtest_state_update_interval_bars),
     ]
-    collapse_probe_bars = max(int(nav_config.get("collapse_probe_bars", 0)), 0)
+    if backtest_bypass_logging:
+        cmd.append("--bypass-logging")
+    if backtest_publish_event_details:
+        cmd.append("--publish-event-details")
+    if backtest_publish_warmup_updates:
+        cmd.append("--publish-warmup-updates")
+    configured_collapse_probe_bars = max(int(nav_config.get("collapse_probe_bars", 0)), 0)
+    collapse_probe_min_fraction = float(np.clip(nav_config.get("collapse_probe_min_fraction", 0.75), 0.0, 1.0))
+    target_probe_floor = int(round(len(target_segment) * collapse_probe_min_fraction))
+    collapse_probe_bars = min(
+        len(target_segment),
+        max(configured_collapse_probe_bars, target_probe_floor),
+    ) if configured_collapse_probe_bars > 0 else 0
     collapse_probe_min_flat_ratio = float(nav_config.get("collapse_probe_min_flat_ratio", 0.995))
     collapse_probe_max_trades = max(int(nav_config.get("collapse_probe_max_trades", 0)), 0)
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(Path.cwd()),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
+    base_timeout_seconds = max(int(nav_config.get("subprocess_timeout_seconds", 240)), 30)
+    test_timeout_seconds = max(
+        int(nav_config.get("subprocess_test_timeout_seconds", base_timeout_seconds)),
+        base_timeout_seconds,
     )
-    stdout_text = ""
-    stderr_text = ""
+    state_poll_interval_seconds = max(
+        float(nav_config.get("subprocess_state_poll_interval_seconds", 4.0)),
+        0.5,
+    )
+    cleanup_validation_artifacts = bool(nav_config.get("cleanup_validation_artifacts", True))
+    subprocess_timeout_seconds = (
+        test_timeout_seconds if str(label).startswith("test_") else base_timeout_seconds
+    )
+    env = dict(os.environ)
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    start_time = time.time()
     killed_for_collapse = False
+    killed_for_timeout = False
     collapse_state: dict | None = None
+    with open(log_path, "ab") as log_handle:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(Path.cwd()),
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            text=False,
+            env=env,
+        )
 
-    while True:
-        returncode = proc.poll()
-        if returncode is not None:
-            stdout_text, stderr_text = proc.communicate()
-            break
+        while True:
+            returncode = proc.poll()
+            if returncode is not None:
+                proc.communicate()
+                break
 
-        if collapse_probe_bars > 0 and state_path.exists():
-            try:
-                with open(state_path, "r", encoding="utf-8") as fh:
-                    runtime_state = json.load(fh)
-                action_counts = runtime_state.get("action_counts", {}) if isinstance(runtime_state, dict) else {}
-                total_actions = int(sum(int(action_counts.get(k, 0)) for k in ("short", "flat", "long")))
-                flat_actions = int(action_counts.get("flat", 0))
-                n_trades = int(runtime_state.get("n_trades", 0))
-                flat_ratio = float(flat_actions) / max(total_actions, 1)
-                if (
-                    total_actions >= collapse_probe_bars
-                    and n_trades <= collapse_probe_max_trades
-                    and flat_ratio >= collapse_probe_min_flat_ratio
-                ):
-                    killed_for_collapse = True
-                    collapse_state = runtime_state
-                    proc.terminate()
+            runtime_state = _load_json_dict(state_path)
+            if collapse_probe_bars > 0 and runtime_state is not None:
+                try:
+                    action_counts = runtime_state.get("action_counts", {})
+                    total_actions = int(sum(int(action_counts.get(k, 0)) for k in ("short", "flat", "long")))
+                    flat_actions = int(action_counts.get("flat", 0))
+                    n_trades = int(runtime_state.get("n_trades", 0))
+                    flat_ratio = float(flat_actions) / max(total_actions, 1)
+                    if (
+                        total_actions >= collapse_probe_bars
+                        and n_trades <= collapse_probe_max_trades
+                        and flat_ratio >= collapse_probe_min_flat_ratio
+                    ):
+                        killed_for_collapse = True
+                        collapse_state = runtime_state
+                        proc.terminate()
+                        try:
+                            proc.communicate(timeout=15)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            proc.communicate()
+                        break
+                except Exception:
+                    pass
+
+            if (time.time() - start_time) >= float(subprocess_timeout_seconds):
+                killed_for_timeout = True
+                collapse_state = runtime_state if isinstance(runtime_state, dict) else None
+                proc.terminate()
+                try:
+                    proc.communicate(timeout=15)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
                     try:
-                        stdout_text, stderr_text = proc.communicate(timeout=15)
+                        proc.communicate(timeout=15)
                     except subprocess.TimeoutExpired:
-                        proc.kill()
-                        stdout_text, stderr_text = proc.communicate()
-                    break
-            except Exception:
-                pass
+                        pass
+                break
 
-        time.sleep(2.0)
+            time.sleep(state_poll_interval_seconds)
+
+    log_tail = _log_tail()
+    runtime_state = _load_json_dict(state_path)
 
     if killed_for_collapse:
         action_counts = collapse_state.get("action_counts", {}) if isinstance(collapse_state, dict) else {}
@@ -600,8 +1784,8 @@ def _run_nautilus_backtest_segment_subprocess(
         )
         gross_total_return = 0.0
         total_return = -server_cost_paid / max(initial_balance, 1e-9)
-        last_idx = min(total_actions, len(segment)) - 1
-        last_close = float(segment["close"].iloc[last_idx])
+        last_idx = min(total_actions, len(target_segment)) - 1
+        last_close = float(target_segment["close"].iloc[last_idx])
         bh_eval_return = (last_close / max(first_price, 1e-9)) - 1.0
         dominant_counts = [short_actions, flat_actions, long_actions]
         dominant_action = int(np.argmax(dominant_counts))
@@ -633,23 +1817,105 @@ def _run_nautilus_backtest_segment_subprocess(
             "outperformance_vs_bh": total_return - bh_eval_return,
             "avg_trades_per_episode": float(int(collapse_state.get("n_trades", 0))) if isinstance(collapse_state, dict) else 0.0,
             "eval_episodes": 1,
-            "stdout_tail": stdout_text[-1000:],
-            "stderr_tail": stderr_text[-1000:],
+            "log_tail": log_tail[-1000:],
+            "nautilus_log_path": str(log_path).replace("\\", "/"),
         }
     else:
+        if killed_for_timeout:
+            state_status = str(runtime_state.get("status", "UNKNOWN")) if isinstance(runtime_state, dict) else "UNKNOWN"
+            state_event = ""
+            if (
+                isinstance(runtime_state, dict)
+                and isinstance(runtime_state.get("recent_events"), list)
+                and runtime_state.get("recent_events")
+                and isinstance(runtime_state.get("recent_events")[-1], dict)
+            ):
+                state_event = str(runtime_state.get("recent_events")[-1].get("message", ""))
+            raise RuntimeError(
+                f"Nautilus subprocess validation timed out for {label} after {subprocess_timeout_seconds}s "
+                f"(state={state_status} event={state_event!r} log={str(log_path).replace('\\', '/')}) "
+                f"log_tail={log_tail[-2000:]}"
+            )
         if proc.returncode != 0:
-            message = (stderr_text or "").strip() or (stdout_text or "").strip() or f"subprocess exit code {proc.returncode}"
-            raise RuntimeError(f"Nautilus subprocess validation failed for {label}: {message[-2000:]}")
-        if not summary_path.exists():
-            raise RuntimeError(f"Nautilus subprocess validation did not create summary file: {summary_path}")
-        with open(summary_path, "r", encoding="utf-8") as f:
-            summary = json.load(f)
+            state_status = str(runtime_state.get("status", "UNKNOWN")) if isinstance(runtime_state, dict) else "UNKNOWN"
+            raise RuntimeError(
+                f"Nautilus subprocess validation failed for {label}: exit={proc.returncode} state={state_status} "
+                f"log={str(log_path).replace('\\', '/')} log_tail={log_tail[-2000:]}"
+            )
+        summary = _load_json_dict(summary_path)
+        if summary is None:
+            if isinstance(runtime_state, dict) and str(runtime_state.get("status", "")).upper() == "COMPLETE":
+                action_counts = runtime_state.get("action_counts", {}) if isinstance(runtime_state.get("action_counts"), dict) else {}
+                summary = {
+                    "status": str(runtime_state.get("status", "COMPLETE")),
+                    "model_family": str(runtime_state.get("model_family", "")),
+                    "model_path": str(runtime_state.get("model_path", model_path)),
+                    "n_trades": int(runtime_state.get("n_trades", 0)),
+                    "n_wins": int(runtime_state.get("n_wins", 0)),
+                    "n_losses": int(runtime_state.get("n_losses", 0)),
+                    "win_rate": float(runtime_state.get("win_rate", 0.0)),
+                    "action_counts": {
+                        "short": int(action_counts.get("short", 0)),
+                        "flat": int(action_counts.get("flat", 0)),
+                        "long": int(action_counts.get("long", 0)),
+                    },
+                    "max_drawdown": float(runtime_state.get("max_drawdown", 0.0)),
+                    "flat_ratio": float(runtime_state.get("flat_ratio", 1.0)),
+                    "position_ratio": float(runtime_state.get("position_ratio", 0.0)),
+                    "eval_action_entropy": float(runtime_state.get("eval_action_entropy", 0.0)),
+                    "eval_dominant_action_ratio": float(runtime_state.get("eval_dominant_action_ratio", 1.0)),
+                    "eval_short_actions": float(action_counts.get("short", 0.0)),
+                    "eval_flat_actions": float(action_counts.get("flat", 0.0)),
+                    "eval_long_actions": float(action_counts.get("long", 0.0)),
+                    "gross_total_return": float(runtime_state.get("gross_total_return", runtime_state.get("total_return", 0.0))),
+                    "total_return": float(runtime_state.get("total_return", 0.0)),
+                    "server_cost_paid": float(runtime_state.get("server_cost_paid", 0.0)),
+                    "bh_eval_return": float(runtime_state.get("bh_eval_return", 0.0)),
+                    "outperformance_vs_bh": float(runtime_state.get("outperformance_vs_bh", 0.0)),
+                    "avg_trades_per_episode": float(runtime_state.get("n_trades", 0.0)),
+                    "eval_episodes": 1,
+                }
+            else:
+                state_status = str(runtime_state.get("status", "UNKNOWN")) if isinstance(runtime_state, dict) else "UNKNOWN"
+                state_event = ""
+                if (
+                    isinstance(runtime_state, dict)
+                    and isinstance(runtime_state.get("recent_events"), list)
+                    and runtime_state.get("recent_events")
+                    and isinstance(runtime_state.get("recent_events")[-1], dict)
+                ):
+                    state_event = str(runtime_state.get("recent_events")[-1].get("message", ""))
+                raise RuntimeError(
+                    f"Nautilus subprocess validation did not produce a usable summary for {label}: "
+                    f"state={state_status} event={state_event!r} summary={str(summary_path).replace('\\', '/')} "
+                    f"log={str(log_path).replace('\\', '/')} log_tail={log_tail[-2000:]}"
+                )
+        if isinstance(runtime_state, dict) and isinstance(runtime_state.get("history"), dict):
+            summary["history"] = copy.deepcopy(runtime_state["history"])
 
+    summary = _apply_nautilus_target_slice_metrics(
+        summary,
+        target_frame=target_segment,
+        target_start=target_start,
+        target_end=end,
+        prepared_start=prepared_start,
+        score_start_index=score_start_index,
+        initial_balance=initial_balance,
+        monthly_server_cost_usd=float(trading_config.get("monthly_server_cost_usd", 100.0)),
+        periods_per_day=int(trading_config.get("periods_per_day", 96)),
+    )
     summary["segment_label"] = label
-    summary["segment_range"] = [start, end]
     summary["trade_size_qty"] = float(trade_qty)
     summary["trade_size_notional_usdt"] = float(trade_qty * first_price)
     summary["subprocess_validation"] = True
+    summary["nautilus_log_path"] = str(log_path).replace("\\", "/")
+
+    if cleanup_validation_artifacts:
+        for artifact_path in (segment_path, state_path, log_path):
+            try:
+                artifact_path.unlink(missing_ok=True)
+            except Exception:
+                pass
     return summary
 
 
@@ -814,6 +2080,10 @@ def train_rl_agent(
             "Primary model strategy '%s' -> skipping PPO training and selecting from supervised candidates only.",
             primary_model or "hybrid",
         )
+        logger.warning(
+            "Current training path is CPU-bound (scikit-learn + validation backtests). "
+            "CUDA will stay mostly idle unless RL or CryptoMamba is enabled."
+        )
 
     _log_gpu_memory()
 
@@ -874,13 +2144,37 @@ def train_rl_agent(
             confidence_grid = supervised_config.get("confidence_grid", [0.34, 0.38, 0.42, 0.46, 0.50])
             long_confidence_grid = supervised_config.get("long_confidence_grid", confidence_grid)
             short_confidence_grid = supervised_config.get("short_confidence_grid", confidence_grid)
+            anchor_long_confidence_grid = supervised_config.get("anchor_long_confidence_grid", [])
+            anchor_short_confidence_grid = supervised_config.get("anchor_short_confidence_grid", [])
+            exploration_long_confidence_grid = supervised_config.get("exploration_long_confidence_grid", [])
+            exploration_short_confidence_grid = supervised_config.get("exploration_short_confidence_grid", [])
+            preserve_top_fallback_count = int(
+                supervised_config.get("preserve_top_confidence_grid_count", 2)
+            )
             model_types = supervised_config.get("model_types", ["logreg", "extratrees"])
+            anchor_long_confidence_values = {
+                round(float(value), 2)
+                for value in anchor_long_confidence_grid
+                if np.isfinite(value)
+            }
+            anchor_short_confidence_values = {
+                round(float(value), 2)
+                for value in anchor_short_confidence_grid
+                if np.isfinite(value)
+            }
             if isinstance(model_types, str):
                 model_types = [model_types]
             recent_train_bars = int(supervised_config.get("recent_train_bars", 0))
             supervised_validation_episodes = int(supervised_config.get("validation_episodes", max(eval_episodes, 10)))
             supervised_validation_seed_runs = max(int(supervised_config.get("validation_seed_runs", 1)), 1)
             supervised_validation_seed_stride = max(int(supervised_config.get("validation_seed_stride", 500)), 1)
+            supervised_validation_probe_seed_runs = min(
+                supervised_validation_seed_runs,
+                max(int(supervised_config.get("validation_probe_seed_runs", 1)), 1),
+            )
+            supervised_validation_skip_walkforward_on_probe_collapse = bool(
+                supervised_config.get("validation_probe_skip_walkforward_on_collapse", True)
+            )
             supervised_min_selection_score = float(supervised_config.get("min_selection_score", 0.0))
             supervised_fallback_to_safe_flat = bool(supervised_config.get("fallback_to_safe_flat", True))
             validation_seed_base = int(training_config.get("seed", 42)) + 1000
@@ -927,7 +2221,7 @@ def train_rl_agent(
             sup_best_validation_metrics = None
             supervised_candidate_pool: list[dict] = []
             supervised_candidate_pool_size = max(
-                int(training_config.get("nautilus_validation", {}).get("top_supervised_candidates", 3)),
+                int(supervised_config.get("candidate_pool_size", 32)),
                 1,
             )
             supervised_train_range = ranges["train"]
@@ -937,7 +2231,7 @@ def train_rl_agent(
                 supervised_train_range = (train_start, train_end)
             logger.info(
                 "Supervised fallback selection: train=[%d:%d) validation=[%d:%d) "
-                "recent_train_bars=%d validation_episodes=%d validation_seed_runs=%d min_selection_score=%.4f "
+                "recent_train_bars=%d validation_episodes=%d validation_seed_runs=%d probe_seed_runs=%d min_selection_score=%.4f "
                 "walkforward_windows=%d",
                 int(supervised_train_range[0]),
                 int(supervised_train_range[1]),
@@ -946,6 +2240,7 @@ def train_rl_agent(
                 recent_train_bars,
                 supervised_validation_episodes,
                 supervised_validation_seed_runs,
+                supervised_validation_probe_seed_runs,
                 supervised_min_selection_score,
                 selection_windows,
             )
@@ -962,6 +2257,8 @@ def train_rl_agent(
                     threshold_quantile=supervised_config.get("threshold_quantile", 0.65),
                     max_train_samples=supervised_config.get("max_train_samples", 120_000),
                     logistic_c=supervised_config.get("logistic_c", 1.0),
+                    logistic_multi_class=supervised_config.get("logistic_multi_class", "ovr"),
+                    logistic_target_mode=supervised_config.get("logistic_target_mode", "binary_meta"),
                     extra_trees_n_estimators=supervised_config.get("extra_trees_n_estimators", 160),
                     extra_trees_max_depth=supervised_config.get("extra_trees_max_depth", 12),
                     extra_trees_min_samples_leaf=supervised_config.get("extra_trees_min_samples_leaf", 32),
@@ -976,20 +2273,88 @@ def train_rl_agent(
                     countertrend_margin=supervised_config.get("countertrend_margin", 0.08),
                     regime_confidence_relief=regime_confidence_relief,
                     flat_reentry_cooldown_steps=supervised_config.get("flat_reentry_cooldown_steps", 0),
+                    flat_patience_steps=supervised_config.get("flat_patience_steps", 0),
+                    flat_patience_threshold_relief=supervised_config.get("flat_patience_threshold_relief", 0.0),
+                    flat_patience_entry_margin_relief=supervised_config.get("flat_patience_entry_margin_relief", 0.0),
+                    countertrend_threshold_penalty=supervised_config.get("countertrend_threshold_penalty", 0.0),
+                    countertrend_entry_penalty=supervised_config.get("countertrend_entry_penalty", 0.0),
+                    meta_label_min_edge=supervised_config.get("meta_label_min_edge", 0.0),
+                    meta_label_edge_margin=supervised_config.get("meta_label_edge_margin", 0.0),
+                    meta_label_exit_edge=supervised_config.get("meta_label_exit_edge", 0.0),
+                    meta_label_min_positive_rate=supervised_config.get("meta_label_min_positive_rate", 0.47),
+                    meta_label_target_edge_threshold=supervised_config.get("meta_label_target_edge_threshold"),
+                    calibration_min_samples=supervised_config.get("calibration_min_samples", 64),
+                    calibration_probability_thresholds=supervised_config.get("calibration_probability_thresholds"),
+                    calibration_window_count=supervised_config.get("calibration_window_count", 4),
+                    calibration_window_min_samples=supervised_config.get("calibration_window_min_samples"),
+                    calibration_min_active_window_ratio=supervised_config.get("calibration_min_active_window_ratio", 0.50),
                     taker_fee=trading_config.get("taker_fee", 0.0005),
                     slippage_bps=trading_config.get("slippage_bps", 1.0),
                     leverage=trading_config.get("leverage", 1.0),
                     random_state=training_config.get("seed", 42),
                 )
 
-                for long_confidence in long_confidence_grid:
-                    for short_confidence in short_confidence_grid:
+                post_cost_calibration = sup_meta.get("post_cost_calibration", {})
+                calibrated_long_confidence_grid = _derive_calibrated_confidence_grid(
+                    post_cost_calibration.get("long") if isinstance(post_cost_calibration, dict) else None,
+                    long_confidence_grid,
+                    min_edge=float(supervised_config.get("meta_label_min_edge", 0.0)),
+                    min_positive_rate=float(supervised_config.get("meta_label_min_positive_rate", 0.47)),
+                    min_active_window_ratio=float(supervised_config.get("calibration_min_active_window_ratio", 0.50)),
+                    anchor_thresholds=anchor_long_confidence_grid,
+                    preserve_top_fallback_count=preserve_top_fallback_count,
+                )
+                calibrated_short_confidence_grid = _derive_calibrated_confidence_grid(
+                    post_cost_calibration.get("short") if isinstance(post_cost_calibration, dict) else None,
+                    short_confidence_grid,
+                    min_edge=float(supervised_config.get("meta_label_min_edge", 0.0)),
+                    min_positive_rate=float(supervised_config.get("meta_label_min_positive_rate", 0.47)),
+                    min_active_window_ratio=float(supervised_config.get("calibration_min_active_window_ratio", 0.50)),
+                    anchor_thresholds=anchor_short_confidence_grid,
+                    preserve_top_fallback_count=preserve_top_fallback_count,
+                )
+                search_long_confidence_grid = _build_supervised_search_grid(
+                    calibrated_long_confidence_grid,
+                    exploration_grid=exploration_long_confidence_grid,
+                    anchor_grid=anchor_long_confidence_grid,
+                )
+                search_short_confidence_grid = _build_supervised_search_grid(
+                    calibrated_short_confidence_grid,
+                    exploration_grid=exploration_short_confidence_grid,
+                    anchor_grid=anchor_short_confidence_grid,
+                )
+                calibrated_long_confidence_values = {
+                    round(float(value), 2)
+                    for value in calibrated_long_confidence_grid
+                    if np.isfinite(value)
+                }
+                calibrated_short_confidence_values = {
+                    round(float(value), 2)
+                    for value in calibrated_short_confidence_grid
+                    if np.isfinite(value)
+                }
+                logger.info(
+                    "Calibrated confidence grids: model=%s long=%s short=%s search_long=%s search_short=%s",
+                    model_type,
+                    calibrated_long_confidence_grid,
+                    calibrated_short_confidence_grid,
+                    search_long_confidence_grid,
+                    search_short_confidence_grid,
+                )
+
+                for long_confidence in search_long_confidence_grid:
+                    for short_confidence in search_short_confidence_grid:
+                        exploration_only = (
+                            round(float(long_confidence), 2) not in calibrated_long_confidence_values
+                            or round(float(short_confidence), 2) not in calibrated_short_confidence_values
+                        )
                         sup_model.confidence_threshold = float(min(float(long_confidence), float(short_confidence)))
                         sup_model.long_confidence_threshold = float(long_confidence)
                         sup_model.short_confidence_threshold = float(short_confidence)
                         sup_val_runs: list[dict] = []
                         strict_scores: list[float] = []
                         relaxed_scores: list[float] = []
+                        collapsed_probe = False
                         for seed_idx in range(supervised_validation_seed_runs):
                             seed_base = validation_seed_base + seed_idx * supervised_validation_seed_stride
                             sup_val_metrics = trainer._eval_multi_episode(
@@ -1007,53 +2372,126 @@ def train_rl_agent(
                                 min_avg_trades_per_episode=relaxed_min_avg_trades,
                                 min_action_entropy=relaxed_min_action_entropy,
                             )))
-                        walkforward_metrics = trainer._eval_walkforward_segments(
-                            sup_model,
-                            segment_range=ranges["validation"],
-                            n_windows=selection_windows,
-                            min_window_size=selection_min_window_bars,
-                        )
-                        walkforward_strict_score = float(trainer.score_candidate(walkforward_metrics))
-                        walkforward_relaxed_score = float(trainer.score_candidate(
-                            walkforward_metrics,
-                            max_dominant_action_ratio=relaxed_max_dominant_ratio,
-                            min_avg_trades_per_episode=relaxed_min_avg_trades,
-                            min_action_entropy=relaxed_min_action_entropy,
-                        ))
+                            if (
+                                supervised_validation_skip_walkforward_on_probe_collapse
+                                and seed_idx + 1 == supervised_validation_probe_seed_runs
+                                and len(sup_val_runs) >= supervised_validation_probe_seed_runs
+                                and all(
+                                    _is_collapsed_supervised_probe_metrics(run_metrics)
+                                    for run_metrics in sup_val_runs[-supervised_validation_probe_seed_runs:]
+                                )
+                            ):
+                                collapsed_probe = True
+                                logger.info(
+                                    "Skipping remaining validation seeds and walk-forward for collapsed probe: "
+                                    "model=%s long_conf=%.2f short_conf=%.2f probe_runs=%d",
+                                    model_type,
+                                    float(long_confidence),
+                                    float(short_confidence),
+                                    supervised_validation_probe_seed_runs,
+                                )
+                                break
                         strict_score = _robust_validation_score(strict_scores)
                         relaxed_score = _robust_validation_score(relaxed_scores)
-                        strict_combined_score, walkforward_strict_soft_score, strict_wf_details = _combine_supervised_validation_scores(
-                            strict_score,
-                            walkforward_metrics,
-                            trainer,
-                            max_dominant_action_ratio=trainer.selection_max_dominant_action_ratio,
-                            min_avg_trades_per_episode=trainer.selection_min_avg_trades_per_episode,
-                            min_action_entropy=trainer.selection_min_action_entropy,
-                            walkforward_score_weight=walkforward_score_weight,
-                            walkforward_min_active_ratio=walkforward_min_active_ratio,
-                            walkforward_inactivity_penalty_scale=walkforward_inactivity_penalty_scale,
-                            walkforward_worst_net_penalty_scale=walkforward_worst_net_penalty_scale,
-                            walkforward_worst_gross_penalty_scale=walkforward_worst_gross_penalty_scale,
-                            walkforward_worst_alpha_penalty_scale=walkforward_worst_alpha_penalty_scale,
-                            walkforward_dominance_penalty_scale=walkforward_dominance_penalty_scale,
-                        )
-                        relaxed_combined_score, walkforward_relaxed_soft_score, relaxed_wf_details = _combine_supervised_validation_scores(
-                            relaxed_score,
-                            walkforward_metrics,
-                            trainer,
-                            max_dominant_action_ratio=relaxed_max_dominant_ratio,
-                            min_avg_trades_per_episode=relaxed_min_avg_trades,
-                            min_action_entropy=relaxed_min_action_entropy,
-                            walkforward_score_weight=walkforward_score_weight,
-                            walkforward_min_active_ratio=walkforward_min_active_ratio,
-                            walkforward_inactivity_penalty_scale=walkforward_inactivity_penalty_scale,
-                            walkforward_worst_net_penalty_scale=walkforward_worst_net_penalty_scale,
-                            walkforward_worst_gross_penalty_scale=walkforward_worst_gross_penalty_scale,
-                            walkforward_worst_alpha_penalty_scale=walkforward_worst_alpha_penalty_scale,
-                            walkforward_dominance_penalty_scale=walkforward_dominance_penalty_scale,
-                        )
+                        if collapsed_probe:
+                            walkforward_metrics = dict(sup_val_runs[-1]) if sup_val_runs else {}
+                            walkforward_metrics["walkforward_window_count"] = 0
+                            walkforward_metrics["walkforward_min_total_return"] = float(
+                                walkforward_metrics.get("total_return", 0.0)
+                            )
+                            walkforward_metrics["walkforward_min_gross_total_return"] = float(
+                                walkforward_metrics.get("gross_total_return", walkforward_metrics.get("total_return", 0.0))
+                            )
+                            walkforward_metrics["walkforward_min_alpha"] = float(
+                                walkforward_metrics.get("outperformance_vs_bh", 0.0)
+                            )
+                            walkforward_metrics["walkforward_net_std"] = 0.0
+                            walkforward_metrics["walkforward_gross_std"] = 0.0
+                            walkforward_metrics["walkforward_active_window_ratio"] = 0.0
+                            walkforward_metrics["walkforward_active_window_count"] = 0.0
+                            walkforward_metrics["walkforward_positive_net_ratio"] = 0.0
+                            walkforward_metrics["walkforward_positive_alpha_ratio"] = 0.0
+                            walkforward_metrics["walkforward_worst_dominant_action_ratio"] = float(
+                                walkforward_metrics.get("eval_dominant_action_ratio", 1.0)
+                            )
+                            walkforward_strict_score = float("-inf")
+                            walkforward_relaxed_score = float("-inf")
+                            strict_combined_score = float("-inf")
+                            relaxed_combined_score = float("-inf")
+                            walkforward_strict_soft_score = float("-inf")
+                            walkforward_relaxed_soft_score = float("-inf")
+                            strict_wf_details = {
+                                "walkforward_active_window_ratio": 0.0,
+                                "walkforward_soft_score": float("-inf"),
+                                "walkforward_penalty": 0.0,
+                                "walkforward_bonus": 0.0,
+                            }
+                            relaxed_wf_details = dict(strict_wf_details)
+                        else:
+                            walkforward_metrics = trainer._eval_walkforward_segments(
+                                sup_model,
+                                segment_range=ranges["validation"],
+                                n_windows=selection_windows,
+                                min_window_size=selection_min_window_bars,
+                            )
+                            walkforward_strict_score = float(trainer.score_candidate(walkforward_metrics))
+                            walkforward_relaxed_score = float(trainer.score_candidate(
+                                walkforward_metrics,
+                                max_dominant_action_ratio=relaxed_max_dominant_ratio,
+                                min_avg_trades_per_episode=relaxed_min_avg_trades,
+                                min_action_entropy=relaxed_min_action_entropy,
+                            ))
+                            strict_combined_score, walkforward_strict_soft_score, strict_wf_details = _combine_supervised_validation_scores(
+                                strict_score,
+                                walkforward_metrics,
+                                trainer,
+                                max_dominant_action_ratio=trainer.selection_max_dominant_action_ratio,
+                                min_avg_trades_per_episode=trainer.selection_min_avg_trades_per_episode,
+                                min_action_entropy=trainer.selection_min_action_entropy,
+                                walkforward_score_weight=walkforward_score_weight,
+                                walkforward_min_active_ratio=walkforward_min_active_ratio,
+                                walkforward_inactivity_penalty_scale=walkforward_inactivity_penalty_scale,
+                                walkforward_worst_net_penalty_scale=walkforward_worst_net_penalty_scale,
+                                walkforward_worst_gross_penalty_scale=walkforward_worst_gross_penalty_scale,
+                                walkforward_worst_alpha_penalty_scale=walkforward_worst_alpha_penalty_scale,
+                                walkforward_dominance_penalty_scale=walkforward_dominance_penalty_scale,
+                            )
+                            relaxed_combined_score, walkforward_relaxed_soft_score, relaxed_wf_details = _combine_supervised_validation_scores(
+                                relaxed_score,
+                                walkforward_metrics,
+                                trainer,
+                                max_dominant_action_ratio=relaxed_max_dominant_ratio,
+                                min_avg_trades_per_episode=relaxed_min_avg_trades,
+                                min_action_entropy=relaxed_min_action_entropy,
+                                walkforward_score_weight=walkforward_score_weight,
+                                walkforward_min_active_ratio=walkforward_min_active_ratio,
+                                walkforward_inactivity_penalty_scale=walkforward_inactivity_penalty_scale,
+                                walkforward_worst_net_penalty_scale=walkforward_worst_net_penalty_scale,
+                                walkforward_worst_gross_penalty_scale=walkforward_worst_gross_penalty_scale,
+                                walkforward_worst_alpha_penalty_scale=walkforward_worst_alpha_penalty_scale,
+                                walkforward_dominance_penalty_scale=walkforward_dominance_penalty_scale,
+                            )
                         strict_metrics = _aggregate_validation_metrics(sup_val_runs, strict_scores)
                         relaxed_metrics = _aggregate_validation_metrics(sup_val_runs, relaxed_scores)
+                        watchlist_metrics = dict(walkforward_metrics)
+                        watchlist_metrics["supervised_validation_brier"] = float(
+                            sup_meta.get("validation_brier", float("inf"))
+                        )
+                        watchlist_metrics["validation_seed_runs"] = int(supervised_validation_seed_runs)
+                        watchlist_metrics["validation_score_median"] = float(
+                            relaxed_metrics.get("validation_score_median", float("-inf"))
+                        )
+                        watchlist_metrics["validation_score_worst"] = float(
+                            relaxed_metrics.get("validation_score_worst", float("-inf"))
+                        )
+                        watchlist_metrics["walkforward_selection_score"] = float(walkforward_relaxed_soft_score)
+                        watchlist_metrics["trade_density"] = float(
+                            relaxed_metrics.get(
+                                "avg_trades_per_episode",
+                                relaxed_metrics.get("n_trades", 0.0),
+                            )
+                        ) / max(float(trainer.max_episode_steps), 1.0)
+                        watchlist_score = _score_sparse_supervised_watchlist_candidate(watchlist_metrics)
                         for metric_bundle, wf_score, wf_details in (
                             (strict_metrics, walkforward_strict_soft_score, strict_wf_details),
                             (relaxed_metrics, walkforward_relaxed_soft_score, relaxed_wf_details),
@@ -1110,7 +2548,7 @@ def train_rl_agent(
                                 sup_meta.get("validation_brier", float("nan"))
                             )
                         logger.info(
-                            "Supervised validation: model=%s long_conf=%.2f short_conf=%.2f strict=%s relaxed=%s "
+                            "Supervised validation: model=%s long_conf=%.2f short_conf=%.2f strict=%s relaxed=%s watchlist=%s "
                             "wf_strict=%s wf_relaxed=%s strict_combined=%s relaxed_combined=%s seed_runs=%d "
                             "alpha=%.4f net=%.4f gross=%.4f trades=%.1f dominant_ratio=%.2f%% "
                             "wf_active=%.2f%% wf_penalty=%.4f brier=%.4f episodes=%d",
@@ -1119,6 +2557,7 @@ def train_rl_agent(
                             float(short_confidence),
                             f"{strict_score:.4f}" if np.isfinite(strict_score) else "-inf",
                             f"{relaxed_score:.4f}" if np.isfinite(relaxed_score) else "-inf",
+                            f"{watchlist_score:.4f}" if np.isfinite(watchlist_score) else "-inf",
                             f"{walkforward_strict_soft_score:.4f}" if np.isfinite(walkforward_strict_soft_score) else "-inf",
                             f"{walkforward_relaxed_soft_score:.4f}" if np.isfinite(walkforward_relaxed_soft_score) else "-inf",
                             f"{strict_combined_score:.4f}" if np.isfinite(strict_combined_score) else "-inf",
@@ -1143,7 +2582,7 @@ def train_rl_agent(
                             candidate_options.append(("strict", float(strict_combined_score), 1, strict_metrics))
                         if np.isfinite(relaxed_combined_score):
                             candidate_options.append(("relaxed", float(relaxed_combined_score), 0, relaxed_metrics))
-                        if candidate_options:
+                        if candidate_options and not exploration_only:
                             candidate_mode, candidate_score, candidate_priority, candidate_validation_metrics = max(
                                 candidate_options,
                                 key=lambda item: (
@@ -1153,7 +2592,7 @@ def train_rl_agent(
                                 ),
                             )
 
-                        if candidate_mode is not None and (
+                        if (not exploration_only) and candidate_mode is not None and (
                             candidate_score > sup_best_score
                             or (np.isclose(candidate_score, sup_best_score) and candidate_priority > sup_best_priority)
                         ):
@@ -1166,9 +2605,30 @@ def train_rl_agent(
                             sup_best_priority = int(candidate_priority)
                             sup_best_mode = str(candidate_mode)
                             sup_best_validation_metrics = dict(candidate_validation_metrics or relaxed_metrics)
-                        if candidate_mode is not None and np.isfinite(candidate_score):
+                        pool_mode = candidate_mode
+                        pool_score = candidate_score
+                        pool_priority = candidate_priority
+                        pool_validation_metrics = candidate_validation_metrics
+                        if pool_mode is None and np.isfinite(watchlist_score):
+                            pool_mode = "watchlist"
+                            pool_score = float(watchlist_score)
+                            pool_priority = -1
+                            pool_validation_metrics = dict(watchlist_metrics)
+                        is_anchor_candidate = (
+                            round(float(long_confidence), 2) in anchor_long_confidence_values
+                            and round(float(short_confidence), 2) in anchor_short_confidence_values
+                        )
+                        if pool_mode is None and is_anchor_candidate:
+                            anchor_metrics = dict(relaxed_metrics)
+                            anchor_probe_score = _score_anchor_supervised_probe_candidate(anchor_metrics)
+                            if np.isfinite(anchor_probe_score):
+                                pool_mode = "anchor_probe"
+                                pool_score = float(anchor_probe_score)
+                                pool_priority = -2
+                                pool_validation_metrics = anchor_metrics
+                        if pool_mode is not None and np.isfinite(pool_score):
                             candidate_name = (
-                                f"{model_type}_{candidate_mode}_"
+                                f"{model_type}_{pool_mode}_"
                                 f"lc{float(long_confidence):.2f}_sc{float(short_confidence):.2f}"
                             )
                             candidate_snapshot = copy.deepcopy(sup_model)
@@ -1181,14 +2641,14 @@ def train_rl_agent(
                                 {
                                     "model": candidate_snapshot,
                                     "meta": dict(sup_meta),
-                                    "score": float(candidate_score),
-                                    "priority": int(candidate_priority),
-                                    "mode": str(candidate_mode),
+                                    "score": float(pool_score),
+                                    "priority": int(pool_priority),
+                                    "mode": str(pool_mode),
                                     "name": candidate_name,
                                     "confidence": float(min(float(long_confidence), float(short_confidence))),
                                     "long_confidence": float(long_confidence),
                                     "short_confidence": float(short_confidence),
-                                    "validation_metrics": dict(candidate_validation_metrics or relaxed_metrics),
+                                    "validation_metrics": dict(pool_validation_metrics or relaxed_metrics),
                                 }
                             )
                             supervised_candidate_pool.sort(
@@ -1208,8 +2668,18 @@ def train_rl_agent(
                 and np.isfinite(sup_best_score)
                 and sup_best_score >= supervised_min_selection_score
             )
+            original_candidate_pool_size = len(supervised_candidate_pool)
+            supervised_candidate_pool = _prune_supervised_candidate_pool(supervised_candidate_pool)
+            if len(supervised_candidate_pool) != original_candidate_pool_size:
+                logger.info(
+                    "Pruned supervised candidate pool by behavior signature: %d -> %d",
+                    original_candidate_pool_size,
+                    len(supervised_candidate_pool),
+                )
 
-            if sup_best_model is not None and sup_best_conf is not None and supervised_candidate_eligible:
+            supervised_path = None
+            supervised_metrics = None
+            if sup_best_model is not None and sup_best_conf is not None:
                 sup_best_model.confidence_threshold = float(sup_best_conf)
                 sup_best_model.long_confidence_threshold = float(
                     sup_best_long_conf if sup_best_long_conf is not None else sup_best_conf
@@ -1218,7 +2688,6 @@ def train_rl_agent(
                     sup_best_short_conf if sup_best_short_conf is not None else sup_best_conf
                 )
                 supervised_path = sup_best_model.save("checkpoints/rl_agent_supervised.joblib")
-                supervised_metrics = None
                 logger.info(
                     "Saved supervised fallback -> %s (mode=%s long_conf=%.2f short_conf=%.2f validation_score=%s)",
                     supervised_path,
@@ -1229,9 +2698,9 @@ def train_rl_agent(
                 )
 
                 use_supervised = False
-                if np.isfinite(sup_best_score):
+                if supervised_candidate_eligible and np.isfinite(sup_best_score):
                     use_supervised = (not np.isfinite(ppo_validation_score)) or (sup_best_score > ppo_validation_score)
-                if not np.isfinite(ppo_validation_score) and np.isfinite(sup_best_score):
+                if supervised_candidate_eligible and not np.isfinite(ppo_validation_score) and np.isfinite(sup_best_score):
                     use_supervised = True
 
                 if use_supervised:
@@ -1286,68 +2755,71 @@ def train_rl_agent(
                     selected_model = sup_best_model
                     selected_metrics = supervised_metrics
                 else:
-                    logger.info(
-                        "Keeping PPO model: best supervised mode=%s score=%s ppo validation score=%s",
-                        sup_best_mode,
-                        f"{sup_best_score:.4f}" if np.isfinite(sup_best_score) else "-inf",
-                        f"{ppo_validation_score:.4f}" if np.isfinite(ppo_validation_score) else "-inf",
-                    )
-                for idx, candidate_info in enumerate(supervised_candidate_pool):
-                    candidate_model = candidate_info["model"]
-                    candidate_meta = candidate_info["meta"]
-                    candidate_mode_value = str(candidate_info["mode"])
-                    candidate_score_value = float(candidate_info["score"])
-                    candidate_conf_value = float(candidate_info["confidence"])
-                    candidate_long_conf_value = float(candidate_info["long_confidence"])
-                    candidate_short_conf_value = float(candidate_info["short_confidence"])
-                    candidate_validation_metrics = dict(candidate_info["validation_metrics"])
-                    candidate_path = (
-                        supervised_path
-                        if idx == 0
-                        else candidate_model.save(
-                            f"checkpoints/rl_agent_supervised_{candidate_info['name']}.joblib"
+                    if supervised_candidate_eligible:
+                        logger.info(
+                            "Keeping PPO model: best supervised mode=%s score=%s ppo validation score=%s",
+                            sup_best_mode,
+                            f"{sup_best_score:.4f}" if np.isfinite(sup_best_score) else "-inf",
+                            f"{ppo_validation_score:.4f}" if np.isfinite(ppo_validation_score) else "-inf",
                         )
+                    else:
+                        logger.warning(
+                            "Best supervised candidate score %.4f is below the fast-env minimum %.4f. "
+                            "Keeping it available for Nautilus validation instead of forcing safe_flat immediately.",
+                            float(sup_best_score),
+                            float(supervised_min_selection_score),
+                        )
+            if supervised_candidate_pool and sup_best_model is None:
+                logger.info(
+                    "No strict/relaxed supervised winner passed fast-env gates, but %d watchlist/anchor candidates remain for Nautilus validation.",
+                    len(supervised_candidate_pool),
+                )
+
+            for idx, candidate_info in enumerate(supervised_candidate_pool):
+                candidate_model = candidate_info["model"]
+                candidate_meta = candidate_info["meta"]
+                candidate_mode_value = str(candidate_info["mode"])
+                candidate_score_value = float(candidate_info["score"])
+                candidate_conf_value = float(candidate_info["confidence"])
+                candidate_long_conf_value = float(candidate_info["long_confidence"])
+                candidate_short_conf_value = float(candidate_info["short_confidence"])
+                candidate_validation_metrics = dict(candidate_info["validation_metrics"])
+                is_selected_env_candidate = (
+                    sup_best_model is not None
+                    and np.isclose(candidate_score_value, sup_best_score)
+                    and np.isclose(candidate_long_conf_value, float(sup_best_long_conf or sup_best_conf or 0.0))
+                    and np.isclose(candidate_short_conf_value, float(sup_best_short_conf or sup_best_conf or 0.0))
+                )
+                if is_selected_env_candidate and supervised_path is not None:
+                    candidate_path = supervised_path
+                else:
+                    candidate_path = candidate_model.save(
+                        f"checkpoints/rl_agent_supervised_{candidate_info['name']}.joblib"
                     )
-                    is_selected_env_candidate = (
-                        np.isclose(candidate_score_value, sup_best_score)
-                        and np.isclose(candidate_long_conf_value, float(sup_best_long_conf or sup_best_conf or 0.0))
-                        and np.isclose(candidate_short_conf_value, float(sup_best_short_conf or sup_best_conf or 0.0))
-                    )
-                    candidate_records.append(
-                        {
-                            "family": f"supervised_{candidate_meta.get('model_type', 'fallback')}",
-                            "candidate_name": str(candidate_info.get("name", f"candidate_{idx + 1}")),
-                            "model": candidate_model,
-                            "model_path": str(candidate_path).replace("\\", "/"),
-                            "display_metrics": (
-                                dict(supervised_metrics) if (is_selected_env_candidate and supervised_metrics is not None) else None
-                            ),
-                            "env_validation_score": float(candidate_score_value),
-                            "env_validation_metrics": candidate_validation_metrics,
-                            "selection_mode": candidate_mode_value,
-                            "supervised_confidence_threshold": float(candidate_conf_value),
-                            "supervised_long_confidence_threshold": float(candidate_long_conf_value),
-                            "supervised_short_confidence_threshold": float(candidate_short_conf_value),
-                            "supervised_label_threshold": float(candidate_meta.get("label_threshold", 0.0)),
-                            "supervised_model_type": str(candidate_meta.get("model_type", "fallback")),
-                        }
-                    )
-            elif sup_best_model is not None and sup_best_conf is not None:
-                logger.warning(
-                    "Best supervised candidate score %.4f is below the minimum %.4f. "
-                    "It will not replace the current selected policy.",
-                    float(sup_best_score),
-                    float(supervised_min_selection_score),
+                candidate_records.append(
+                    {
+                        "family": f"supervised_{candidate_meta.get('model_type', 'fallback')}",
+                        "candidate_name": str(candidate_info.get("name", f"candidate_{idx + 1}")),
+                        "model": candidate_model,
+                        "model_path": str(candidate_path).replace("\\", "/"),
+                        "display_metrics": (
+                            dict(supervised_metrics) if (is_selected_env_candidate and supervised_metrics is not None) else None
+                        ),
+                        "env_validation_score": float(candidate_score_value),
+                        "env_validation_metrics": candidate_validation_metrics,
+                        "selection_mode": candidate_mode_value,
+                        "supervised_confidence_threshold": float(candidate_conf_value),
+                        "supervised_long_confidence_threshold": float(candidate_long_conf_value),
+                        "supervised_short_confidence_threshold": float(candidate_short_conf_value),
+                        "supervised_label_threshold": float(candidate_meta.get("label_threshold", 0.0)),
+                        "supervised_model_type": str(candidate_meta.get("model_type", "fallback")),
+                    }
                 )
 
             if (
                 supervised_fallback_to_safe_flat
-                and (selected_model is None or not np.isfinite(ppo_validation_score))
-                and (
-                    sup_best_model is None
-                    or sup_best_conf is None
-                    or not supervised_candidate_eligible
-                )
+                and selected_model is None
+                and not candidate_records
             ):
                 safe_flat_model = build_constant_action_model(
                     feature_dim=int(feature_array.shape[1]),
@@ -1368,6 +2840,7 @@ def train_rl_agent(
                 safe_flat_metrics["model_family"] = "safe_flat"
                 safe_flat_metrics["model_path"] = str(safe_flat_path).replace("\\", "/")
                 safe_flat_metrics["selection_mode"] = "safety"
+                safe_flat_metrics["selection_reason"] = "no_supervised_candidate"
                 selected_model = safe_flat_model
                 selected_metrics = safe_flat_metrics
                 candidate_records.append(
@@ -1382,14 +2855,19 @@ def train_rl_agent(
                     }
                 )
                 logger.warning(
-                    "No supervised candidate cleared the minimum score. Falling back to safe flat policy."
+                    "No supervised candidate could be built. Falling back to safe flat policy."
                 )
         except Exception as e:
             logger.exception("Supervised fallback training failed: %s", e)
 
+    force_safe_flat_after_nautilus_rejection = False
     nautilus_config = training_config.get("nautilus_validation", {})
     nautilus_enabled = bool(nautilus_config.get("enabled", False))
-    if nautilus_enabled and candidate_records:
+    has_non_safe_flat_candidate = any(
+        str(candidate.get("family", "")) != "safe_flat"
+        for candidate in candidate_records
+    )
+    if nautilus_enabled and candidate_records and has_non_safe_flat_candidate:
         frame_15m = config.get("_nautilus_frame")
         if not isinstance(frame_15m, pd.DataFrame) or len(frame_15m) != len(prices):
             logger.warning(
@@ -1399,6 +2877,11 @@ def train_rl_agent(
             min_trades = float(nautilus_config.get("selection_min_trades", 1.0))
             max_dom = float(nautilus_config.get("selection_max_dominant_action_ratio", 0.995))
             min_nautilus_selection_score = float(nautilus_config.get("min_selection_score", 0.0))
+            conservative_fallback_min_score = float(
+                nautilus_config.get("conservative_fallback_min_score", 0.75)
+            )
+            nautilus_selection_windows = max(int(nautilus_config.get("selection_windows", 2)), 1)
+            nautilus_selection_min_window_bars = max(int(nautilus_config.get("selection_min_window_bars", 4096)), 128)
             use_for_selection = bool(nautilus_config.get("use_for_model_selection", True))
             evaluate_final_test = bool(nautilus_config.get("evaluate_final_test", True))
             use_subprocess_validation = bool(nautilus_config.get("subprocess_on_windows", True)) and sys.platform.startswith("win")
@@ -1408,8 +2891,24 @@ def train_rl_agent(
                 )
             best_candidate = None
             best_nautilus_score = float("-inf")
+            best_rejected_candidate = None
+            best_rejected_score = float("-inf")
+            nautilus_candidate_limit = max(int(nautilus_config.get("top_supervised_candidates", 2)), 1)
+            candidate_pool = _select_nautilus_candidate_subset(
+                candidate_records,
+                limit=nautilus_candidate_limit,
+            )
+            logger.info(
+                "Nautilus candidate subset (%d/%d): %s",
+                len(candidate_pool),
+                len(candidate_records),
+                ", ".join(
+                    str(item.get("candidate_name", item.get("family", "candidate")))
+                    for item in candidate_pool
+                ) or "none",
+            )
 
-            for candidate in candidate_records:
+            for candidate in candidate_pool:
                 candidate_name = str(candidate.get("candidate_name", candidate.get("family", "candidate")))
                 if str(candidate.get("family", "")) == "safe_flat":
                     candidate["nautilus_validation"] = {"skipped": "safe_flat_candidate"}
@@ -1432,45 +2931,132 @@ def train_rl_agent(
                         if use_subprocess_validation
                         else _run_nautilus_backtest_segment
                     )
-                    validation_summary = validation_runner(
-                        model_path=candidate["model_path"],
-                        frame_15m=frame_15m,
+                    nautilus_windows = trainer._build_walkforward_windows(
                         segment_range=ranges["validation"],
-                        config=config,
-                        label=f"validation_{candidate_name}",
+                        n_windows=nautilus_selection_windows,
+                        min_window_size=nautilus_selection_min_window_bars,
                     )
+                    validation_window_summaries: list[dict] = []
+                    validation_window_scores: list[float] = []
+                    for window_idx, window_range in enumerate(nautilus_windows, start=1):
+                        window_label = (
+                            f"validation_{candidate_name}"
+                            if len(nautilus_windows) == 1
+                            else f"validation_{candidate_name}_w{window_idx}"
+                        )
+                        window_summary = validation_runner(
+                            model_path=candidate["model_path"],
+                            frame_15m=frame_15m,
+                            segment_range=window_range,
+                            config=config,
+                            label=window_label,
+                        )
+                        validation_window_summaries.append(window_summary)
+                        validation_window_scores.append(
+                            _score_nautilus_summary(
+                                window_summary,
+                                min_trades=min_trades,
+                                max_dominant_action_ratio=max_dom,
+                            )
+                        )
+                    validation_summary, validation_score = _aggregate_nautilus_window_summaries(
+                        validation_window_summaries,
+                        validation_window_scores,
+                        nautilus_windows,
+                    )
+                    validation_preliminary_score = float(validation_score)
+                    validation_summary["nautilus_score_preliminary"] = validation_preliminary_score
                     validation_score = _score_nautilus_summary(
                         validation_summary,
                         min_trades=min_trades,
                         max_dominant_action_ratio=max_dom,
                     )
+                    validation_summary["nautilus_score_final"] = (
+                        float(validation_score) if np.isfinite(validation_score) else float("-inf")
+                    )
+                    fallback_score = _score_nautilus_rejected_fallback(validation_summary)
+                    validation_summary["nautilus_fallback_score"] = (
+                        float(fallback_score) if np.isfinite(fallback_score) else float("-inf")
+                    )
                     candidate["nautilus_validation"] = validation_summary
                     candidate["nautilus_validation_score"] = float(validation_score)
+                    candidate["nautilus_fallback_score"] = (
+                        float(fallback_score) if np.isfinite(fallback_score) else float("-inf")
+                    )
                     logger.info(
                         "Nautilus validation: family=%s candidate=%s long_conf=%.2f short_conf=%.2f "
-                        "score=%s net=%.4f gross=%.4f alpha=%.4f trades=%d dominant_ratio=%.2f%% status=%s",
+                        "score=%s pre_score=%s fallback_score=%s windows=%d active_ratio=%.2f%% net=%.4f gross=%.4f alpha=%.4f "
+                        "trades=%d trade_density=%.4f dominant_ratio=%.2f%% status=%s",
                         candidate["family"],
                         candidate_name,
                         float(candidate.get("supervised_long_confidence_threshold", candidate.get("supervised_confidence_threshold", 0.0))),
                         float(candidate.get("supervised_short_confidence_threshold", candidate.get("supervised_confidence_threshold", 0.0))),
                         f"{validation_score:.4f}" if np.isfinite(validation_score) else "-inf",
+                        f"{validation_preliminary_score:.4f}" if np.isfinite(validation_preliminary_score) else "-inf",
+                        f"{fallback_score:.4f}" if np.isfinite(fallback_score) else "-inf",
+                        int(validation_summary.get("nautilus_window_count", 1)),
+                        float(validation_summary.get("nautilus_active_window_ratio", 1.0) * 100.0),
                         float(validation_summary.get("total_return", 0.0)),
                         float(validation_summary.get("gross_total_return", 0.0)),
                         float(validation_summary.get("outperformance_vs_bh", 0.0)),
                         int(validation_summary.get("n_trades", 0)),
+                        float(validation_summary.get("trade_density", 0.0)),
                         float(validation_summary.get("eval_dominant_action_ratio", 0.0) * 100.0),
                         str(validation_summary.get("status", "UNKNOWN")),
                     )
                     if np.isfinite(validation_score) and validation_score > best_nautilus_score:
                         best_nautilus_score = float(validation_score)
                         best_candidate = candidate
+                    if (
+                        not np.isfinite(validation_score)
+                        and np.isfinite(fallback_score)
+                        and fallback_score > best_rejected_score
+                    ):
+                        best_rejected_score = float(fallback_score)
+                        best_rejected_candidate = candidate
                 except Exception as exc:
                     candidate["nautilus_validation"] = {"error": str(exc)}
                     candidate["nautilus_validation_score"] = float("-inf")
+                    candidate["nautilus_fallback_score"] = float("-inf")
                     logger.warning(
                         "Nautilus validation failed for %s: %s",
                         candidate["family"],
                         exc,
+                    )
+
+            nautilus_selection_engine = "nautilus_validation"
+            if best_candidate is None and best_rejected_candidate is not None:
+                rejected_summary = (
+                    best_rejected_candidate.get("nautilus_validation", {})
+                    if isinstance(best_rejected_candidate, dict)
+                    else {}
+                )
+                allow_sparse_rejected = (
+                    isinstance(rejected_summary, dict)
+                    and _allows_sparse_active_nautilus_override(
+                        rejected_summary,
+                        min_trades=min_trades,
+                        max_dominant_action_ratio=max_dom,
+                    )
+                )
+                if float(best_rejected_score) >= conservative_fallback_min_score or allow_sparse_rejected:
+                    logger.warning(
+                        "No model passed Nautilus validation gates; selecting best conservative Nautilus fallback candidate: "
+                        "family=%s fallback_score=%.4f gate_score=-inf min_fallback_score=%.4f sparse_override=%s",
+                        best_rejected_candidate["family"],
+                        float(best_rejected_score),
+                        float(conservative_fallback_min_score),
+                        allow_sparse_rejected,
+                    )
+                    best_candidate = best_rejected_candidate
+                    best_nautilus_score = float(best_rejected_score)
+                    nautilus_selection_engine = "nautilus_conservative_fallback"
+                else:
+                    logger.warning(
+                        "No model passed Nautilus validation gates and best fallback score %.4f is below "
+                        "conservative minimum %.4f; deferring to downstream safe-flat fallback if enabled.",
+                        float(best_rejected_score),
+                        float(conservative_fallback_min_score),
                     )
 
             if best_candidate is not None:
@@ -1501,7 +3087,7 @@ def train_rl_agent(
                         selected_metrics = dict(best_candidate["display_metrics"])
                     selected_metrics["model_family"] = str(best_candidate["family"])
                     selected_metrics["model_path"] = str(best_candidate["model_path"])
-                    selected_metrics["selection_engine"] = "nautilus_validation"
+                    selected_metrics["selection_engine"] = str(nautilus_selection_engine)
                     selected_metrics["selection_mode"] = str(best_candidate.get("selection_mode", "unknown"))
                     if str(best_candidate["family"]).startswith("supervised_"):
                         selected_metrics["supervised_confidence_threshold"] = float(
@@ -1520,7 +3106,8 @@ def train_rl_agent(
                             best_candidate.get("supervised_model_type", "fallback")
                         )
                     logger.info(
-                        "Selecting final model using Nautilus validation -> %s",
+                        "Selecting final model using %s -> %s",
+                        str(nautilus_selection_engine),
                         best_candidate["family"],
                     )
                 elif use_for_selection:
@@ -1529,6 +3116,8 @@ def train_rl_agent(
                         float(best_nautilus_score),
                         float(min_nautilus_selection_score),
                     )
+                    if supervised_fallback_to_safe_flat:
+                        force_safe_flat_after_nautilus_rejection = True
 
                 selected_metrics["nautilus_validation"] = dict(best_candidate["nautilus_validation"])
                 selected_metrics["nautilus_validation_score"] = float(best_nautilus_score)
@@ -1547,7 +3136,7 @@ def train_rl_agent(
                             config=config,
                             label=f"test_{str(best_candidate.get('candidate_name', best_candidate['family']))}",
                         )
-                        selected_metrics["nautilus_test"] = dict(final_summary)
+                        selected_metrics = _promote_nautilus_test_metrics(selected_metrics, final_summary)
                         logger.info(
                             "Nautilus held-out test: family=%s net=%.4f gross=%.4f alpha=%.4f "
                             "trades=%d win_rate=%.2f%%",
@@ -1562,9 +3151,63 @@ def train_rl_agent(
                         selected_metrics["nautilus_test"] = {"error": str(exc)}
                         logger.warning("Nautilus held-out test failed for %s: %s", best_candidate["family"], exc)
             else:
-                logger.warning(
-                    "No model passed Nautilus validation gates; keeping fast-env selection."
+                if use_for_selection and supervised_fallback_to_safe_flat:
+                    logger.warning(
+                        "No model passed Nautilus validation gates; deferring to downstream safe-flat fallback."
+                    )
+                    force_safe_flat_after_nautilus_rejection = True
+                else:
+                    logger.warning(
+                        "No model passed Nautilus validation gates; keeping fast-env selection."
+                    )
+
+    if force_safe_flat_after_nautilus_rejection:
+        selected_model = None
+        selected_metrics = {}
+
+    if supervised_fallback_to_safe_flat and selected_model is None:
+        logger.warning(
+            "No candidate survived fast-env plus Nautilus selection. Falling back to safe flat policy."
+        )
+        safe_flat_model = build_constant_action_model(
+            feature_dim=int(feature_array.shape[1]),
+            action=1,
+            metadata={"model_type": "safe_flat", "reason": "no_candidate_survived_selection"},
+        )
+        safe_flat_path = safe_flat_model.save("checkpoints/rl_agent_safe_flat.joblib")
+        safe_flat_metrics = trainer._eval_multi_episode(
+            safe_flat_model,
+            n_episodes=10,
+            segment_range=ranges["test"],
+            log_episodes=True,
+            seed_base=test_seed_base,
+        )
+        trainer._save_chart(safe_flat_model, safe_flat_metrics)
+        safe_flat_metrics["selection_gate_passed"] = 1.0
+        safe_flat_metrics["selection_best_score"] = 0.0
+        safe_flat_metrics["model_family"] = "safe_flat"
+        safe_flat_metrics["model_path"] = str(safe_flat_path).replace("\\", "/")
+        safe_flat_metrics["selection_mode"] = "safety"
+        safe_flat_metrics["selection_reason"] = (
+            "nautilus_rejected_all_candidates"
+            if has_non_safe_flat_candidate
+            else "no_supervised_candidate"
+        )
+        if candidate_records:
+            best_candidate = max(
+                candidate_records,
+                key=lambda item: float(item.get("nautilus_validation_score", item.get("env_validation_score", float("-inf")))),
+            )
+            if isinstance(best_candidate.get("nautilus_validation"), dict):
+                safe_flat_metrics["nautilus_validation"] = dict(best_candidate["nautilus_validation"])
+                safe_flat_metrics["nautilus_validation_score"] = float(
+                    best_candidate.get("nautilus_validation_score", float("-inf"))
                 )
+        selected_model = safe_flat_model
+        selected_metrics = safe_flat_metrics
+
+    if selected_model is not None and selected_metrics:
+        trainer._save_chart(selected_model, selected_metrics)
 
     return selected_model, selected_metrics
 
@@ -2729,8 +4372,11 @@ def run_training_pipeline(config_path: str | None = None, no_cache: bool = False
             dash.add_phase(f"Features + CryptoMamba ({n_feats} dims)", "ok", time.time() - t0)
             dash.update(features=n_feats)
 
-            # Save to cache for next run
-            save_features(symbol, feature_array, prices, ohlcv_data, close_15m)
+            # Save to cache for next run unless this execution explicitly bypassed cache usage.
+            if use_cache:
+                save_features(symbol, feature_array, prices, ohlcv_data, close_15m)
+            else:
+                logger.info("Skipping feature cache write because --no-cache was requested.")
 
         # Step 4: Baseline
         bh_return = float(prices[-1] / prices[0] - 1)
@@ -2875,6 +4521,7 @@ def _print_report(report: dict, start_time: float):
 
 def main():
     import argparse
+    import os
     import warnings
 
     parser = argparse.ArgumentParser(description="GARIC train/test pipeline")
@@ -2883,27 +4530,23 @@ def main():
     parser.add_argument("--no-cache", action="store_true", help="Force recompute features (ignore cache)")
     args = parser.parse_args()
 
-    # Train mode: browser dashboard handles visuals, console shows logs/errors.
-    # Test mode: log to both console + file.
+    run_logs_dir = Path("logs")
+    run_logs_dir.mkdir(parents=True, exist_ok=True)
+    run_log_path = run_logs_dir / f"pipeline_{args.mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler("pipeline.log", mode="w", encoding="utf-8"),
+            logging.FileHandler(run_log_path, mode="w", encoding="utf-8"),
+        ],
+        force=True,
+    )
+    os.environ["GARIC_RUN_TAG"] = run_log_path.stem.replace("pipeline_", "", 1)
+    logger.info("Run log archive: %s", run_log_path.as_posix())
     if args.mode == "train":
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-            handlers=[
-                logging.StreamHandler(),
-                logging.FileHandler("pipeline.log", mode="w", encoding="utf-8"),
-            ],
-        )
         warnings.filterwarnings("ignore")  # suppress all warnings in train mode
-    else:
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-            handlers=[
-                logging.StreamHandler(),
-                logging.FileHandler("pipeline.log", mode="w", encoding="utf-8"),
-            ],
-        )
 
     if args.mode == "test":
         run_test_pipeline(args.config)

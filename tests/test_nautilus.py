@@ -17,7 +17,7 @@ from execution.nautilus.strategy import GaricNautilusStrategy
 
 
 def test_nautilus_feature_builder_outputs_compact_features():
-    n = 200
+    n = 420
     close = 100 + np.cumsum(np.random.randn(n) * 0.2)
     frame = pd.DataFrame(
         {
@@ -31,7 +31,7 @@ def test_nautilus_feature_builder_outputs_compact_features():
             "taker_buy_volume": np.random.uniform(5, 50, size=n),
         }
     )
-    builder = NautilusFeatureBuilder(history_bars=160)
+    builder = NautilusFeatureBuilder(history_bars=384)
     snapshot = builder.build_latest(frame)
     assert snapshot.feature_array.shape == (25,)
     assert np.isfinite(snapshot.feature_array).all()
@@ -39,7 +39,7 @@ def test_nautilus_feature_builder_outputs_compact_features():
 
 
 def test_nautilus_feature_builder_outputs_forecast_features_when_enabled():
-    n = 200
+    n = 420
     close = 100 + np.cumsum(np.random.randn(n) * 0.2)
     frame = pd.DataFrame(
         {
@@ -53,7 +53,7 @@ def test_nautilus_feature_builder_outputs_forecast_features_when_enabled():
             "taker_buy_volume": np.random.uniform(5, 50, size=n),
         }
     )
-    builder = NautilusFeatureBuilder(history_bars=160, include_forecast=True)
+    builder = NautilusFeatureBuilder(history_bars=384, include_forecast=True)
     snapshot = builder.build_latest(frame)
     assert snapshot.feature_array.shape == (30,)
     assert np.isfinite(snapshot.feature_array).all()
@@ -198,7 +198,7 @@ def test_nautilus_strategy_position_lifecycle_updates_trade_stats():
     strategy._n_wins = 0
     strategy._n_losses = 0
     strategy._latest_price = 0.0
-    strategy._last_realized_pnl = 0.0
+    strategy._publish_event_details = True
     strategy._seen_event_ids = set()
     events = []
     strategy._publish_runtime_state = lambda **kwargs: events.append(kwargs.get("event"))
@@ -238,36 +238,78 @@ def test_nautilus_strategy_position_lifecycle_updates_trade_stats():
         },
     )()
 
-    GaricNautilusStrategy.on_event(strategy, opened)
-    GaricNautilusStrategy._sync_trade_counters(
-        strategy,
-        previous_position=0.0,
-        current_position=-1.0,
-        realized_pnl_after=-0.5,
-    )
-    GaricNautilusStrategy.on_event(strategy, win_closed)
-    GaricNautilusStrategy._sync_trade_counters(
-        strategy,
-        previous_position=-1.0,
-        current_position=0.0,
-        realized_pnl_after=12.5,
-    )
-    GaricNautilusStrategy._sync_trade_counters(
-        strategy,
-        previous_position=0.0,
-        current_position=1.0,
-        realized_pnl_after=12.0,
-    )
-    GaricNautilusStrategy.on_event(strategy, loss_closed)
-    GaricNautilusStrategy._sync_trade_counters(
-        strategy,
-        previous_position=1.0,
-        current_position=0.0,
-        realized_pnl_after=9.25,
-    )
+    GaricNautilusStrategy.on_position_opened(strategy, opened)
+    GaricNautilusStrategy.on_position_closed(strategy, win_closed)
+    GaricNautilusStrategy.on_position_opened(strategy, opened)
+    GaricNautilusStrategy.on_position_closed(strategy, loss_closed)
 
     assert strategy._n_trades == 2
     assert strategy._n_wins == 1
     assert strategy._n_losses == 1
     assert any("Position opened" in str(msg) for msg in events)
     assert any("Position closed" in str(msg) for msg in events)
+
+
+def test_nautilus_strategy_suppresses_event_details_when_disabled():
+    strategy = GaricNautilusStrategy.__new__(GaricNautilusStrategy)
+    strategy._n_trades = 0
+    strategy._n_wins = 0
+    strategy._n_losses = 0
+    strategy._latest_price = 100.0
+    strategy._publish_event_details = False
+    strategy._seen_event_ids = set()
+    strategy._safe_float = GaricNautilusStrategy._safe_float.__get__(strategy, GaricNautilusStrategy)
+    published = []
+    strategy._publish_runtime_state = lambda **kwargs: published.append(kwargs)
+
+    filled = type(
+        "OrderFilled",
+        (),
+        {
+            "id": "evt-1",
+            "last_px": 101.0,
+            "last_qty": 0.002,
+            "is_buy": True,
+            "is_sell": False,
+        },
+    )()
+    opened = type(
+        "PositionOpened",
+        (),
+        {
+            "last_px": 101.5,
+            "side": SimpleNamespace(value="LONG"),
+            "signed_qty": 0.002,
+            "realized_pnl": 0.0,
+            "realized_return": 0.0,
+        },
+    )()
+    closed = type(
+        "PositionClosed",
+        (),
+        {
+            "last_px": 103.0,
+            "realized_pnl": 4.0,
+            "realized_return": 0.01,
+            "side": SimpleNamespace(value="FLAT"),
+            "signed_qty": 0.0,
+        },
+    )()
+
+    GaricNautilusStrategy.on_event(strategy, filled)
+    GaricNautilusStrategy.on_position_opened(strategy, opened)
+    GaricNautilusStrategy.on_position_closed(strategy, closed)
+
+    assert strategy._n_trades == 1
+    assert strategy._n_wins == 1
+    assert strategy._n_losses == 0
+    assert published == []
+
+
+def test_nautilus_strategy_state_publish_interval():
+    strategy = GaricNautilusStrategy.__new__(GaricNautilusStrategy)
+    strategy._state_update_interval_bars = 4
+    strategy._bar_counter = 3
+    assert GaricNautilusStrategy._should_publish_bar_state(strategy) is False
+    strategy._bar_counter = 4
+    assert GaricNautilusStrategy._should_publish_bar_state(strategy) is True

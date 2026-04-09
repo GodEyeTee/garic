@@ -8,6 +8,7 @@ Key fixes:
 """
 
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -966,39 +967,153 @@ class RLTrainer:
             matplotlib.use("Agg")
             import matplotlib.pyplot as plt
 
-            # Run one deterministic episode for chart
-            env = self.create_env(segment_range=self.test_range, balanced_sampling=False)
-            obs, _ = env.reset()
-            positions = []
-            while True:
-                action, _ = model.predict(obs, deterministic=True)
-                obs, r, t, tr, info = env.step(action)
-                positions.append(info["position"])
-                if t or tr:
-                    break
+            metrics_source = str(metrics.get("metrics_source", "env_eval"))
+            metrics_source_label = str(
+                metrics.get(
+                    "metrics_source_label",
+                    "Nautilus held-out test" if metrics_source == "nautilus_test" else "Env episodic eval",
+                )
+            )
+            nautilus_test = metrics.get("nautilus_test", {})
+            nautilus_history = nautilus_test.get("history", {}) if isinstance(nautilus_test, dict) else {}
+            use_nautilus_history = (
+                metrics_source == "nautilus_test"
+                and isinstance(nautilus_history, dict)
+                and len(nautilus_history.get("equity", [])) >= 2
+                and len(nautilus_history.get("price", [])) >= 2
+            )
 
-            equity = np.array(env.equity_curve)
-            start_idx = env._start
-            end_idx = start_idx + len(equity) - 1
-            bh_prices = self.price_series[start_idx:end_idx].astype(np.float64)
-            if len(bh_prices) >= 2:
-                bh_equity = np.concatenate((
-                    [env.initial_balance],
-                    env.initial_balance * bh_prices / bh_prices[0],
-                ))
-                bh_ret = bh_prices[-1] / bh_prices[0] - 1
+            chart_note = ""
+            if use_nautilus_history:
+                equity = np.asarray(nautilus_history.get("equity", []), dtype=np.float64)
+                positions = list(np.asarray(nautilus_history.get("position", []), dtype=np.float64))
+                bh_prices = np.asarray(nautilus_history.get("price", []), dtype=np.float64)
+                initial_balance = float(equity[0]) if equity.size else 10_000.0
+                if bh_prices.size >= 2 and bh_prices[0] > 0.0:
+                    bh_equity = initial_balance * bh_prices / bh_prices[0]
+                    bh_ret_proxy = float(bh_prices[-1] / bh_prices[0] - 1.0)
+                else:
+                    bh_equity = np.full(max(int(equity.size), 1), initial_balance, dtype=np.float64)
+                    bh_ret_proxy = 0.0
+                chart_note = f"Equity/position panels use {metrics_source_label.lower()} history."
             else:
-                bh_equity = np.full(max(len(equity), 1), env.initial_balance, dtype=np.float64)
-                bh_ret = 0.0
+                # Run one deterministic episode for chart proxy
+                env = self.create_env(segment_range=self.test_range, balanced_sampling=False)
+                obs, _ = env.reset()
+                positions = []
+                while True:
+                    action, _ = model.predict(obs, deterministic=True)
+                    obs, r, t, tr, info = env.step(action)
+                    positions.append(info["position"])
+                    if t or tr:
+                        break
+
+                equity = np.array(env.equity_curve)
+                start_idx = env._start
+                end_idx = start_idx + len(equity) - 1
+                bh_prices = self.price_series[start_idx:end_idx].astype(np.float64)
+                if len(bh_prices) >= 2:
+                    bh_equity = np.concatenate((
+                        [env.initial_balance],
+                        env.initial_balance * bh_prices / bh_prices[0],
+                    ))
+                    bh_ret_proxy = float(bh_prices[-1] / bh_prices[0] - 1.0)
+                else:
+                    bh_equity = np.full(max(len(equity), 1), env.initial_balance, dtype=np.float64)
+                    bh_ret_proxy = 0.0
+                if metrics_source == "nautilus_test":
+                    chart_note = (
+                        "Performance table and return bars use Nautilus held-out test. "
+                        "Equity/position panels remain an env proxy rollout for visualization."
+                    )
+                else:
+                    chart_note = "Equity/position panels and performance table use env episodic evaluation."
+
+            bh_ret_display = float(metrics.get("bh_eval_return", bh_ret_proxy))
 
             fig, axes = plt.subplots(3, 2, figsize=(16, 12))
-            fig.suptitle(f"GARIC Training Results — {len(equity)} steps", fontsize=14, fontweight="bold")
+            model_family = str(metrics.get("model_family", "unknown"))
+            selection_mode = str(metrics.get("selection_mode", "unknown"))
+            selection_reason = str(metrics.get("selection_reason", ""))
+            fig.suptitle(
+                f"GARIC Training Results - {len(equity)} steps\n"
+                f"Selected model: {model_family} ({selection_mode})",
+                fontsize=14,
+                fontweight="bold",
+            )
+            fig.text(
+                0.5,
+                0.955,
+                f"Metrics source: {metrics_source_label}",
+                ha="center",
+                va="top",
+                fontsize=9,
+                color="#334155",
+            )
+            nautilus_validation = metrics.get("nautilus_validation", {})
+            if model_family == "safe_flat":
+                if selection_reason == "no_supervised_candidate":
+                    rejected_text = (
+                        "Safe-flat fallback: no supervised candidate survived fast-env validation.\n"
+                        "The chart shows a defensive flat policy, not an active trading model."
+                    )
+                elif isinstance(nautilus_validation, dict) and isinstance(nautilus_validation.get("skipped"), str):
+                    rejected_text = (
+                        "Safe-flat fallback: no candidate reached execution-grade validation.\n"
+                        f"Last selector state: {nautilus_validation.get('skipped')}"
+                    )
+                elif isinstance(nautilus_validation, dict) and nautilus_validation:
+                    rejected_text = (
+                        "Safe-flat fallback: Nautilus rejected the best supervised candidate.\n"
+                        f"Candidate {nautilus_validation.get('segment_label', 'unknown')} | "
+                        f"net {float(nautilus_validation.get('total_return', 0.0)):.2%} | "
+                        f"gross {float(nautilus_validation.get('gross_total_return', 0.0)):.2%} | "
+                        f"alpha {float(nautilus_validation.get('outperformance_vs_bh', 0.0)):.2%} | "
+                        f"trades {float(nautilus_validation.get('n_trades', 0.0)):.0f} | "
+                        f"dom {float(nautilus_validation.get('eval_dominant_action_ratio', 0.0)):.2%}"
+                    )
+                else:
+                    rejected_text = (
+                        "Safe-flat fallback: the selector did not approve any active trading candidate."
+                    )
+                fig.text(
+                    0.5,
+                    0.935,
+                    rejected_text,
+                    ha="center",
+                    va="top",
+                    fontsize=9,
+                    color="firebrick",
+                    bbox={
+                        "facecolor": "#fff5f5",
+                        "edgecolor": "firebrick",
+                        "boxstyle": "round,pad=0.35",
+                    },
+                )
+            elif chart_note:
+                fig.text(
+                    0.5,
+                    0.935,
+                    chart_note,
+                    ha="center",
+                    va="top",
+                    fontsize=9,
+                    color="#475569",
+                    bbox={
+                        "facecolor": "#f8fafc",
+                        "edgecolor": "#cbd5e1",
+                        "boxstyle": "round,pad=0.30",
+                    },
+                )
 
             # 1. RL vs Buy&Hold Equity
             ax = axes[0, 0]
             ax.plot(equity, label=f"RL Agent ({metrics.get('total_return', 0):.1%})", linewidth=1)
-            ax.plot(bh_equity, label=f"Buy & Hold ({bh_ret:.1%})", linewidth=1, alpha=0.7)
-            ax.set_title("Equity: RL Agent vs Buy & Hold")
+            ax.plot(bh_equity, label=f"Buy & Hold ({bh_ret_display:.1%})", linewidth=1, alpha=0.7)
+            ax.set_title(
+                "Equity: RL Agent vs Buy & Hold"
+                + (f" ({metrics_source_label})" if use_nautilus_history else " (env proxy)")
+            )
             ax.legend()
             ax.set_ylabel("Balance ($)")
 
@@ -1014,7 +1129,10 @@ class RLTrainer:
             # 3. Position over time
             ax = axes[1, 0]
             ax.plot(positions, linewidth=0.5, alpha=0.8)
-            ax.set_title(f"Position History (Trades: {metrics.get('n_trades', 0):.0f})")
+            ax.set_title(
+                f"Position History (Trades: {metrics.get('n_trades', 0):.0f})"
+                + ("" if use_nautilus_history else " [env proxy]")
+            )
             ax.set_ylabel("Position")
             ax.axhline(y=0, color="gray", linestyle="--", alpha=0.3)
 
@@ -1022,6 +1140,10 @@ class RLTrainer:
             ax = axes[1, 1]
             ax.axis("off")
             table_data = [
+                ["Source", metrics_source_label],
+                ["Model", model_family],
+                ["Selection", selection_mode],
+                ["Reason", selection_reason or "-"],
                 ["Sharpe", f"{metrics.get('sharpe', 0):.3f}"],
                 ["Sortino", f"{metrics.get('sortino', 0):.3f}"],
                 ["Net Return", f"{metrics.get('total_return', 0):.2%}"],
@@ -1040,7 +1162,11 @@ class RLTrainer:
             tbl.auto_set_font_size(False)
             tbl.set_fontsize(10)
             tbl.scale(1, 1.4)
-            ax.set_title("Performance Metrics (avg 10 episodes)")
+            ax.set_title(
+                "Performance Metrics (Nautilus held-out test)"
+                if metrics_source == "nautilus_test"
+                else "Performance Metrics (avg 10 episodes)"
+            )
 
             # 5. Returns distribution
             ax = axes[2, 0]
@@ -1054,7 +1180,7 @@ class RLTrainer:
             # 6. RL vs B&H comparison bar
             ax = axes[2, 1]
             rl_ret = metrics.get("total_return", 0) * 100
-            bh_ret = bh_ret * 100
+            bh_ret = bh_ret_display * 100
             colors = ["green" if rl_ret > 0 else "red", "gray"]
             ax.bar(["RL Agent", "Buy & Hold"], [rl_ret, bh_ret], color=colors, alpha=0.8)
             ax.set_title("Return Comparison (%)")
@@ -1062,10 +1188,17 @@ class RLTrainer:
             for i, v in enumerate([rl_ret, bh_ret]):
                 ax.text(i, v + (1 if v >= 0 else -3), f"{v:.1f}%", ha="center", fontweight="bold")
 
-            plt.tight_layout()
-            path = "checkpoints/training_results.png"
+            plt.tight_layout(rect=[0, 0, 1, 0.90])
+            path = Path("checkpoints/training_results.png")
             plt.savefig(path, dpi=150, bbox_inches="tight")
+            run_tag = str(os.environ.get("GARIC_RUN_TAG", "")).strip()
+            if run_tag:
+                archive_dir = Path("logs")
+                archive_dir.mkdir(parents=True, exist_ok=True)
+                archive_path = archive_dir / f"training_results_{run_tag}.png"
+                plt.savefig(archive_path, dpi=150, bbox_inches="tight")
+                logger.info("Chart archive saved -> %s", archive_path.as_posix())
             plt.close()
-            logger.info(f"Chart saved → {path}")
+            logger.info("Chart saved -> %s", path.as_posix())
         except Exception as e:
             logger.warning(f"Chart failed: {e}")

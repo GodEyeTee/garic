@@ -31,12 +31,18 @@ class GaricNautilusStrategyConfig(StrategyConfig, frozen=True):
     trade_size: Decimal
     model_path: str
     state_path: str
-    history_bars: PositiveInt = 160
-    request_history_days: PositiveInt = 3
+    history_bars: PositiveInt = 384
+    request_history_days: PositiveInt = 8
     starting_balance: float = 10_000.0
     mode: str = "backtest"
+    trading_start_bar_index: int = 0
     close_positions_on_stop: bool = True
     reduce_only_on_stop: bool = True
+    monthly_server_cost_usd: float = 0.0
+    periods_per_day: PositiveInt = 96
+    state_update_interval_bars: PositiveInt = 1
+    publish_event_details: bool = True
+    publish_warmup_updates: bool = True
 
 
 class GaricNautilusStrategy(Strategy):
@@ -58,7 +64,6 @@ class GaricNautilusStrategy(Strategy):
         self._flat_steps = 0
         self._pos_steps = 0
         self._last_turnover = 0.0
-        self._last_realized_pnl = 0.0
         self._n_trades = 0
         self._n_wins = 0
         self._n_losses = 0
@@ -66,6 +71,14 @@ class GaricNautilusStrategy(Strategy):
         self._seen_event_ids: set[str] = set()
         self._peak_equity = float(config.starting_balance)
         self._max_drawdown = 0.0
+        self._server_cost_paid = 0.0
+        self._bar_counter = 0
+        self._trading_start_bar_index = max(int(config.trading_start_bar_index), 0)
+        self._state_update_interval_bars = max(int(config.state_update_interval_bars), 1)
+        self._publish_event_details = bool(config.publish_event_details)
+        self._publish_warmup_updates = bool(config.publish_warmup_updates)
+        periods_per_month = max(int(config.periods_per_day) * 30, 1)
+        self._server_cost_per_bar = float(max(float(config.monthly_server_cost_usd), 0.0)) / float(periods_per_month)
 
     def snapshot(self) -> dict:
         return {
@@ -78,6 +91,7 @@ class GaricNautilusStrategy(Strategy):
             "model_family": self.model.model_family,
             "model_path": str(self.model.model_path).replace("\\", "/"),
             "max_drawdown": float(self._max_drawdown),
+            "server_cost_paid": float(self._server_cost_paid),
         }
 
     def on_start(self) -> None:
@@ -113,6 +127,7 @@ class GaricNautilusStrategy(Strategy):
         if self._last_bar_ts_event == bar.ts_event:
             return
         self._last_bar_ts_event = int(bar.ts_event)
+        self._bar_counter += 1
 
         row = {
             "open_time": pd.Timestamp(bar.ts_event, unit="ns", tz="UTC"),
@@ -124,21 +139,23 @@ class GaricNautilusStrategy(Strategy):
         }
         self._latest_price = row["close"]
         self._bars.append(row)
+        prepared_bar_index = self._bar_counter - 1
 
-        if len(self._bars) < self.features.warmup_bars:
-            self.state_writer.update(
-                status="WARMUP",
-                warmup_progress=len(self._bars),
-                warmup_target=self.features.warmup_bars,
-                recent_price=row["close"],
-                history={
-                    "ts": int(bar.ts_event),
-                    "price": row["close"],
-                    "equity": self.config.starting_balance,
-                    "position": 0.0,
-                    "upnl": 0.0,
-                },
-            )
+        if len(self._bars) < self.features.warmup_bars or prepared_bar_index < self._trading_start_bar_index:
+            if self._publish_warmup_updates and self._should_publish_bar_state():
+                self.state_writer.update(
+                    status="WARMUP",
+                    warmup_progress=min(prepared_bar_index + 1, self._trading_start_bar_index + 1),
+                    warmup_target=max(self.features.warmup_bars, self._trading_start_bar_index + 1),
+                    recent_price=row["close"],
+                    history={
+                        "ts": int(bar.ts_event),
+                        "price": row["close"],
+                        "equity": self.config.starting_balance,
+                        "position": 0.0,
+                        "upnl": 0.0,
+                    },
+                )
             return
 
         frame = pd.DataFrame(list(self._bars))
@@ -153,7 +170,7 @@ class GaricNautilusStrategy(Strategy):
 
         upnl = self._portfolio_pnl("unrealized", snapshot.latest_price)
         total_pnl = self._portfolio_pnl("total", snapshot.latest_price)
-        equity = float(self.config.starting_balance) + total_pnl
+        equity = self._effective_equity(total_pnl)
         self._peak_equity = max(self._peak_equity, equity)
         drawdown = 0.0
         if self._peak_equity > 0:
@@ -177,23 +194,19 @@ class GaricNautilusStrategy(Strategy):
         self._last_confidence = prediction.confidence
         self._last_probabilities = dict(prediction.probabilities)
         post_position = self._current_position_state()
-        realized_after = self._portfolio_pnl("realized", snapshot.latest_price)
-        self._sync_trade_counters(
-            previous_position=current_position,
-            current_position=post_position,
-            realized_pnl_after=realized_after,
-        )
-        self._publish_runtime_state(
-            status="RUNNING",
-            price=snapshot.latest_price,
-            history={
-                "ts": int(bar.ts_event),
-                "price": snapshot.latest_price,
-                "equity": equity,
-                "position": post_position,
-                "upnl": upnl,
-            },
-        )
+        if self._should_publish_bar_state():
+            self._publish_runtime_state(
+                status="RUNNING",
+                price=snapshot.latest_price,
+                history={
+                    "ts": int(bar.ts_event),
+                    "price": snapshot.latest_price,
+                    "equity": equity,
+                    "position": post_position,
+                    "upnl": upnl,
+                },
+            )
+        self._advance_server_cost()
 
     def on_stop(self) -> None:
         self.cancel_all_orders(self.config.instrument_id)
@@ -207,6 +220,8 @@ class GaricNautilusStrategy(Strategy):
         self.state_writer.update(status="STOPPED", event="Strategy stopped")
 
     def on_event(self, event) -> None:
+        if not self._publish_event_details:
+            return
         event_name = type(event).__name__
         event_id = getattr(event, "id", None) or getattr(event, "event_id", None)
         event_key = (
@@ -228,25 +243,23 @@ class GaricNautilusStrategy(Strategy):
             )
             return
 
-        if event_name not in {"PositionOpened", "PositionChanged", "PositionClosed"}:
-            return
+    def on_position_opened(self, event) -> None:
+        self._n_trades += 1
+        if self._publish_event_details:
+            self._publish_position_event(event, "PositionOpened")
 
+    def on_position_changed(self, event) -> None:
+        if self._publish_event_details:
+            self._publish_position_event(event, "PositionChanged")
+
+    def on_position_closed(self, event) -> None:
         realized_pnl = self._safe_float(getattr(event, "realized_pnl", 0.0))
-        realized_return = self._safe_float(getattr(event, "realized_return", 0.0))
-        side = getattr(getattr(event, "side", None), "value", str(getattr(event, "side", "")))
-        qty = self._safe_float(getattr(event, "signed_qty", 0.0))
-
-        if event_name == "PositionOpened":
-            message = f"Position opened: {side} {qty:+.4f} @ {price:,.2f}"
-        elif event_name == "PositionClosed":
-            message = f"Position closed: PnL {realized_pnl:+.2f} ({realized_return:+.2%})"
-        else:
-            message = f"Position changed: realized PnL {realized_pnl:+.2f}"
-
-        self._publish_runtime_state(
-            price=price,
-            event=message,
-        )
+        if realized_pnl > 0:
+            self._n_wins += 1
+        elif realized_pnl < 0:
+            self._n_losses += 1
+        if self._publish_event_details:
+            self._publish_position_event(event, "PositionClosed")
 
     def _record_action(self, direction: float) -> None:
         if direction > 0:
@@ -301,10 +314,11 @@ class GaricNautilusStrategy(Strategy):
         elif desired_direction < 0:
             self._submit_market(OrderSide.SELL)
         else:
-            self._publish_runtime_state(
-                price=price,
-                event="Flattening position",
-            )
+            if self._publish_event_details:
+                self._publish_runtime_state(
+                    price=price,
+                    event="Flattening position",
+                )
 
     def _rolling_volatility(self, frame: pd.DataFrame, window: int = 32) -> float:
         closes = frame["close"].astype(float).to_numpy()[-(max(int(window), 1) + 1):]
@@ -323,37 +337,44 @@ class GaricNautilusStrategy(Strategy):
             time_in_force=TimeInForce.GTC,
         )
         self.submit_order(order)
-        self.log.info(f"Submitted {side.value} market order", color=LogColor.CYAN)
+        if self._publish_event_details:
+            self.log.info(f"Submitted {side.value} market order", color=LogColor.CYAN)
+
+    def _should_publish_bar_state(self) -> bool:
+        if self._state_update_interval_bars <= 1:
+            return True
+        return (self._bar_counter % self._state_update_interval_bars) == 0
 
     def _order_qty(self) -> Quantity:
         if self.instrument is not None:
             return self.instrument.make_qty(self.config.trade_size)
         return Quantity.from_str(str(self.config.trade_size))
 
-    def _sync_trade_counters(
-        self,
-        *,
-        previous_position: float,
-        current_position: float,
-        realized_pnl_after: float,
-    ) -> None:
-        realized_delta = float(realized_pnl_after - self._last_realized_pnl)
+    def _effective_equity(self, total_pnl: float) -> float:
+        return float(self.config.starting_balance) + float(total_pnl) - float(self._server_cost_paid)
 
-        if previous_position == 0.0 and current_position != 0.0:
-            self._n_trades += 1
-        elif previous_position != 0.0 and current_position == 0.0:
-            if realized_delta > 0:
-                self._n_wins += 1
-            elif realized_delta < 0:
-                self._n_losses += 1
-        elif previous_position != 0.0 and current_position != 0.0 and previous_position != current_position:
-            if realized_delta > 0:
-                self._n_wins += 1
-            elif realized_delta < 0:
-                self._n_losses += 1
-            self._n_trades += 1
+    def _advance_server_cost(self) -> None:
+        if self._server_cost_per_bar > 0.0:
+            self._server_cost_paid += self._server_cost_per_bar
 
-        self._last_realized_pnl = float(realized_pnl_after)
+    def _publish_position_event(self, event, event_name: str) -> None:
+        price = self._safe_float(getattr(event, "last_px", 0.0)) or self._latest_price
+        realized_pnl = self._safe_float(getattr(event, "realized_pnl", 0.0))
+        realized_return = self._safe_float(getattr(event, "realized_return", 0.0))
+        side = getattr(getattr(event, "side", None), "value", str(getattr(event, "side", "")))
+        qty = self._safe_float(getattr(event, "signed_qty", 0.0))
+
+        if event_name == "PositionOpened":
+            message = f"Position opened: {side} {qty:+.4f} @ {price:,.2f}"
+        elif event_name == "PositionClosed":
+            message = f"Position closed: PnL {realized_pnl:+.2f} ({realized_return:+.2%})"
+        else:
+            message = f"Position changed: realized PnL {realized_pnl:+.2f}"
+
+        self._publish_runtime_state(
+            price=price,
+            event=message,
+        )
 
     def _publish_runtime_state(
         self,
@@ -367,7 +388,7 @@ class GaricNautilusStrategy(Strategy):
         current_position = self._current_position_state() if mark_price else 0.0
         upnl = self._portfolio_pnl("unrealized", mark_price) if mark_price else 0.0
         total_pnl = self._portfolio_pnl("total", mark_price) if mark_price else 0.0
-        equity = float(self.config.starting_balance) + total_pnl
+        equity = self._effective_equity(total_pnl)
         self.state_writer.update(
             status=status or self.state_writer.state.get("status", "RUNNING"),
             recent_price=mark_price,
@@ -380,6 +401,7 @@ class GaricNautilusStrategy(Strategy):
             unrealized_pnl=upnl,
             equity=equity,
             total_return=(equity / max(float(self.config.starting_balance), 1e-9)) - 1.0,
+            server_cost_paid=float(self._server_cost_paid),
             n_trades=self._n_trades,
             n_wins=self._n_wins,
             n_losses=self._n_losses,

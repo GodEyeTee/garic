@@ -12,7 +12,9 @@ import numpy as np
 import pandas as pd
 
 try:
+    from nautilus_trader.backtest.config import BacktestEngineConfig
     from nautilus_trader.backtest.engine import BacktestEngine
+    from nautilus_trader.common.config import LoggingConfig
     from nautilus_trader.core.datetime import dt_to_unix_nanos
     from nautilus_trader.model.currencies import USDT
     from nautilus_trader.model.data import Bar
@@ -28,7 +30,9 @@ try:
     from nautilus_trader.test_kit.providers import TestInstrumentProvider
     _NAUTILUS_IMPORT_ERROR: Exception | None = None
 except ModuleNotFoundError as exc:
+    BacktestEngineConfig = None  # type: ignore[assignment]
     BacktestEngine = None  # type: ignore[assignment]
+    LoggingConfig = None  # type: ignore[assignment]
     dt_to_unix_nanos = None  # type: ignore[assignment]
     USDT = None  # type: ignore[assignment]
     Bar = Any  # type: ignore[assignment]
@@ -307,17 +311,23 @@ def run_backtest_frame(
     model_path: str,
     venue: str = "BINANCE",
     bar_minutes: int = 15,
-    history_bars: int = 160,
-    request_history_days: int = 3,
+    history_bars: int = 384,
+    request_history_days: int = 8,
     trade_size: str = "0.002",
     initial_balance_usdt: float = 10_000.0,
     leverage: float = 1.0,
     state_path: str = "checkpoints/nautilus_dashboard_state.json",
     mode: str = "backtest",
+    trading_start_bar_index: int = 0,
     close_positions_on_stop: bool = True,
     reduce_only_on_stop: bool = True,
     monthly_server_cost_usd: float = 100.0,
     periods_per_day: int = 96,
+    log_level: str = "ERROR",
+    bypass_logging: bool = False,
+    state_update_interval_bars: int = 1,
+    publish_event_details: bool = True,
+    publish_warmup_updates: bool = True,
 ) -> dict:
     _require_nautilus()
     prepared = _prepare_15m_frame(frame_15m, bar_minutes)
@@ -344,12 +354,25 @@ def run_backtest_frame(
             request_history_days=max(int(request_history_days), 1),
             starting_balance=float(initial_balance_usdt),
             mode=mode,
+            trading_start_bar_index=max(int(trading_start_bar_index), 0),
             close_positions_on_stop=bool(close_positions_on_stop),
             reduce_only_on_stop=bool(reduce_only_on_stop),
+            monthly_server_cost_usd=float(monthly_server_cost_usd),
+            periods_per_day=max(int(periods_per_day), 1),
+            state_update_interval_bars=max(int(state_update_interval_bars), 1),
+            publish_event_details=bool(publish_event_details),
+            publish_warmup_updates=bool(publish_warmup_updates),
         )
     )
 
-    engine = BacktestEngine()
+    engine_config = BacktestEngineConfig(
+        logging=LoggingConfig(
+            log_level=str(log_level).upper(),
+            bypass_logging=bool(bypass_logging),
+            log_colors=False,
+        ),
+    )
+    engine = BacktestEngine(config=engine_config)
     try:
         engine.add_venue(
             venue=Venue(venue),
@@ -444,10 +467,16 @@ def run_backtest(config_path: str | None = None, limit_bars: int | None = None) 
         leverage=cfg["leverage"],
         state_path=cfg["state_path"],
         mode="backtest",
+        trading_start_bar_index=0,
         close_positions_on_stop=cfg["close_positions_on_stop"],
         reduce_only_on_stop=cfg["reduce_only_on_stop"],
         monthly_server_cost_usd=cfg.get("monthly_server_cost_usd", 100.0),
         periods_per_day=cfg.get("periods_per_day", 96),
+        log_level=cfg.get("backtest_log_level", "INFO"),
+        bypass_logging=bool(cfg.get("backtest_bypass_logging", False)),
+        state_update_interval_bars=int(cfg.get("backtest_state_update_interval_bars", 1)),
+        publish_event_details=bool(cfg.get("backtest_publish_event_details", True)),
+        publish_warmup_updates=bool(cfg.get("backtest_publish_warmup_updates", True)),
     )
 
 
@@ -467,18 +496,28 @@ def main() -> int:
     parser.add_argument("--leverage", type=float, default=1.0)
     parser.add_argument("--state-path", default="checkpoints/nautilus_dashboard_state.json")
     parser.add_argument("--mode", default="backtest")
+    parser.add_argument("--trading-start-bar-index", type=int, default=0)
     parser.add_argument("--monthly-server-cost-usd", type=float, default=100.0)
     parser.add_argument("--periods-per-day", type=int, default=96)
     parser.add_argument("--summary-json", default=None)
+    parser.add_argument("--log-path", default="nautilus.log")
+    parser.add_argument("--log-level", default="INFO")
+    parser.add_argument("--bypass-logging", action="store_true")
+    parser.add_argument("--state-update-interval-bars", type=int, default=1)
+    parser.add_argument("--publish-event-details", action="store_true")
+    parser.add_argument("--publish-warmup-updates", action="store_true")
     args = parser.parse_args()
+
+    handlers = [
+        logging.FileHandler(str(args.log_path), mode="w", encoding="utf-8"),
+    ]
+    if not args.summary_json:
+        handlers.append(logging.StreamHandler())
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler("nautilus.log", mode="w", encoding="utf-8"),
-        ],
+        handlers=handlers,
     )
     if args.frame_parquet:
         frame = pd.read_parquet(args.frame_parquet)
@@ -495,8 +534,14 @@ def main() -> int:
             leverage=float(args.leverage),
             state_path=str(args.state_path),
             mode=str(args.mode),
+            trading_start_bar_index=int(args.trading_start_bar_index),
             monthly_server_cost_usd=float(args.monthly_server_cost_usd),
             periods_per_day=int(args.periods_per_day),
+            log_level=str(args.log_level),
+            bypass_logging=bool(args.bypass_logging),
+            state_update_interval_bars=int(args.state_update_interval_bars),
+            publish_event_details=bool(args.publish_event_details),
+            publish_warmup_updates=bool(args.publish_warmup_updates),
         )
         if args.summary_json:
             with open(args.summary_json, "w", encoding="utf-8") as f:

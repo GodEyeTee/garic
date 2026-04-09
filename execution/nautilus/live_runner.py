@@ -130,6 +130,8 @@ def run_live(mode: str, config_path: str | None = None) -> None:
             mode=mode,
             close_positions_on_stop=bool(cfg["close_positions_on_stop"]),
             reduce_only_on_stop=bool(cfg["reduce_only_on_stop"]),
+            monthly_server_cost_usd=float(cfg.get("monthly_server_cost_usd", 0.0)),
+            periods_per_day=max(int(cfg.get("periods_per_day", 96)), 1),
         )
     )
     node.trader.add_strategy(strategy)

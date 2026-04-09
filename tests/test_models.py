@@ -388,6 +388,153 @@ class TestSupervisedFallback:
         action, _ = model.predict(features)
         assert action == ACTION_LONG
 
+    def test_policy_relaxes_aligned_entry_after_extended_flat_patience(self):
+        from models.rl.environment import build_agent_state
+        from models.rl.supervised import ACTION_LONG, SupervisedActionModel
+
+        class DummyClassifier:
+            classes_ = np.array([0, 1, 2], dtype=np.int32)
+
+            def predict_proba(self, x):
+                return np.array([[0.05, 0.76, 0.80]], dtype=np.float32)
+
+        features = np.zeros(20, dtype=np.float32)
+        features[2] = 0.004
+        features[3] = 0.007
+        features[4] = 0.010
+        features[18] = 0.998
+        features[19] = 0.997
+        obs = np.concatenate(
+            [
+                features,
+                build_agent_state(
+                    position=0.0,
+                    upnl=0.0,
+                    equity_ratio=0.0,
+                    drawdown=0.0,
+                    rolling_volatility=0.01,
+                    turnover_last_step=0.0,
+                    flat_steps=72,
+                    pos_steps=0,
+                ),
+            ]
+        ).astype(np.float32)
+
+        model = SupervisedActionModel(
+            scaler=None,
+            classifier=DummyClassifier(),
+            feature_dim=20,
+            confidence_threshold=0.82,
+            min_hold_steps=4,
+            reversal_margin=0.08,
+            entry_margin=0.04,
+            exit_to_flat_margin=0.05,
+            max_hold_steps=32,
+            stop_loss_threshold=-0.012,
+            drawdown_exit_threshold=0.04,
+            trend_alignment_threshold=0.0015,
+            countertrend_margin=0.08,
+            metadata={
+                "post_cost_calibration": {
+                    "long": {
+                        "global": {"mean_edge": 0.0020, "positive_rate": 0.70},
+                        "thresholds": [],
+                    },
+                    "short": {
+                        "global": {"mean_edge": -0.0010, "positive_rate": 0.30},
+                        "thresholds": [],
+                    },
+                },
+                "flat_patience_steps": 48,
+                "flat_patience_threshold_relief": 0.03,
+                "flat_patience_entry_margin_relief": 0.02,
+            },
+            long_confidence_threshold=0.82,
+            short_confidence_threshold=0.84,
+            regime_confidence_relief=0.0,
+            flat_reentry_cooldown_steps=0,
+            meta_label_min_edge=0.0005,
+            meta_label_edge_margin=0.0002,
+            meta_label_exit_edge=0.0,
+            meta_label_min_positive_rate=0.47,
+        )
+
+        action, _ = model.predict(obs)
+        assert action == ACTION_LONG
+
+    def test_policy_blocks_countertrend_short_with_regime_penalty(self):
+        from models.rl.environment import build_agent_state
+        from models.rl.supervised import ACTION_FLAT, SupervisedActionModel
+
+        class DummyClassifier:
+            classes_ = np.array([0, 1, 2], dtype=np.int32)
+
+            def predict_proba(self, x):
+                return np.array([[0.84, 0.79, 0.10]], dtype=np.float32)
+
+        features = np.zeros(20, dtype=np.float32)
+        features[2] = 0.004
+        features[3] = 0.007
+        features[4] = 0.010
+        features[18] = 0.998
+        features[19] = 0.997
+        obs = np.concatenate(
+            [
+                features,
+                build_agent_state(
+                    position=0.0,
+                    upnl=0.0,
+                    equity_ratio=0.0,
+                    drawdown=0.0,
+                    rolling_volatility=0.01,
+                    turnover_last_step=0.0,
+                    flat_steps=80,
+                    pos_steps=0,
+                ),
+            ]
+        ).astype(np.float32)
+
+        model = SupervisedActionModel(
+            scaler=None,
+            classifier=DummyClassifier(),
+            feature_dim=20,
+            confidence_threshold=0.82,
+            min_hold_steps=4,
+            reversal_margin=0.08,
+            entry_margin=0.02,
+            exit_to_flat_margin=0.05,
+            max_hold_steps=32,
+            stop_loss_threshold=-0.012,
+            drawdown_exit_threshold=0.04,
+            trend_alignment_threshold=0.0015,
+            countertrend_margin=0.08,
+            metadata={
+                "post_cost_calibration": {
+                    "long": {
+                        "global": {"mean_edge": 0.0010, "positive_rate": 0.55},
+                        "thresholds": [],
+                    },
+                    "short": {
+                        "global": {"mean_edge": 0.0020, "positive_rate": 0.70},
+                        "thresholds": [],
+                    },
+                },
+                "countertrend_threshold_penalty": 0.04,
+                "countertrend_entry_penalty": 0.02,
+            },
+            long_confidence_threshold=0.82,
+            short_confidence_threshold=0.82,
+            regime_confidence_relief=0.0,
+            flat_reentry_cooldown_steps=0,
+            meta_label_min_edge=0.0005,
+            meta_label_edge_margin=0.0002,
+            meta_label_exit_edge=0.0,
+            meta_label_min_positive_rate=0.47,
+        )
+
+        action, _ = model.predict(obs)
+        assert action == ACTION_FLAT
+
     def test_train_supervised_model_reports_validation_brier(self):
         from models.rl.supervised import train_supervised_action_model
 
@@ -428,6 +575,11 @@ class TestSupervisedFallback:
         assert "validation_brier" in meta
         assert np.isfinite(meta["validation_brier"])
         assert meta["validation_brier"] >= 0.0
+        assert "post_cost_calibration" in meta
+        assert "long" in meta["post_cost_calibration"]
+        assert "short" in meta["post_cost_calibration"]
+        assert "robust_mean_edge" in meta["post_cost_calibration"]["long"]["global"]
+        assert "active_window_ratio" in meta["post_cost_calibration"]["short"]["global"]
 
     def test_policy_respects_flat_reentry_cooldown(self):
         from models.rl.environment import build_agent_state
@@ -476,6 +628,276 @@ class TestSupervisedFallback:
 
         action, _ = model.predict(obs)
         assert action == ACTION_FLAT
+
+    def test_policy_stays_flat_when_post_cost_edge_is_negative(self):
+        from models.rl.environment import build_agent_state
+        from models.rl.supervised import ACTION_FLAT, SupervisedActionModel
+
+        class DummyClassifier:
+            classes_ = np.array([0, 1, 2], dtype=np.int32)
+
+            def predict_proba(self, x):
+                return np.array([[0.06, 0.10, 0.84]], dtype=np.float32)
+
+        model = SupervisedActionModel(
+            scaler=None,
+            classifier=DummyClassifier(),
+            feature_dim=6,
+            confidence_threshold=0.80,
+            min_hold_steps=8,
+            reversal_margin=0.08,
+            entry_margin=0.08,
+            exit_to_flat_margin=0.05,
+            max_hold_steps=32,
+            stop_loss_threshold=-0.012,
+            drawdown_exit_threshold=0.04,
+            trend_alignment_threshold=0.0,
+            countertrend_margin=0.08,
+            metadata={
+                "post_cost_calibration": {
+                    "long": {
+                        "global": {"mean_edge": -0.0005, "positive_rate": 0.45},
+                        "thresholds": [
+                            {"threshold": 0.80, "mean_edge": -0.0012, "positive_rate": 0.42},
+                        ],
+                    },
+                    "short": {
+                        "global": {"mean_edge": -0.0006, "positive_rate": 0.44},
+                        "thresholds": [
+                            {"threshold": 0.80, "mean_edge": -0.0008, "positive_rate": 0.43},
+                        ],
+                    },
+                },
+            },
+            long_confidence_threshold=0.80,
+            short_confidence_threshold=0.84,
+            meta_label_min_edge=0.0005,
+            meta_label_edge_margin=0.0002,
+            meta_label_exit_edge=0.0,
+        )
+        obs = np.concatenate(
+            [
+                np.zeros(6, dtype=np.float32),
+                build_agent_state(
+                    position=0.0,
+                    upnl=0.0,
+                    equity_ratio=0.0,
+                    drawdown=0.0,
+                    rolling_volatility=0.0,
+                    turnover_last_step=0.0,
+                    flat_steps=10,
+                    pos_steps=0,
+                ),
+            ]
+        ).astype(np.float32)
+
+        action, _ = model.predict(obs)
+        assert action == ACTION_FLAT
+
+    def test_policy_enters_when_post_cost_edge_is_positive_enough(self):
+        from models.rl.environment import build_agent_state
+        from models.rl.supervised import ACTION_LONG, SupervisedActionModel
+
+        class DummyClassifier:
+            classes_ = np.array([0, 1, 2], dtype=np.int32)
+
+            def predict_proba(self, x):
+                return np.array([[0.05, 0.08, 0.87]], dtype=np.float32)
+
+        features = np.zeros(6, dtype=np.float32)
+        features[2] = 0.004
+        features[3] = 0.006
+        features[4] = 0.008
+        model = SupervisedActionModel(
+            scaler=None,
+            classifier=DummyClassifier(),
+            feature_dim=6,
+            confidence_threshold=0.80,
+            min_hold_steps=8,
+            reversal_margin=0.08,
+            entry_margin=0.08,
+            exit_to_flat_margin=0.05,
+            max_hold_steps=32,
+            stop_loss_threshold=-0.012,
+            drawdown_exit_threshold=0.04,
+            trend_alignment_threshold=0.001,
+            countertrend_margin=0.08,
+            metadata={
+                "post_cost_calibration": {
+                    "long": {
+                        "global": {"mean_edge": 0.0008, "positive_rate": 0.56},
+                        "thresholds": [
+                            {"threshold": 0.80, "mean_edge": 0.0021, "positive_rate": 0.67},
+                        ],
+                    },
+                    "short": {
+                        "global": {"mean_edge": -0.0004, "positive_rate": 0.46},
+                        "thresholds": [
+                            {"threshold": 0.80, "mean_edge": -0.0010, "positive_rate": 0.42},
+                        ],
+                    },
+                },
+            },
+            long_confidence_threshold=0.80,
+            short_confidence_threshold=0.84,
+            meta_label_min_edge=0.0005,
+            meta_label_edge_margin=0.0002,
+            meta_label_exit_edge=0.0,
+        )
+        obs = np.concatenate(
+            [
+                features,
+                build_agent_state(
+                    position=0.0,
+                    upnl=0.0,
+                    equity_ratio=0.0,
+                    drawdown=0.0,
+                    rolling_volatility=0.0,
+                    turnover_last_step=0.0,
+                    flat_steps=10,
+                    pos_steps=0,
+                ),
+            ]
+        ).astype(np.float32)
+
+        action, _ = model.predict(obs)
+        assert action == ACTION_LONG
+
+    def test_policy_damps_sparse_calibration_support(self):
+        from models.rl.environment import build_agent_state
+        from models.rl.supervised import ACTION_FLAT, SupervisedActionModel
+
+        class DummyClassifier:
+            classes_ = np.array([0, 1, 2], dtype=np.int32)
+
+            def predict_proba(self, x):
+                return np.array([[0.04, 0.10, 0.86]], dtype=np.float32)
+
+        features = np.zeros(6, dtype=np.float32)
+        features[2] = 0.006
+        features[3] = 0.007
+        features[4] = 0.009
+        model = SupervisedActionModel(
+            scaler=None,
+            classifier=DummyClassifier(),
+            feature_dim=6,
+            confidence_threshold=0.80,
+            min_hold_steps=8,
+            reversal_margin=0.08,
+            entry_margin=0.08,
+            exit_to_flat_margin=0.05,
+            max_hold_steps=32,
+            stop_loss_threshold=-0.012,
+            drawdown_exit_threshold=0.04,
+            trend_alignment_threshold=0.001,
+            countertrend_margin=0.08,
+            metadata={
+                "post_cost_calibration": {
+                    "long": {
+                        "global": {
+                            "mean_edge": 0.0012,
+                            "positive_rate": 0.62,
+                            "robust_mean_edge": 0.0012,
+                            "robust_positive_rate": 0.62,
+                            "active_window_ratio": 1.0,
+                        },
+                        "thresholds": [
+                            {
+                                "threshold": 0.80,
+                                "mean_edge": 0.0025,
+                                "positive_rate": 0.69,
+                                "robust_mean_edge": 0.0025,
+                                "robust_positive_rate": 0.69,
+                                "active_window_ratio": 0.25,
+                            },
+                        ],
+                    },
+                    "short": {
+                        "global": {
+                            "mean_edge": -0.0005,
+                            "positive_rate": 0.46,
+                            "robust_mean_edge": -0.0005,
+                            "robust_positive_rate": 0.46,
+                            "active_window_ratio": 1.0,
+                        },
+                        "thresholds": [],
+                    },
+                },
+            },
+            long_confidence_threshold=0.80,
+            short_confidence_threshold=0.84,
+            meta_label_min_edge=0.0008,
+            meta_label_edge_margin=0.0002,
+            meta_label_exit_edge=0.0,
+            meta_label_min_positive_rate=0.55,
+            calibration_min_active_window_ratio=0.50,
+        )
+        obs = np.concatenate(
+            [
+                features,
+                build_agent_state(
+                    position=0.0,
+                    upnl=0.0,
+                    equity_ratio=0.0,
+                    drawdown=0.0,
+                    rolling_volatility=0.0,
+                    turnover_last_step=0.0,
+                    flat_steps=10,
+                    pos_steps=0,
+                ),
+            ]
+        ).astype(np.float32)
+
+        action, _ = model.predict(obs)
+        assert action == ACTION_FLAT
+
+    def test_meta_label_calibration_round_trips(self, tmp_path):
+        from models.rl.supervised import SupervisedActionModel, TrendRuleClassifier
+
+        model = SupervisedActionModel(
+            scaler=None,
+            classifier=TrendRuleClassifier(feature_dim=6, entry_threshold=0.004, neutral_band=0.0015),
+            feature_dim=6,
+            confidence_threshold=0.80,
+            min_hold_steps=8,
+            reversal_margin=0.08,
+            entry_margin=0.08,
+            exit_to_flat_margin=0.05,
+            max_hold_steps=32,
+            stop_loss_threshold=-0.012,
+            drawdown_exit_threshold=0.04,
+            trend_alignment_threshold=0.001,
+            countertrend_margin=0.08,
+            metadata={
+                "post_cost_calibration": {
+                    "long": {
+                        "global": {"mean_edge": 0.0007, "positive_rate": 0.55},
+                        "thresholds": [{"threshold": 0.70, "mean_edge": 0.0015, "positive_rate": 0.61}],
+                    },
+                    "short": {
+                        "global": {"mean_edge": -0.0004, "positive_rate": 0.46},
+                        "thresholds": [{"threshold": 0.70, "mean_edge": -0.0009, "positive_rate": 0.43}],
+                    },
+                },
+            },
+            long_confidence_threshold=0.80,
+            short_confidence_threshold=0.84,
+            meta_label_min_edge=0.0008,
+            meta_label_edge_margin=0.0004,
+            meta_label_exit_edge=0.0001,
+            meta_label_min_positive_rate=0.47,
+            calibration_min_active_window_ratio=0.50,
+        )
+
+        saved_path = model.save(tmp_path / "meta_label_model.joblib")
+        loaded = SupervisedActionModel.load(saved_path)
+
+        assert loaded.meta_label_min_edge == pytest.approx(0.0008)
+        assert loaded.meta_label_edge_margin == pytest.approx(0.0004)
+        assert loaded.meta_label_exit_edge == pytest.approx(0.0001)
+        assert loaded.meta_label_min_positive_rate == pytest.approx(0.47)
+        assert loaded.calibration_min_active_window_ratio == pytest.approx(0.50)
+        assert loaded.metadata["post_cost_calibration"]["long"]["thresholds"][0]["mean_edge"] == pytest.approx(0.0015)
 
     def test_stateful_policy_holds_position_before_min_hold(self):
         from models.rl.environment import build_agent_state
@@ -581,6 +1003,9 @@ class TestSupervisedFallback:
         assert loaded.exit_to_flat_margin == pytest.approx(0.04)
         assert loaded.max_hold_steps == 64
         assert loaded.stop_loss_threshold == pytest.approx(-0.012)
+        assert "post_cost_calibration" in loaded.metadata
+        assert loaded.meta_label_min_edge == pytest.approx(0.0)
+        assert loaded.meta_label_edge_margin == pytest.approx(0.0)
 
     def test_build_constant_action_model_predicts_flat(self):
         from models.rl.supervised import ACTION_FLAT, build_constant_action_model

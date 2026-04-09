@@ -84,7 +84,7 @@ training:
     holdout_test_ratio: 0.20
     validation_ratio_within_train: 0.10
     selection_windows: 4
-    selection_min_window_bars: 2048
+    selection_min_window_bars: 256
     cpcv_splits: 4
     embargo_pct: 0.01
     n_trials_dsr: 1
@@ -92,44 +92,68 @@ training:
   supervised_fallback:
     enabled: true
     model_types: ["logreg"]
+    candidate_pool_size: 32
     recent_train_bars: 48000
     validation_episodes: 10
     validation_seed_runs: 4
+    validation_probe_seed_runs: 1
     validation_seed_stride: 500
-    min_selection_score: 0.25
+    min_selection_score: 0.15
     fallback_to_safe_flat: true
     horizon: 64
     min_return_threshold: 0.003
     threshold_quantile: 0.80
     max_train_samples: 80000
     logistic_c: 0.35
+    logistic_target_mode: "binary_meta"
+    logistic_multi_class: "ovr"
     extra_trees_n_estimators: 96
     extra_trees_max_depth: 10
     extra_trees_min_samples_leaf: 24
     min_hold_steps: 16
     max_hold_steps: 48
-    reversal_margin: 0.08
-    entry_margin: 0.10
-    exit_to_flat_margin: 0.06
+    reversal_margin: 0.07
+    entry_margin: 0.08
+    exit_to_flat_margin: 0.05
     stop_loss_threshold: -0.010
     drawdown_exit_threshold: 0.035
-    trend_alignment_threshold: 0.0015
-    countertrend_margin: 0.08
+    trend_alignment_threshold: 0.0012
+    countertrend_margin: 0.07
     relaxed_max_dominant_action_ratio: 0.99
     relaxed_min_avg_trades_per_episode: 0.5
     relaxed_min_action_entropy: 0.0
-    confidence_grid: [0.80, 0.82, 0.84]
-    long_confidence_grid: [0.80, 0.82, 0.84]
-    short_confidence_grid: [0.82, 0.84, 0.86]
-    regime_confidence_relief: 0.03
-    flat_reentry_cooldown_steps: 6
+    confidence_grid: [0.78, 0.80, 0.82, 0.84, 0.86]
+    long_confidence_grid: [0.78, 0.80, 0.82, 0.84, 0.86]
+    short_confidence_grid: [0.74, 0.76, 0.78, 0.80, 0.82, 0.84]
+    anchor_long_confidence_grid: [0.80, 0.82, 0.84, 0.86]
+    anchor_short_confidence_grid: [0.76, 0.78, 0.80, 0.82, 0.84]
+    exploration_long_confidence_grid: [0.72, 0.76, 0.80]
+    exploration_short_confidence_grid: [0.70, 0.74, 0.78, 0.80]
+    preserve_top_confidence_grid_count: 3
+    regime_confidence_relief: 0.04
+    flat_reentry_cooldown_steps: 8
+    flat_patience_steps: 0
+    flat_patience_threshold_relief: 0.0
+    flat_patience_entry_margin_relief: 0.0
+    countertrend_threshold_penalty: 0.03
+    countertrend_entry_penalty: 0.015
+    meta_label_min_edge: 0.0006
+    meta_label_edge_margin: 0.0003
+    meta_label_exit_edge: 0.0001
+    meta_label_min_positive_rate: 0.55
+    meta_label_target_edge_threshold: 0.0006
+    calibration_min_samples: 48
+    calibration_probability_thresholds: [0.40, 0.50, 0.60, 0.70, 0.75, 0.80, 0.82, 0.84, 0.86, 0.88, 0.90]
+    calibration_window_count: 4
+    calibration_window_min_samples: 8
+    calibration_min_active_window_ratio: 0.33
     walkforward_score_weight: 0.20
-    walkforward_min_active_ratio: 0.25
-    walkforward_inactivity_penalty_scale: 1.50
+    walkforward_min_active_ratio: 0.20
+    walkforward_inactivity_penalty_scale: 1.00
     walkforward_worst_net_penalty_scale: 4.0
     walkforward_worst_gross_penalty_scale: 3.0
     walkforward_worst_alpha_penalty_scale: 0.50
-    walkforward_dominance_penalty_scale: 3.0
+    walkforward_dominance_penalty_scale: 2.0
 
   forecast_features:
     crypto_mamba:
@@ -157,15 +181,28 @@ training:
     use_for_model_selection: true
     evaluate_final_test: true
     subprocess_on_windows: true
-    top_supervised_candidates: 2
+    subprocess_timeout_seconds: 240
+    subprocess_test_timeout_seconds: 300
+    backtest_log_level: "ERROR"
+    backtest_bypass_logging: true
+    backtest_state_update_interval_bars: 128
+    subprocess_state_poll_interval_seconds: 4.0
+    cleanup_validation_artifacts: true
+    backtest_publish_event_details: false
+    backtest_publish_warmup_updates: false
+    top_supervised_candidates: 6
+    selection_windows: 3
+    selection_min_window_bars: 256
     collapse_probe_bars: 4096
+    collapse_probe_min_fraction: 0.75
     collapse_probe_min_flat_ratio: 0.995
     collapse_probe_max_trades: 0
+    conservative_fallback_min_score: 0.75
     min_selection_score: 0.0
     venue: "BINANCE"
     bar_minutes: 15
-    history_bars: 160
-    request_history_days: 3
+    history_bars: 384
+    request_history_days: 8
     initial_balance_usdt: 10000.0
     leverage: 1.0
     trade_size_pct_of_equity: 1.0
