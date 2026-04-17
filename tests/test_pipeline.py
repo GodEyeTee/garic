@@ -25,6 +25,7 @@ from pipeline import (
     _score_sparse_supervised_watchlist_candidate,
     _select_nautilus_candidate_subset,
     _score_nautilus_summary,
+    _trim_supervised_candidate_pool,
     add_naive_forecast,
     backtest_with_model,
 )
@@ -1018,6 +1019,60 @@ class TestPipelineHelpers:
         names = [item["candidate_name"] for item in selected]
         assert "low_short_explorer" in names
 
+    def test_select_nautilus_candidate_subset_keeps_best_of_distinct_family(self):
+        candidates = [
+            {
+                "family": "supervised_logreg",
+                "candidate_name": "logreg_top",
+                "model_path": "a.joblib",
+                "supervised_long_confidence_threshold": 0.82,
+                "supervised_short_confidence_threshold": 0.76,
+                "env_validation_score": 1.20,
+                "env_validation_metrics": {
+                    "walkforward_selection_score": 0.90,
+                    "walkforward_active_window_ratio": 0.25,
+                    "gross_total_return": 0.004,
+                    "avg_trades_per_episode": 1.0,
+                    "supervised_validation_brier": 0.62,
+                },
+            },
+            {
+                "family": "supervised_trend_rule",
+                "candidate_name": "trend_family_candidate",
+                "model_path": "b.joblib",
+                "supervised_long_confidence_threshold": 0.78,
+                "supervised_short_confidence_threshold": 0.72,
+                "env_validation_score": 0.95,
+                "env_validation_metrics": {
+                    "walkforward_selection_score": 0.70,
+                    "walkforward_active_window_ratio": 0.50,
+                    "gross_total_return": 0.006,
+                    "avg_trades_per_episode": 2.0,
+                    "supervised_validation_brier": 0.66,
+                },
+            },
+            {
+                "family": "supervised_logreg",
+                "candidate_name": "logreg_second",
+                "model_path": "c.joblib",
+                "supervised_long_confidence_threshold": 0.84,
+                "supervised_short_confidence_threshold": 0.80,
+                "env_validation_score": 1.10,
+                "env_validation_metrics": {
+                    "walkforward_selection_score": 0.85,
+                    "walkforward_active_window_ratio": 0.10,
+                    "gross_total_return": 0.003,
+                    "avg_trades_per_episode": 1.0,
+                    "supervised_validation_brier": 0.60,
+                },
+            },
+        ]
+
+        selected = _select_nautilus_candidate_subset(candidates, limit=2)
+        names = [item["candidate_name"] for item in selected]
+        assert "logreg_top" in names
+        assert "trend_family_candidate" in names
+
     def test_prune_supervised_candidate_pool_preserves_threshold_variants(self):
         candidates = [
             {
@@ -1058,6 +1113,72 @@ class TestPipelineHelpers:
 
         pruned = _prune_supervised_candidate_pool(candidates)
         assert len(pruned) == 2
+
+    def test_trim_supervised_candidate_pool_keeps_distinct_family_when_late_family_scores_lower(self):
+        candidates = []
+        for idx in range(6):
+            candidates.append(
+                {
+                    "name": f"logreg_{idx}",
+                    "meta": {"model_type": "logreg"},
+                    "score": 10.0 - idx,
+                    "priority": 0,
+                    "long_confidence": 0.80,
+                    "short_confidence": 0.72 + idx * 0.01,
+                    "validation_metrics": {
+                        "walkforward_active_window_ratio": 0.5,
+                        "gross_total_return": 0.002,
+                        "supervised_validation_brier": 0.7,
+                    },
+                }
+            )
+        candidates.append(
+            {
+                "name": "trend_best",
+                "meta": {"model_type": "trend_rule"},
+                "score": 1.0,
+                "priority": -1,
+                "long_confidence": 0.82,
+                "short_confidence": 0.74,
+                "validation_metrics": {
+                    "walkforward_active_window_ratio": 1.0,
+                    "gross_total_return": 0.001,
+                    "supervised_validation_brier": 0.8,
+                },
+            }
+        )
+
+        trimmed = _trim_supervised_candidate_pool(candidates, limit=4)
+        families = {item["meta"]["model_type"] for item in trimmed}
+        assert "logreg" in families
+        assert "trend_rule" in families
+
+    def test_score_nautilus_summary_allows_one_of_three_active_windows_when_configured(self):
+        summary = {
+            "n_trades": 3.0,
+            "total_return": 0.002,
+            "gross_total_return": 0.004,
+            "outperformance_vs_bh": 0.001,
+            "win_rate": 0.66,
+            "flat_ratio": 0.97,
+            "eval_dominant_action_ratio": 0.99,
+            "eval_action_entropy": 0.05,
+            "max_drawdown": -0.01,
+            "nautilus_min_total_return": -0.001,
+            "nautilus_min_gross_total_return": 0.0,
+            "nautilus_min_alpha": -0.001,
+            "nautilus_active_window_ratio": 1.0 / 3.0,
+            "trade_density": 0.002,
+            "stats_returns": {"Sharpe Ratio (252 days)": 0.5},
+        }
+
+        score = _score_nautilus_summary(
+            summary,
+            min_trades=1.0,
+            max_dominant_action_ratio=0.995,
+            min_active_window_ratio=1.0 / 3.0,
+        )
+        assert np.isfinite(score)
 
     def test_score_sparse_supervised_watchlist_candidate_accepts_sparse_profitable_model(self):
         score = _score_sparse_supervised_watchlist_candidate(

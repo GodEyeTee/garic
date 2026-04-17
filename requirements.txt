@@ -15,6 +15,7 @@ websocket-client>=1.6
 torch>=2.4
 stable-baselines3>=2.3
 gymnasium>=0.29
+catboost>=1.2.10
 
 # Monitoring
 wandb>=0.16

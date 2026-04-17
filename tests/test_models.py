@@ -1007,6 +1007,122 @@ class TestSupervisedFallback:
         assert loaded.meta_label_min_edge == pytest.approx(0.0)
         assert loaded.meta_label_edge_margin == pytest.approx(0.0)
 
+    def test_catboost_model_round_trip(self, tmp_path):
+        pytest.importorskip("catboost")
+        from models.rl.supervised import SupervisedActionModel, train_supervised_action_model
+
+        n = 320
+        prices = np.concatenate(
+            [
+                np.linspace(100.0, 121.0, 110, dtype=np.float32),
+                np.linspace(121.0, 119.0, 90, dtype=np.float32),
+                np.linspace(119.0, 132.0, 120, dtype=np.float32),
+            ]
+        )
+        horizon = 4
+        future_ret = np.zeros(n, dtype=np.float32)
+        future_ret[:-horizon] = (prices[horizon:] / prices[:-horizon]) - 1.0
+        features = np.column_stack(
+            [
+                future_ret,
+                np.sign(future_ret),
+                np.roll(future_ret, 1),
+                np.roll(future_ret, 4),
+                np.roll(future_ret, 16),
+                np.linspace(-1.0, 1.0, n, dtype=np.float32),
+            ]
+        ).astype(np.float32)
+
+        model, meta = train_supervised_action_model(
+            feature_array=features,
+            prices=prices,
+            train_range=(0, 220),
+            validation_range=(220, 300),
+            model_type="catboost",
+            horizon=horizon,
+            min_return_threshold=0.002,
+            threshold_quantile=0.40,
+            max_train_samples=2000,
+            catboost_iterations=32,
+            catboost_depth=4,
+            catboost_learning_rate=0.1,
+            catboost_l2_leaf_reg=3.0,
+            catboost_border_count=64,
+            catboost_task_type="CPU",
+            min_hold_steps=10,
+            reversal_margin=0.05,
+            entry_margin=0.07,
+            exit_to_flat_margin=0.04,
+        )
+        model.confidence_threshold = 0.30
+        action_before, _ = model.predict(features[240])
+        assert action_before in (0, 1, 2)
+        assert meta["model_type"] == "catboost"
+        assert meta["catboost_task_type"] == "CPU"
+
+        saved_path = model.save(tmp_path / "catboost_model.joblib")
+        loaded = SupervisedActionModel.load(saved_path)
+        action_after, _ = loaded.predict(features[240])
+
+        assert action_before == action_after
+        assert loaded.min_hold_steps == 10
+        assert loaded.metadata["model_type"] == "catboost"
+
+    def test_trend_rule_model_round_trip(self, tmp_path):
+        from models.rl.supervised import SupervisedActionModel, train_supervised_action_model
+
+        n = 320
+        prices = np.concatenate(
+            [
+                np.linspace(100.0, 118.0, 110, dtype=np.float32),
+                np.linspace(118.0, 117.0, 90, dtype=np.float32),
+                np.linspace(117.0, 130.0, 120, dtype=np.float32),
+            ]
+        )
+        horizon = 4
+        future_ret = np.zeros(n, dtype=np.float32)
+        future_ret[:-horizon] = (prices[horizon:] / prices[:-horizon]) - 1.0
+        features = np.column_stack(
+            [
+                future_ret,
+                np.roll(future_ret, 1),
+                np.roll(future_ret, 4),
+                np.roll(future_ret, 16),
+                np.linspace(-0.02, 0.03, n, dtype=np.float32),
+                np.linspace(1.01, 0.99, n, dtype=np.float32),
+                np.linspace(1.02, 0.98, n, dtype=np.float32),
+                np.linspace(-1.0, 1.0, n, dtype=np.float32),
+            ]
+        ).astype(np.float32)
+
+        model, meta = train_supervised_action_model(
+            feature_array=features,
+            prices=prices,
+            train_range=(0, 220),
+            validation_range=(220, 300),
+            model_type="trend_rule",
+            horizon=horizon,
+            min_return_threshold=0.002,
+            threshold_quantile=0.40,
+            max_train_samples=2000,
+            min_hold_steps=10,
+            reversal_margin=0.05,
+            entry_margin=0.07,
+            exit_to_flat_margin=0.04,
+        )
+        model.confidence_threshold = 0.30
+        action_before, _ = model.predict(features[240])
+        assert action_before in (0, 1, 2)
+        assert meta["model_type"] == "trend_rule"
+        assert "trend_rule_entry_threshold" in meta
+
+        saved_path = model.save(tmp_path / "trend_rule_model.joblib")
+        loaded = SupervisedActionModel.load(saved_path)
+        action_after, _ = loaded.predict(features[240])
+
+        assert action_before == action_after
+        assert loaded.min_hold_steps == 10
+
     def test_build_constant_action_model_predicts_flat(self):
         from models.rl.supervised import ACTION_FLAT, build_constant_action_model
 

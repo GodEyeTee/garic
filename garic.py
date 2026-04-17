@@ -219,7 +219,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Config profile for test mode. smoke is the default quick validation profile.",
     )
     test_parser.add_argument("--config", default=None, help="Custom YAML override. Takes precedence over --profile.")
+    test_parser.add_argument("--cli", action="store_true", help="Run pipeline directly without the Streamlit dashboard.")
     test_parser.add_argument("--no-cache", action="store_true", help="Rebuild features instead of using cache.")
+    test_parser.add_argument("--host", default="127.0.0.1", help="Dashboard host in web mode.")
+    test_parser.add_argument("--port", type=int, default=8501, help="Dashboard port in web mode.")
+    test_parser.add_argument("--no-browser", action="store_true", help="Do not auto-open the dashboard URL.")
+    test_parser.add_argument("--no-hold", action="store_true", help="Exit immediately when the web launcher finishes.")
 
     for mode, default_port, help_text in (
         ("backtest", 8502, "Run the Nautilus backtest flow"),

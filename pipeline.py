@@ -1109,6 +1109,34 @@ def _select_nautilus_candidate_subset(
             return None
         return max(pool, key=key_fn)
 
+    def _append_best_by_family() -> None:
+        family_values = []
+        for item in ordered:
+            family = str(item.get("family", ""))
+            if family and family not in family_values:
+                family_values.append(family)
+        for family in family_values:
+            pool = [
+                item
+                for item in ordered
+                if _candidate_id(item) not in seen_ids
+                and str(item.get("family", "")) == family
+            ]
+            if not pool:
+                continue
+            candidate = max(
+                pool,
+                key=lambda item: (
+                    _walkforward_active_ratio(item),
+                    1.0 if _gross_return(item) > 0.0 else 0.0,
+                    float(item.get("env_validation_score", float("-inf"))),
+                    -_avg_trades(item),
+                ),
+            )
+            _append_candidate(candidate)
+            if len(selected) >= limit:
+                return
+
     def _append_best_active_sparse_candidate() -> None:
         pool = [
             item
@@ -1218,6 +1246,7 @@ def _select_nautilus_candidate_subset(
             return
 
     _append_best_active_sparse_candidate()
+    _append_best_by_family()
     _append_next_stricter_short_candidate()
     _append_extreme_by_confidence("supervised_short_confidence_threshold", highest=True)
     _append_extreme_by_confidence("supervised_long_confidence_threshold", highest=True)
@@ -1343,11 +1372,83 @@ def _prune_supervised_candidate_pool(candidate_pool: list[dict]) -> list[dict]:
     )
 
 
+def _trim_supervised_candidate_pool(
+    candidate_pool: list[dict],
+    *,
+    limit: int,
+) -> list[dict]:
+    """Trim the supervised candidate pool while preserving family diversity.
+
+    The candidate search evaluates model families sequentially. If we truncate the
+    pool immediately during search, later families can be starved by earlier
+    families even when they should still get a realistic Nautilus check.
+    """
+    if limit <= 0 or len(candidate_pool) <= limit:
+        return list(candidate_pool)
+
+    def _metric(candidate: dict, key: str, default: float = 0.0) -> float:
+        metrics = candidate.get("validation_metrics")
+        if not isinstance(metrics, dict):
+            return float(default)
+        return float(metrics.get(key, default))
+
+    ordered = sorted(
+        candidate_pool,
+        key=lambda item: (
+            float(item.get("score", float("-inf"))),
+            int(item.get("priority", -999)),
+            _metric(item, "walkforward_active_window_ratio", 0.0),
+            _metric(item, "gross_total_return", float("-inf")),
+            -_metric(item, "supervised_validation_brier", float("inf")),
+        ),
+        reverse=True,
+    )
+
+    selected: list[dict] = []
+    seen_ids: set[str] = set()
+
+    def _candidate_id(candidate: dict) -> str:
+        return "|".join(
+            [
+                str(candidate.get("name", "")),
+                str(candidate.get("meta", {}).get("model_type", "")),
+                f"{float(candidate.get('long_confidence', candidate.get('confidence', 0.0))):.4f}",
+                f"{float(candidate.get('short_confidence', candidate.get('confidence', 0.0))):.4f}",
+            ]
+        )
+
+    def _append(candidate: dict | None) -> None:
+        if candidate is None:
+            return
+        candidate_id = _candidate_id(candidate)
+        if candidate_id in seen_ids:
+            return
+        seen_ids.add(candidate_id)
+        selected.append(candidate)
+
+    family_best: dict[str, dict] = {}
+    for item in ordered:
+        family = str(item.get("meta", {}).get("model_type", "fallback"))
+        family_best.setdefault(family, item)
+    for family in sorted(family_best.keys()):
+        _append(family_best[family])
+        if len(selected) >= limit:
+            return selected[:limit]
+
+    for item in ordered:
+        if len(selected) >= limit:
+            break
+        _append(item)
+
+    return selected[:limit]
+
+
 def _score_nautilus_summary(
     summary: dict,
     *,
     min_trades: float = 1.0,
     max_dominant_action_ratio: float = 0.995,
+    min_active_window_ratio: float = 0.50,
 ) -> float:
     if summary.get("error"):
         return float("-inf")
@@ -1373,11 +1474,12 @@ def _score_nautilus_summary(
         summary,
         min_trades=min_trades,
         max_dominant_action_ratio=max_dominant_action_ratio,
+        min_active_window_ratio=min_active_window_ratio,
     )
 
     if trades < min_trades:
         return float("-inf")
-    if active_window_ratio < 0.5 and not sparse_active_override:
+    if active_window_ratio < float(min_active_window_ratio) and not sparse_active_override:
         return float("-inf")
     if dominant_ratio > max_dominant_action_ratio and trades <= (min_trades + 1.0) and not sparse_active_override:
         return float("-inf")
@@ -1424,6 +1526,7 @@ def _allows_sparse_active_nautilus_override(
     *,
     min_trades: float = 1.0,
     max_dominant_action_ratio: float = 0.995,
+    min_active_window_ratio: float = 1.0 / 3.0,
 ) -> bool:
     trades = float(summary.get("n_trades", 0.0))
     net_return = float(summary.get("total_return", 0.0))
@@ -1437,7 +1540,7 @@ def _allows_sparse_active_nautilus_override(
 
     return bool(
         trades >= max(min_trades + 1.0, 2.0)
-        and active_window_ratio >= (1.0 / 3.0)
+        and active_window_ratio >= min(float(min_active_window_ratio), 1.0 / 3.0)
         and gross_return >= -0.0005
         and worst_gross_return >= -0.0015
         and net_return >= -0.0025
@@ -1833,14 +1936,14 @@ def _run_nautilus_backtest_segment_subprocess(
                 state_event = str(runtime_state.get("recent_events")[-1].get("message", ""))
             raise RuntimeError(
                 f"Nautilus subprocess validation timed out for {label} after {subprocess_timeout_seconds}s "
-                f"(state={state_status} event={state_event!r} log={str(log_path).replace('\\', '/')}) "
+                f"(state={state_status} event={state_event!r} log={str(log_path)}) "
                 f"log_tail={log_tail[-2000:]}"
             )
         if proc.returncode != 0:
             state_status = str(runtime_state.get("status", "UNKNOWN")) if isinstance(runtime_state, dict) else "UNKNOWN"
             raise RuntimeError(
                 f"Nautilus subprocess validation failed for {label}: exit={proc.returncode} state={state_status} "
-                f"log={str(log_path).replace('\\', '/')} log_tail={log_tail[-2000:]}"
+                f"log={str(log_path)} log_tail={log_tail[-2000:]}"
             )
         summary = _load_json_dict(summary_path)
         if summary is None:
@@ -1887,8 +1990,8 @@ def _run_nautilus_backtest_segment_subprocess(
                     state_event = str(runtime_state.get("recent_events")[-1].get("message", ""))
                 raise RuntimeError(
                     f"Nautilus subprocess validation did not produce a usable summary for {label}: "
-                    f"state={state_status} event={state_event!r} summary={str(summary_path).replace('\\', '/')} "
-                    f"log={str(log_path).replace('\\', '/')} log_tail={log_tail[-2000:]}"
+                    f"state={state_status} event={state_event!r} summary={str(summary_path)} "
+                    f"log={str(log_path)} log_tail={log_tail[-2000:]}"
                 )
         if isinstance(runtime_state, dict) and isinstance(runtime_state.get("history"), dict):
             summary["history"] = copy.deepcopy(runtime_state["history"])
@@ -1967,7 +2070,15 @@ def train_rl_agent(
     rl_config = training_config.get("rl", {})
     primary_model = str(training_config.get("primary_model", "hybrid")).strip().lower()
     ppo_enabled = bool(rl_config.get("enabled", True))
-    if primary_model in {"supervised", "supervised_logreg", "logreg", "supervised_only"}:
+    if primary_model in {
+        "supervised",
+        "supervised_logreg",
+        "supervised_catboost",
+        "supervised_gpu",
+        "catboost",
+        "logreg",
+        "supervised_only",
+    }:
         ppo_enabled = False
 
     total_timesteps = rl_config.get("total_timesteps", 10000)
@@ -2080,10 +2191,16 @@ def train_rl_agent(
             "Primary model strategy '%s' -> skipping PPO training and selecting from supervised candidates only.",
             primary_model or "hybrid",
         )
-        logger.warning(
-            "Current training path is CPU-bound (scikit-learn + validation backtests). "
-            "CUDA will stay mostly idle unless RL or CryptoMamba is enabled."
-        )
+        if any(str(model_type).strip().lower() == "catboost" for model_type in supervised_config.get("model_types", [])):
+            logger.warning(
+                "Current training path is validation/backtest bound. CUDA will be used mainly during CatBoost fitting, "
+                "not during the slower walk-forward and Nautilus validation stages."
+            )
+        else:
+            logger.warning(
+                "Current training path is CPU-bound (scikit-learn + validation backtests). "
+                "CUDA will stay mostly idle unless RL, CryptoMamba, or a GPU-capable supervised model is enabled."
+            )
 
     _log_gpu_memory()
 
@@ -2259,6 +2376,16 @@ def train_rl_agent(
                     logistic_c=supervised_config.get("logistic_c", 1.0),
                     logistic_multi_class=supervised_config.get("logistic_multi_class", "ovr"),
                     logistic_target_mode=supervised_config.get("logistic_target_mode", "binary_meta"),
+                    catboost_iterations=supervised_config.get("catboost_iterations", 256),
+                    catboost_depth=supervised_config.get("catboost_depth", 6),
+                    catboost_learning_rate=supervised_config.get("catboost_learning_rate", 0.05),
+                    catboost_l2_leaf_reg=supervised_config.get("catboost_l2_leaf_reg", 3.0),
+                    catboost_border_count=supervised_config.get("catboost_border_count", 128),
+                    catboost_task_type=supervised_config.get(
+                        "catboost_task_type",
+                        "GPU" if str(training_device).strip().lower() == "cuda" else "CPU",
+                    ),
+                    catboost_devices=supervised_config.get("catboost_devices", "0"),
                     extra_trees_n_estimators=supervised_config.get("extra_trees_n_estimators", 160),
                     extra_trees_max_depth=supervised_config.get("extra_trees_max_depth", 12),
                     extra_trees_min_samples_leaf=supervised_config.get("extra_trees_min_samples_leaf", 32),
@@ -2340,6 +2467,18 @@ def train_rl_agent(
                     calibrated_short_confidence_grid,
                     search_long_confidence_grid,
                     search_short_confidence_grid,
+                )
+                search_pair_count = int(len(search_long_confidence_grid) * len(search_short_confidence_grid))
+                projected_seed_eval_passes = int(search_pair_count * supervised_validation_seed_runs)
+                projected_walkforward_passes = int(search_pair_count * selection_windows)
+                logger.info(
+                    "Supervised search workload: model=%s threshold_pairs=%d projected_seed_eval_passes=%d "
+                    "projected_walkforward_passes=%d probe_seed_runs=%d",
+                    model_type,
+                    search_pair_count,
+                    projected_seed_eval_passes,
+                    projected_walkforward_passes,
+                    supervised_validation_probe_seed_runs,
                 )
 
                 for long_confidence in search_long_confidence_grid:
@@ -2659,8 +2798,6 @@ def train_rl_agent(
                                 ),
                                 reverse=True,
                             )
-                            if len(supervised_candidate_pool) > supervised_candidate_pool_size:
-                                supervised_candidate_pool = supervised_candidate_pool[:supervised_candidate_pool_size]
 
             supervised_candidate_eligible = (
                 sup_best_model is not None
@@ -2674,6 +2811,17 @@ def train_rl_agent(
                 logger.info(
                     "Pruned supervised candidate pool by behavior signature: %d -> %d",
                     original_candidate_pool_size,
+                    len(supervised_candidate_pool),
+                )
+            if len(supervised_candidate_pool) > supervised_candidate_pool_size:
+                trimmed_size = len(supervised_candidate_pool)
+                supervised_candidate_pool = _trim_supervised_candidate_pool(
+                    supervised_candidate_pool,
+                    limit=supervised_candidate_pool_size,
+                )
+                logger.info(
+                    "Trimmed supervised candidate pool with family preservation: %d -> %d",
+                    trimmed_size,
                     len(supervised_candidate_pool),
                 )
 
@@ -2876,6 +3024,7 @@ def train_rl_agent(
         else:
             min_trades = float(nautilus_config.get("selection_min_trades", 1.0))
             max_dom = float(nautilus_config.get("selection_max_dominant_action_ratio", 0.995))
+            min_active_window_ratio = float(nautilus_config.get("selection_min_active_window_ratio", 1.0 / 3.0))
             min_nautilus_selection_score = float(nautilus_config.get("min_selection_score", 0.0))
             conservative_fallback_min_score = float(
                 nautilus_config.get("conservative_fallback_min_score", 0.75)
@@ -2957,6 +3106,7 @@ def train_rl_agent(
                                 window_summary,
                                 min_trades=min_trades,
                                 max_dominant_action_ratio=max_dom,
+                                min_active_window_ratio=min_active_window_ratio,
                             )
                         )
                     validation_summary, validation_score = _aggregate_nautilus_window_summaries(
@@ -2970,6 +3120,7 @@ def train_rl_agent(
                         validation_summary,
                         min_trades=min_trades,
                         max_dominant_action_ratio=max_dom,
+                        min_active_window_ratio=min_active_window_ratio,
                     )
                     validation_summary["nautilus_score_final"] = (
                         float(validation_score) if np.isfinite(validation_score) else float("-inf")
@@ -3037,6 +3188,7 @@ def train_rl_agent(
                         rejected_summary,
                         min_trades=min_trades,
                         max_dominant_action_ratio=max_dom,
+                        min_active_window_ratio=min_active_window_ratio,
                     )
                 )
                 if float(best_rejected_score) >= conservative_fallback_min_score or allow_sparse_rejected:
@@ -4509,7 +4661,7 @@ def _print_report(report: dict, start_time: float):
     logger.info("=" * 70)
 
     if n_fail == 0:
-        logger.info("ALL PHASES PASSED โ€” เธฃเธฐเธเธเธเธฃเนเธญเธกเนเธเนเธเธฒเธ")
+        logger.info("ALL PHASES PASSED - System is ready")
         logger.info("Next: python pipeline.py --mode train (full data, cloud GPU)")
     else:
         logger.info(f"{n_fail} PHASES FAILED โ€” เธ•เนเธญเธเนเธเนเนเธเธเนเธญเธ deploy")

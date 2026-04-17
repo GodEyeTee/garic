@@ -8,7 +8,7 @@ GARIC is a Windows-first Binance USDT-M futures research workspace focused on on
 
 The current project direction is **supervised-first**.
 
-- `supervised_logreg` is the primary model family
+- `supervised_catboost` is the primary model family
 - PPO is still in the codebase for research, but it is **disabled by default** in the shipped training profiles
 - `NautilusTrader` is the execution-aligned backtest / paper / live engine
 
@@ -113,7 +113,7 @@ The best execution-aligned baseline currently kept on record is documented in:
 
 At the time of writing, the safer execution-aligned baseline is:
 
-- model family: `supervised_logreg`
+- model family: `supervised_logreg` (historical baseline)
 - net return: about `+0.63%`
 - gross return: about `+1.33%`
 - alpha vs B&H: about `+0.37%`
@@ -169,7 +169,7 @@ Execution commands use [configs/nautilus.yaml](/C:/Users/wanar/OneDrive/เด�
 
 Current shipped defaults are centered on:
 
-- `primary_model: supervised_logreg`
+- `primary_model: supervised_catboost`
 - `training.rl.enabled: false`
 - `training.nautilus_validation.enabled: true`
 - `forecast_features.crypto_mamba.enabled: false`
@@ -199,9 +199,10 @@ That means:
 
 Important runtime note:
 
-- the current default `supervised_logreg + Nautilus validation` path is mostly CPU-bound
-- setting `training.device: "cuda"` does not make scikit-learn logistic regression or Nautilus backtests move to GPU
-- GPU is only meaningfully used when PPO or CryptoMamba is enabled
+- the current default `supervised_catboost + Nautilus validation` path is mixed:
+  - CatBoost fitting uses CUDA when `catboost_task_type: GPU`
+  - walk-forward validation and Nautilus backtests are still mostly CPU-bound
+- setting `training.device: "cuda"` does not make Nautilus backtests move to GPU by itself
 
 ## Main Outputs
 

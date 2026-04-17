@@ -53,7 +53,7 @@ training:
   checkpoint_interval: 300
   device: "cuda"
   seed: 42
-  primary_model: "supervised_logreg"
+  primary_model: "supervised_catboost"
 
   rl:
     enabled: false
@@ -76,7 +76,7 @@ training:
     static_position_episode_penalty: 0.0
     balanced_sampling: true
     regime_label_threshold: 0.02
-    selection_max_dominant_action_ratio: 0.85
+    selection_max_dominant_action_ratio: 0.98
     selection_min_avg_trades_per_episode: 1.5
     selection_min_action_entropy: 0.05
 
@@ -91,14 +91,14 @@ training:
 
   supervised_fallback:
     enabled: true
-    model_types: ["logreg"]
-    candidate_pool_size: 32
+    model_types: ["catboost", "trend_rule"]
+    candidate_pool_size: 48
     recent_train_bars: 48000
     validation_episodes: 10
     validation_seed_runs: 4
     validation_probe_seed_runs: 1
     validation_seed_stride: 500
-    min_selection_score: 0.15
+    min_selection_score: 0.05
     fallback_to_safe_flat: true
     horizon: 64
     min_return_threshold: 0.003
@@ -107,48 +107,55 @@ training:
     logistic_c: 0.35
     logistic_target_mode: "binary_meta"
     logistic_multi_class: "ovr"
+    catboost_iterations: 128
+    catboost_depth: 5
+    catboost_learning_rate: 0.07
+    catboost_l2_leaf_reg: 3.0
+    catboost_border_count: 96
+    catboost_task_type: "GPU"
+    catboost_devices: "0"
     extra_trees_n_estimators: 96
     extra_trees_max_depth: 10
     extra_trees_min_samples_leaf: 24
-    min_hold_steps: 16
+    min_hold_steps: 8
     max_hold_steps: 48
     reversal_margin: 0.07
-    entry_margin: 0.08
-    exit_to_flat_margin: 0.05
+    entry_margin: 0.06
+    exit_to_flat_margin: 0.04
     stop_loss_threshold: -0.010
     drawdown_exit_threshold: 0.035
     trend_alignment_threshold: 0.0012
-    countertrend_margin: 0.07
-    relaxed_max_dominant_action_ratio: 0.99
+    countertrend_margin: 0.06
+    relaxed_max_dominant_action_ratio: 0.998
     relaxed_min_avg_trades_per_episode: 0.5
     relaxed_min_action_entropy: 0.0
-    confidence_grid: [0.78, 0.80, 0.82, 0.84, 0.86]
-    long_confidence_grid: [0.78, 0.80, 0.82, 0.84, 0.86]
-    short_confidence_grid: [0.74, 0.76, 0.78, 0.80, 0.82, 0.84]
-    anchor_long_confidence_grid: [0.80, 0.82, 0.84, 0.86]
-    anchor_short_confidence_grid: [0.76, 0.78, 0.80, 0.82, 0.84]
-    exploration_long_confidence_grid: [0.72, 0.76, 0.80]
-    exploration_short_confidence_grid: [0.70, 0.74, 0.78, 0.80]
+    confidence_grid: [0.35, 0.40, 0.45, 0.50, 0.55]
+    long_confidence_grid: [0.35, 0.40, 0.45, 0.50, 0.55]
+    short_confidence_grid: [0.35, 0.40, 0.45, 0.50, 0.55]
+    anchor_long_confidence_grid: [0.40, 0.50]
+    anchor_short_confidence_grid: [0.40, 0.50]
+    exploration_long_confidence_grid: [0.35]
+    exploration_short_confidence_grid: [0.35]
     preserve_top_confidence_grid_count: 3
     regime_confidence_relief: 0.04
-    flat_reentry_cooldown_steps: 8
+    flat_reentry_cooldown_steps: 4
     flat_patience_steps: 0
     flat_patience_threshold_relief: 0.0
     flat_patience_entry_margin_relief: 0.0
-    countertrend_threshold_penalty: 0.03
-    countertrend_entry_penalty: 0.015
-    meta_label_min_edge: 0.0006
+    countertrend_threshold_penalty: 0.02
+    countertrend_entry_penalty: 0.01
+    meta_label_min_edge: 0.0001
     meta_label_edge_margin: 0.0003
     meta_label_exit_edge: 0.0001
-    meta_label_min_positive_rate: 0.55
-    meta_label_target_edge_threshold: 0.0006
-    calibration_min_samples: 48
-    calibration_probability_thresholds: [0.40, 0.50, 0.60, 0.70, 0.75, 0.80, 0.82, 0.84, 0.86, 0.88, 0.90]
+    meta_label_min_positive_rate: 0.51
+    meta_label_target_edge_threshold: 0.0001
+    calibration_min_samples: 12
+    calibration_probability_thresholds: [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
     calibration_window_count: 4
     calibration_window_min_samples: 8
-    calibration_min_active_window_ratio: 0.33
+    calibration_min_active_window_ratio: 0.25
     walkforward_score_weight: 0.20
-    walkforward_min_active_ratio: 0.20
+    walkforward_min_active_ratio: 0.10
     walkforward_inactivity_penalty_scale: 1.00
     walkforward_worst_net_penalty_scale: 4.0
     walkforward_worst_gross_penalty_scale: 3.0
@@ -190,15 +197,16 @@ training:
     cleanup_validation_artifacts: true
     backtest_publish_event_details: false
     backtest_publish_warmup_updates: false
-    top_supervised_candidates: 6
+    top_supervised_candidates: 8
     selection_windows: 3
     selection_min_window_bars: 256
     collapse_probe_bars: 4096
     collapse_probe_min_fraction: 0.75
     collapse_probe_min_flat_ratio: 0.995
     collapse_probe_max_trades: 0
-    conservative_fallback_min_score: 0.75
+    conservative_fallback_min_score: 0.0
     min_selection_score: 0.0
+    selection_min_active_window_ratio: 0.3333333333
     venue: "BINANCE"
     bar_minutes: 15
     history_bars: 384

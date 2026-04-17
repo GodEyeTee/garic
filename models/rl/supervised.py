@@ -10,10 +10,12 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import joblib
 import numpy as np
+from catboost import CatBoostClassifier
 from sklearn.ensemble import ExtraTreesClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.multiclass import OneVsRestClassifier
@@ -106,6 +108,47 @@ class TrendRuleClassifier:
                 [short_prob / total, flat_prob / total, long_prob / total],
                 dtype=np.float32,
             )
+        return probs
+
+
+class TrendRuleBinaryClassifier:
+    """Binary edge classifier backed by the same trend score heuristic."""
+
+    classes_ = np.array([0, 1], dtype=np.int32)
+
+    def __init__(
+        self,
+        *,
+        feature_dim: int,
+        positive_direction: int,
+        entry_threshold: float = 0.004,
+        neutral_band: float = 0.0015,
+    ):
+        self.feature_dim = int(feature_dim)
+        self.positive_direction = int(positive_direction)
+        self.entry_threshold = max(float(entry_threshold), 1e-6)
+        self.neutral_band = max(float(neutral_band), 1e-6)
+
+    def predict_proba(self, x: np.ndarray) -> np.ndarray:
+        arr = np.asarray(x, dtype=np.float32)
+        if arr.ndim == 1:
+            arr = arr[None, :]
+        probs = np.zeros((arr.shape[0], 2), dtype=np.float32)
+        scale = max(self.entry_threshold * 3.0, self.neutral_band * 2.0, 1e-6)
+        for i, row in enumerate(arr):
+            score = compute_trend_score(row[: self.feature_dim])
+            aligned_score = score if self.positive_direction == ACTION_LONG else -score
+            if aligned_score >= self.entry_threshold:
+                strength = min((aligned_score - self.entry_threshold) / scale, 1.0)
+                positive_prob = 0.56 + 0.32 * strength
+            elif aligned_score <= -self.neutral_band:
+                strength = min((-aligned_score - self.neutral_band) / scale, 1.0)
+                positive_prob = 0.12 - 0.08 * strength
+            else:
+                centered = min(abs(aligned_score) / max(self.neutral_band, 1e-6), 1.0)
+                positive_prob = 0.32 + (0.12 * centered)
+            positive_prob = float(np.clip(positive_prob, 0.02, 0.98))
+            probs[i] = np.array([1.0 - positive_prob, positive_prob], dtype=np.float32)
         return probs
 
 
@@ -825,6 +868,13 @@ def train_supervised_action_model(
     logistic_c: float = 1.0,
     logistic_multi_class: str = "ovr",
     logistic_target_mode: str = "binary_meta",
+    catboost_iterations: int = 256,
+    catboost_depth: int = 6,
+    catboost_learning_rate: float = 0.05,
+    catboost_l2_leaf_reg: float = 3.0,
+    catboost_border_count: int = 128,
+    catboost_task_type: str = "CPU",
+    catboost_devices: str = "0",
     extra_trees_n_estimators: int = 160,
     extra_trees_max_depth: int = 12,
     extra_trees_min_samples_leaf: int = 32,
@@ -891,7 +941,9 @@ def train_supervised_action_model(
     model_type = str(model_type).strip().lower()
     scaler: StandardScaler | None = None
     target_mode = str(logistic_target_mode).strip().lower()
-    if target_mode not in {"binary_meta", "multiclass"}:
+    if model_type == "trend_rule":
+        target_mode = "trend_rule"
+    elif target_mode not in {"binary_meta", "multiclass"}:
         target_mode = "binary_meta"
 
     x_valid = np.asarray(feature_array[valid_idx], dtype=np.float32)
@@ -899,7 +951,13 @@ def train_supervised_action_model(
         scaler = StandardScaler()
         x_train_fit = scaler.fit_transform(x_train)
         x_valid_eval = scaler.transform(x_valid)
+    elif model_type == "catboost":
+        x_train_fit = x_train
+        x_valid_eval = x_valid
     elif model_type == "extratrees":
+        x_train_fit = x_train
+        x_valid_eval = x_valid
+    elif model_type == "trend_rule":
         x_train_fit = x_train
         x_valid_eval = x_valid
     else:
@@ -920,6 +978,30 @@ def train_supervised_action_model(
                     multi_class_mode = "ovr"
                 return OneVsRestClassifier(base) if multi_class_mode == "ovr" else base
             return base
+        if model_type == "catboost":
+            catboost_mode = str(catboost_task_type).strip().upper() or "CPU"
+            params = {
+                "iterations": max(int(catboost_iterations), 32),
+                "depth": max(int(catboost_depth), 2),
+                "learning_rate": float(catboost_learning_rate),
+                "l2_leaf_reg": float(catboost_l2_leaf_reg),
+                "border_count": max(int(catboost_border_count), 32),
+                "random_seed": int(random_state + seed_offset),
+                "verbose": False,
+                "allow_writing_files": False,
+                "thread_count": -1,
+                "auto_class_weights": "Balanced",
+                "task_type": catboost_mode,
+            }
+            if catboost_mode == "GPU":
+                params["devices"] = str(catboost_devices)
+            if target_mode == "multiclass":
+                params["loss_function"] = "MultiClass"
+                params["eval_metric"] = "MultiClass"
+            else:
+                params["loss_function"] = "Logloss"
+                params["eval_metric"] = "Logloss"
+            return CatBoostClassifier(**params)
         return ExtraTreesClassifier(
             n_estimators=max(int(extra_trees_n_estimators), 64),
             max_depth=max(int(extra_trees_max_depth), 2),
@@ -952,7 +1034,28 @@ def train_supervised_action_model(
         edge_threshold=edge_target_threshold,
     )
 
-    if target_mode == "binary_meta":
+    if model_type == "trend_rule":
+        trend_entry_threshold = max(
+            float(adaptive_threshold) * 0.75,
+            float(round_trip_cost) * 1.25,
+            0.0008,
+        )
+        trend_neutral_band = max(float(adaptive_threshold) * 0.35, 0.0004)
+        classifier = BinaryEdgeActionClassifier(
+            long_classifier=TrendRuleBinaryClassifier(
+                feature_dim=feature_dim,
+                positive_direction=ACTION_LONG,
+                entry_threshold=trend_entry_threshold,
+                neutral_band=trend_neutral_band,
+            ),
+            short_classifier=TrendRuleBinaryClassifier(
+                feature_dim=feature_dim,
+                positive_direction=ACTION_SHORT,
+                entry_threshold=trend_entry_threshold,
+                neutral_band=trend_neutral_band,
+            ),
+        )
+    elif target_mode == "binary_meta":
         def _fit_binary_head(targets: np.ndarray, edges: np.ndarray, *, seed_offset: int):
             if np.unique(targets).size < 2:
                 positive_prob = float(np.mean(targets)) if targets.size else 0.0
@@ -963,10 +1066,29 @@ def train_supervised_action_model(
                 0.0,
                 4.0,
             )
+            fit_task_type = (
+                str(catboost_task_type).strip().upper()
+                if model_type == "catboost"
+                else "CPU"
+            )
+            fit_devices = str(catboost_devices) if model_type == "catboost" else "-"
+            fit_start = perf_counter()
             if isinstance(estimator, OneVsRestClassifier):
                 estimator.fit(x_train_fit, targets)
             else:
                 estimator.fit(x_train_fit, targets, sample_weight=binary_weights)
+            fit_seconds = perf_counter() - fit_start
+            logger.info(
+                "Supervised fit head complete: model=%s mode=%s task_type=%s devices=%s "
+                "samples=%d features=%d duration=%.2fs",
+                model_type,
+                str(target_mode),
+                fit_task_type,
+                fit_devices,
+                int(len(targets)),
+                int(x_train_fit.shape[1]) if np.ndim(x_train_fit) == 2 else 0,
+                float(fit_seconds),
+            )
             return estimator
 
         long_classifier = _fit_binary_head(train_long_targets, train_long_edges, seed_offset=11)
@@ -977,10 +1099,29 @@ def train_supervised_action_model(
         )
     else:
         classifier = _make_estimator(seed_offset=0)
+        fit_task_type = (
+            str(catboost_task_type).strip().upper()
+            if model_type == "catboost"
+            else "CPU"
+        )
+        fit_devices = str(catboost_devices) if model_type == "catboost" else "-"
+        fit_start = perf_counter()
         if isinstance(classifier, OneVsRestClassifier):
             classifier.fit(x_train_fit, train_labels)
         else:
             classifier.fit(x_train_fit, train_labels, sample_weight=sample_weights)
+        fit_seconds = perf_counter() - fit_start
+        logger.info(
+            "Supervised fit complete: model=%s mode=%s task_type=%s devices=%s "
+            "samples=%d features=%d duration=%.2fs",
+            model_type,
+            str(target_mode),
+            fit_task_type,
+            fit_devices,
+            int(len(train_labels)),
+            int(x_train_fit.shape[1]) if np.ndim(x_train_fit) == 2 else 0,
+            float(fit_seconds),
+        )
 
     metadata = {
         "horizon": int(horizon),
@@ -1004,6 +1145,13 @@ def train_supervised_action_model(
         "model_type": model_type,
         "logistic_multi_class": str(logistic_multi_class).strip().lower(),
         "logistic_target_mode": str(target_mode),
+        "catboost_iterations": int(max(catboost_iterations, 0)),
+        "catboost_depth": int(max(catboost_depth, 0)),
+        "catboost_learning_rate": float(catboost_learning_rate),
+        "catboost_l2_leaf_reg": float(catboost_l2_leaf_reg),
+        "catboost_border_count": int(max(catboost_border_count, 0)),
+        "catboost_task_type": str(catboost_task_type).strip().upper(),
+        "catboost_devices": str(catboost_devices),
         "binary_target_edge_threshold": float(edge_target_threshold),
         "binary_target_counts": {
             "train_long_positive": int(np.sum(train_long_targets)),
@@ -1028,6 +1176,9 @@ def train_supervised_action_model(
         "countertrend_threshold_penalty": float(max(countertrend_threshold_penalty, 0.0)),
         "countertrend_entry_penalty": float(max(countertrend_entry_penalty, 0.0)),
     }
+    if model_type == "trend_rule":
+        metadata["trend_rule_entry_threshold"] = float(trend_entry_threshold)
+        metadata["trend_rule_neutral_band"] = float(trend_neutral_band)
 
     aligned_valid_proba_raw, aligned_valid_proba = _align_action_probability_views(classifier, x_valid_eval)
     valid_one_hot = np.eye(3, dtype=np.float64)[valid_labels.astype(np.int32)]
