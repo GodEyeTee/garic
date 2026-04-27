@@ -1,17 +1,21 @@
-﻿"""Trading environment for Binance USDT-M futures.
+"""Trading environment for Binance USDT-M futures.
 
 3 actions: Short, Flat, Long
 
-Reward (v2 โ€” simplified for profitability):
-- Net PnL from position (fees + funding included) ร— scale
+Reward (v3 — profitability-driven, no double-penalty):
+- Net PnL from position (fees + funding included) × pnl_reward_scale
 - Continuous opportunity cost when flat (proportional to market move)
-- No double-counting, no alpha benchmark, no server cost in reward
-- Server cost tracked in balance only (sunk cost the agent can't control)
+- Hold bonus for holding a winning position (encourages discipline, not flipping)
+- Progressive drawdown penalty (linear up to 10%, quadratic beyond)
+- Episode-end Sharpe bonus (rewards consistent profitability)
+- Graduated inactive-episode penalty (no trades / mostly flat)
+- turnover_penalty_scale defaults to 0 — fees in cost model already cover this.
 
 OHLCV path: Open -> High/Low (liquidation) -> Close
 """
 
 import logging
+import math
 import numpy as np
 
 from performance import summarize_equity_curve
@@ -37,6 +41,9 @@ STATE_IDX_ROLLING_VOL = 4
 STATE_IDX_TURNOVER = 5
 STATE_IDX_FLAT_STEPS = 6
 STATE_IDX_POS_STEPS = 7
+
+REWARD_CLIP = 10.0          # widened from 5.0 to fit pnl_reward_scale=100-200
+DD_QUADRATIC_KNEE = 0.10    # drawdown above this gets quadratic penalty
 
 
 def build_agent_state(
@@ -85,9 +92,12 @@ class CryptoFuturesEnv(gym.Env):
         periods_per_day: int = 96,
         pnl_reward_scale: float = 100.0,
         drawdown_penalty_scale: float = 2.0,
-        turnover_penalty_scale: float = 0.05,
-        inactive_episode_penalty: float = 0.0,
+        turnover_penalty_scale: float = 0.0,        # LOCKED at 0 — fee model is enough
+        inactive_episode_penalty: float = 0.5,       # default non-zero — push agent to trade
         static_position_episode_penalty: float = 0.0,
+        opp_cost_scale: float = 0.4,                 # opportunity cost when flat
+        hold_bonus_scale: float = 0.5,               # reward for holding winners
+        sharpe_bonus_scale: float = 0.3,             # episode-end Sharpe bonus
         balanced_sampling: bool = False,
         regime_label_threshold: float = 0.02,
         segment_start: int = 0,
@@ -106,12 +116,18 @@ class CryptoFuturesEnv(gym.Env):
         self.maintenance_margin = maintenance_margin
         self.max_episode_steps = max_episode_steps
         self.monthly_server_cost_usd = monthly_server_cost_usd
-        self.periods_per_day = periods_per_day
+        self.periods_per_day = max(int(periods_per_day), 1)
         self.pnl_reward_scale = max(float(pnl_reward_scale), 0.0)
         self.drawdown_penalty_scale = max(float(drawdown_penalty_scale), 0.0)
+        # turnover_penalty_scale is intentionally allowed to be set but defaults to 0.
+        # Fees in cost model already discourage churn; keeping a knob lets configs
+        # opt-in for a small extra penalty if a future experiment needs it.
         self.turnover_penalty_scale = max(float(turnover_penalty_scale), 0.0)
         self.inactive_episode_penalty = max(float(inactive_episode_penalty), 0.0)
         self.static_position_episode_penalty = max(float(static_position_episode_penalty), 0.0)
+        self.opp_cost_scale = max(float(opp_cost_scale), 0.0)
+        self.hold_bonus_scale = max(float(hold_bonus_scale), 0.0)
+        self.sharpe_bonus_scale = max(float(sharpe_bonus_scale), 0.0)
         self.balanced_sampling = bool(balanced_sampling)
         self.regime_label_threshold = max(float(regime_label_threshold), 0.0)
         self.total_len = n
@@ -199,7 +215,7 @@ class CryptoFuturesEnv(gym.Env):
         super().reset(seed=seed)
         self._start = self._sample_start_index()
         self._step = 0
-        self.position = 0.0  # start flat
+        self.position = 0.0
         self.entry_price = 0.0
         self.balance = self.initial_balance
         self.gross_balance = self.initial_balance
@@ -214,13 +230,15 @@ class CryptoFuturesEnv(gym.Env):
         self._pos_steps = 0
         self._flat_steps_total = 0
         self._pos_steps_total = 0
-        self._missed_moves = 0.0  # cumulative missed opportunity
+        self._missed_moves = 0.0
         self._wrong_side_moves = 0.0
         self._server_cost_paid = 0.0
         self._direction_steps = 0
         self._last_turnover = 0.0
         self._peak_balance = self.initial_balance
         self._prev_drawdown = 0.0
+        self._step_returns: list[float] = []
+        self._action_counts = [0, 0, 0]
         return self._obs(), {}
 
     @property
@@ -268,11 +286,38 @@ class CryptoFuturesEnv(gym.Env):
             return 0.0
         return float(np.std(returns))
 
+    def _compute_episode_sharpe(self) -> float:
+        """Annualized Sharpe of per-step net returns. Clipped to keep bonus bounded."""
+        rets = np.asarray(self._step_returns, dtype=np.float64)
+        rets = rets[np.isfinite(rets)]
+        if rets.size < 2:
+            return 0.0
+        std = float(np.std(rets))
+        if std < 1e-10:
+            return 0.0
+        # Daily periods × ~252 trading days for crypto-style annualization
+        annualization = math.sqrt(max(self.periods_per_day * 252, 1))
+        sharpe = float(np.mean(rets) / std * annualization)
+        return float(np.clip(sharpe, -5.0, 5.0))
+
+    def _compute_action_entropy(self) -> float:
+        """Shannon entropy of executed actions, normalized by log(3)."""
+        total = float(sum(self._action_counts))
+        if total <= 0:
+            return 0.0
+        probs = np.asarray(self._action_counts, dtype=np.float64) / total
+        nonzero = probs[probs > 0.0]
+        if nonzero.size == 0:
+            return 0.0
+        return float(-np.sum(nonzero * np.log(nonzero)) / np.log(3.0))
+
     def step(self, action):
         if isinstance(action, np.ndarray):
             a = int(action.item()) if action.ndim == 0 else int(action[0])
         else:
             a = int(action)
+        if 0 <= a <= 2:
+            self._action_counts[a] += 1
 
         idx = self._idx
         old_balance = float(self.balance)
@@ -314,7 +359,8 @@ class CryptoFuturesEnv(gym.Env):
 
         actual_new_pos = 0.0 if liquidated else requested_pos
         turnover = abs(actual_new_pos - old_pos)
-        trading_cost = turnover * self.fee_rate
+        # 3 bps slippage per side + base fee_rate (taker + slippage_bps already bundled)
+        trading_cost = turnover * (self.fee_rate + 0.0003)
         self._last_turnover = float(turnover)
 
         if self._step > 0 and old_pos == 0.0:
@@ -367,16 +413,39 @@ class CryptoFuturesEnv(gym.Env):
         self.balance = max(self.balance, 0.0)
         self.equity_curve.append(self.balance)
         self._peak_balance = max(self._peak_balance, self.balance)
+        self._step_returns.append(float(net_step_return))
 
         drawdown = self._current_drawdown()
         drawdown_increase = max(0.0, drawdown - self._prev_drawdown)
         equity_ret = (self.balance - old_balance) / max(old_balance, 1e-9)
-        reward = (
-            self.pnl_reward_scale * equity_ret
-            - self.drawdown_penalty_scale * drawdown_increase
-            - self.turnover_penalty_scale * turnover
-        )
-        reward = float(np.clip(reward, -5.0, 5.0))
+
+        # ----- Reward components -----
+        # 1) PnL reward (after costs)
+        reward = self.pnl_reward_scale * equity_ret
+
+        # 2) Progressive drawdown penalty: linear up to knee, quadratic above
+        dd_penalty = self.drawdown_penalty_scale * drawdown_increase
+        if drawdown > DD_QUADRATIC_KNEE:
+            excess = drawdown - DD_QUADRATIC_KNEE
+            dd_penalty += self.drawdown_penalty_scale * 5.0 * excess * excess
+        reward -= dd_penalty
+
+        # 3) Opportunity cost while flat — agent shouldn't sit out big moves
+        if self._step > 0 and old_pos == 0.0 and abs_move > 0.0:
+            opp_penalty = abs_move * self.opp_cost_scale * self.pnl_reward_scale
+            if abs_move < 0.001:
+                opp_penalty *= 0.3       # damp tiny noise moves
+            reward -= opp_penalty
+
+        # 4) Hold bonus — small reward for being on the right side
+        if old_pos != 0.0 and gross_pnl > 0.0 and self.hold_bonus_scale > 0.0:
+            reward += min(gross_pnl, 0.01) * self.hold_bonus_scale * self.pnl_reward_scale
+
+        # 5) Optional turnover penalty (default 0; fee model is the primary brake)
+        if self.turnover_penalty_scale > 0.0:
+            reward -= self.turnover_penalty_scale * turnover
+
+        reward = float(np.clip(reward, -REWARD_CLIP, REWARD_CLIP))
         self._prev_drawdown = drawdown
 
         self.position = actual_new_pos
@@ -398,7 +467,7 @@ class CryptoFuturesEnv(gym.Env):
         done = self._step >= self.max_episode_steps or self._idx >= self.segment_end - 1
         trunc = self.balance <= 0.0
         if trunc:
-            reward = -5.0
+            reward = -REWARD_CLIP
 
         if (done or trunc) and self.position != 0.0:
             trade_ret = self.position * (close_p / self.entry_price - 1.0) * self.leverage - self.fee_rate
@@ -409,12 +478,28 @@ class CryptoFuturesEnv(gym.Env):
 
         if done or trunc:
             total_steps = max(self._flat_steps_total + self._pos_steps_total, 1)
+            flat_ratio = self._flat_steps_total / total_steps
             position_ratio = self._pos_steps_total / total_steps
-            if self._trades == 0 and self.inactive_episode_penalty > 0:
-                reward -= self.inactive_episode_penalty
-            elif self._trades <= 1 and position_ratio >= 0.98 and self.static_position_episode_penalty > 0:
+
+            # Episode-end Sharpe bonus — rewards consistent profitability
+            if self.sharpe_bonus_scale > 0.0:
+                reward += self._compute_episode_sharpe() * self.sharpe_bonus_scale
+
+            # Graduated inactive penalty
+            if self.inactive_episode_penalty > 0.0:
+                if self._trades == 0:
+                    reward -= self.inactive_episode_penalty * 2.0
+                elif flat_ratio > 0.95:
+                    reward -= self.inactive_episode_penalty * (flat_ratio - 0.95) * 10.0
+
+            if (
+                self._trades <= 1
+                and position_ratio >= 0.98
+                and self.static_position_episode_penalty > 0.0
+            ):
                 reward -= self.static_position_episode_penalty
-            reward = float(np.clip(reward, -5.0, 5.0))
+
+            reward = float(np.clip(reward, -REWARD_CLIP, REWARD_CLIP))
 
         obs = self._obs() if not (done or trunc) else np.zeros(self.observation_space.shape, dtype=np.float32)
 
@@ -456,4 +541,6 @@ class CryptoFuturesEnv(gym.Env):
             "missed_moves": float(self._missed_moves),
             "wrong_side_moves": float(self._wrong_side_moves),
             "server_cost_paid": float(self._server_cost_paid),
+            "episode_sharpe": self._compute_episode_sharpe(),
+            "eval_action_entropy": self._compute_action_entropy(),
         }

@@ -68,6 +68,7 @@ class RLTrainer:
         self.selection_max_dominant_action_ratio = float(selection_max_dominant_action_ratio)
         self.selection_min_avg_trades_per_episode = float(selection_min_avg_trades_per_episode)
         self.selection_min_action_entropy = float(selection_min_action_entropy)
+        self._dashboard = None
 
     def _normalize_range(self, segment_range: tuple[int, int] | None) -> tuple[int, int]:
         if self.total_len <= 0:
@@ -554,35 +555,39 @@ class RLTrainer:
         if net_return < -0.10:
             return float("-inf")
 
+        # Sharpe-priority scoring (v2):
+        # Primary objective is risk-adjusted return + alpha vs buy&hold,
+        # NOT raw net return. A model that wins 40% with 3:1 profit:loss
+        # is preferred over one that wins 70% with 1:1.
         collapse_penalty = max(dominant_action_ratio - 0.75, 0.0) * 2.0
-        collapse_penalty += max(flat_ratio - 0.90, 0.0) * 1.5
+        collapse_penalty += max(flat_ratio - 0.90, 0.0) * 3.0   # raised, but only above 90% flat
 
         trade_bonus = min(avg_trades, 8.0) * 0.015
         turnover_penalty = max(avg_trades - 10.0, 0.0) * 0.020
         turnover_penalty += max(avg_trades - 20.0, 0.0) * 0.030
-        loss_penalty = max(-net_return, 0.0) * 8.0
-        profit_bonus = max(net_return, 0.0) * 12.0
-        gross_bonus = max(gross_return, 0.0) * 8.0
+        loss_penalty = max(-net_return, 0.0) * 6.0              # 8 → 6, sharpe carries more weight
+        profit_bonus = max(net_return, 0.0) * 6.0               # 12 → 6, sharpe is primary
+        gross_bonus = max(gross_return, 0.0) * 4.0              # 8 → 4
         wrong_side_penalty = wrong_side_moves * 0.05
         return (
-            sharpe * 3.0
-            + alpha * 1.5
-            + net_return * 6.0
-            + gross_return * 4.0
-            + worst_net_return * 4.0
-            + worst_gross_return * 3.0
-            + worst_alpha * 0.75
+            sharpe * 4.0                       # 3.0 → 4.0  (PRIMARY: risk-adjusted return)
+            + alpha * 3.0                      # 1.5 → 3.0  (PRIMARY: must beat passive)
+            + net_return * 2.0                 # 6.0 → 2.0  (secondary)
+            + gross_return * 1.5               # 4.0 → 1.5
+            + worst_net_return * 2.0           # 4.0 → 2.0
+            + worst_gross_return * 1.5         # 3.0 → 1.5
+            + worst_alpha * 1.5                # 0.75 → 1.5
             + profit_bonus
             + gross_bonus
-            - max_drawdown * 4.0
+            - max_drawdown * 5.0               # 4.0 → 5.0  (survival first)
             + action_entropy * 0.15
             + trade_bonus
             - collapse_penalty
             - turnover_penalty
             - loss_penalty
             - wrong_side_penalty
-            - walkforward_net_std * 2.0
-            - walkforward_gross_std * 1.5
+            - walkforward_net_std * 1.5        # 2.0 → 1.5
+            - walkforward_gross_std * 1.0      # 1.5 → 1.0
         )
 
     def _selection_score(self, metrics: dict) -> float:
@@ -608,6 +613,8 @@ class RLTrainer:
         active_range = self._normalize_range(segment_range or self.test_range)
 
         for ep in range(n_episodes):
+            if self._dashboard:
+                self._dashboard.update(status_msg=f"Validating Candidate (Episode {ep+1}/{n_episodes})...")
             env = self.create_env(segment_range=active_range, balanced_sampling=False)
             seed = None if seed_base is None else int(seed_base) + ep
             m, action_counts, reward_sum = self._run_eval_episode(model, env, seed=seed)
@@ -852,7 +859,11 @@ class RLTrainer:
             n_windows=n_windows,
             min_window_size=min_window_size,
         )
-        metrics_list = [self._eval_full_segment(model, segment_range=window, log_episode=False) for window in windows]
+        metrics_list = []
+        for i, window in enumerate(windows):
+            if self._dashboard:
+                self._dashboard.update(status_msg=f"Walk-forward Validation ({i+1}/{len(windows)})...")
+            metrics_list.append(self._eval_full_segment(model, segment_range=window, log_episode=False))
         if len(metrics_list) == 1:
             metrics = dict(metrics_list[0])
             active = bool(

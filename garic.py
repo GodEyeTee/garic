@@ -182,6 +182,25 @@ def build_nautilus_command(
     return command, config_path
 
 
+def build_download_command(args: argparse.Namespace, python_exe: Path | str) -> tuple[list[str], str]:
+    command = [
+        str(python_exe),
+        "-m",
+        "data.downloaders.binance_historical",
+        "--pairs",
+        *args.pairs,
+        "--interval",
+        args.interval,
+        "--start",
+        args.start,
+    ]
+    if args.end:
+        command.extend(["--end", args.end])
+    if getattr(args, "clear", False):
+        command.append("--clear")
+    return command, "none"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Unified GARIC launcher. Prefer this over calling individual helper scripts directly.",
@@ -226,6 +245,17 @@ def build_parser() -> argparse.ArgumentParser:
     test_parser.add_argument("--no-browser", action="store_true", help="Do not auto-open the dashboard URL.")
     test_parser.add_argument("--no-hold", action="store_true", help="Exit immediately when the web launcher finishes.")
 
+    download_parser = subparsers.add_parser(
+        "download",
+        help="Download historical data from Binance",
+        description="Download OHLCV data from Binance Data Vision without API keys.",
+    )
+    download_parser.add_argument("--pairs", nargs="+", default=["BTCUSDT", "ETHUSDT"], help="Trading pairs to download.")
+    download_parser.add_argument("--interval", default="1m", help="Candle interval (default 1m).")
+    download_parser.add_argument("--start", default="2020-01-01", help="Start date (YYYY-MM-DD).")
+    download_parser.add_argument("--end", default=None, help="End date (YYYY-MM-DD).")
+    download_parser.add_argument("--clear", action="store_true", help="Clear old data for the pairs before downloading.")
+
     for mode, default_port, help_text in (
         ("backtest", 8502, "Run the Nautilus backtest flow"),
         ("paper", 8502, "Run the Nautilus paper-trading flow"),
@@ -260,6 +290,9 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "test":
         required = ["yaml", "numpy", "pandas", "stable_baselines3"]
         python_exe = pick_python_executable(required)
+    elif args.command == "download":
+        required = ["requests", "pandas"]
+        python_exe = pick_python_executable(required)
     else:
         required = ["yaml", "nautilus_trader"]
         if not args.cli:
@@ -278,6 +311,8 @@ def main(argv: list[str] | None = None) -> int:
         command, config_path = build_train_command(args, python_exe)
     elif args.command == "test":
         command, config_path = build_test_command(args, python_exe)
+    elif args.command == "download":
+        command, config_path = build_download_command(args, python_exe)
     else:
         command, config_path = build_nautilus_command(args.command, args, python_exe)
 

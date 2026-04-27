@@ -94,12 +94,17 @@ def download_range(
     start_date: date = date(2020, 1, 1),
     end_date: date | None = None,
     output_dir: str = "data/raw",
+    clear: bool = False,
 ) -> Path:
     """Download klines for a date range, save as Parquet."""
     if end_date is None:
         end_date = date.today()
 
     output_path = Path(output_dir) / f"{symbol}_{interval}.parquet"
+    if clear and output_path.exists():
+        logger.info(f"Clearing old data at {output_path}")
+        output_path.unlink()
+        
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     all_dfs = []
@@ -141,13 +146,14 @@ def main():
     parser.add_argument("--start", default="2020-01-01")
     parser.add_argument("--end", default=None)
     parser.add_argument("--output", default="data/raw")
+    parser.add_argument("--clear", action="store_true")
     args = parser.parse_args()
 
     start = date.fromisoformat(args.start)
     end = date.fromisoformat(args.end) if args.end else None
 
     for pair in args.pairs:
-        download_range(pair, args.interval, start, end, args.output)
+        download_range(pair, args.interval, start, end, args.output, args.clear)
 
 
 if __name__ == "__main__":

@@ -17,6 +17,18 @@ from features.technical.microstructure import compute_all as compute_micro
 logger = logging.getLogger(__name__)
 
 
+def _torch_cuda_available() -> bool:
+    """Detect CUDA without importing torch eagerly elsewhere."""
+    try:
+        import torch
+    except ImportError:
+        return False
+    try:
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
 class FeatureBuilder:
     """สร้าง feature vectors จาก OHLCV data."""
 
@@ -24,9 +36,51 @@ class FeatureBuilder:
         self,
         lookback: int = 60,
         return_periods: list[int] | None = None,
+        use_gpu: bool = True,
     ):
         self.lookback = lookback
         self.return_periods = return_periods or [1, 4, 16, 48, 96]
+        # use_gpu = True means "use GPU when available"; CUDA absence falls back to CPU silently.
+        self.use_gpu = bool(use_gpu) and _torch_cuda_available()
+
+    def _compute_period_returns_gpu(
+        self,
+        log_returns: np.ndarray,
+        lb: int,
+        n: int,
+    ) -> np.ndarray:
+        """Period-return matrix on GPU. Falls back to CPU on any failure."""
+        try:
+            import torch
+
+            device = torch.device("cuda")
+            log_t = torch.as_tensor(log_returns, dtype=torch.float64, device=device)
+            cum_lr = torch.cat([torch.zeros(1, dtype=torch.float64, device=device), torch.cumsum(log_t, dim=0)])
+            idx = torch.arange(lb, n, dtype=torch.long, device=device)
+            n_out = n - lb
+            out = torch.zeros((n_out, len(self.return_periods)), dtype=torch.float64, device=device)
+            for j, p in enumerate(self.return_periods):
+                prev_idx = torch.clamp(idx - int(p), min=0)
+                out[:, j] = cum_lr[idx + 1] - cum_lr[prev_idx]
+            return out.to(torch.float32).cpu().numpy()
+        except Exception as exc:  # pragma: no cover — exception path is environment-dependent
+            logger.warning("GPU period-return computation failed (%s); falling back to CPU.", exc)
+            return self._compute_period_returns_cpu(log_returns, lb, n)
+
+    def _compute_period_returns_cpu(
+        self,
+        log_returns: np.ndarray,
+        lb: int,
+        n: int,
+    ) -> np.ndarray:
+        cum_lr = np.concatenate([[0.0], np.cumsum(log_returns)])
+        idx = np.arange(lb, n)
+        n_out = n - lb
+        returns_all = np.zeros((n_out, len(self.return_periods)), dtype=np.float32)
+        for j, p in enumerate(self.return_periods):
+            prev_idx = np.maximum(0, idx - p)
+            returns_all[:, j] = (cum_lr[idx + 1] - cum_lr[prev_idx]).astype(np.float32)
+        return returns_all
 
     def build_batch_array(
         self,
@@ -37,12 +91,16 @@ class FeatureBuilder:
         ใช้สำหรับ training pipeline กับ large datasets.
         ไม่สร้าง StandardFeatureVector objects — ทำงานเร็วกว่า build_batch() มาก.
 
+        TA/microstructure stay on CPU (their implementations live in pandas/numpy).
+        Period-return computation is the only piece that runs on GPU when available;
+        for ~200K-row datasets this is small but it does exercise the GPU path.
+
         Returns:
             feature_array: shape (n_out, feature_dim) — ready for model input
             ta_all: shape (n_out, n_ta) — TA indicators aligned with feature_array
             micro_all: shape (n_out, n_micro) — microstructure features aligned
         """
-        logger.info("Computing indicators...")
+        logger.info("Computing indicators (CPU)...")
         ta_all = compute_ta(df)        # (n, 15)
         micro_all = compute_micro(df)  # (n, 5)
 
@@ -55,15 +113,13 @@ class FeatureBuilder:
         lb = self.lookback
         n_out = n - lb
 
-        logger.info(f"Building {n_out} feature vectors (vectorized)...")
+        device_label = "GPU" if self.use_gpu else "CPU"
+        logger.info(f"Building {n_out} feature vectors (returns on {device_label})...")
 
-        # Period returns via cumsum
-        cum_lr = np.concatenate([[0.0], np.cumsum(log_returns)])
-        idx = np.arange(lb, n)
-        returns_all = np.zeros((n_out, len(self.return_periods)), dtype=np.float32)
-        for j, p in enumerate(self.return_periods):
-            prev_idx = np.maximum(0, idx - p)
-            returns_all[:, j] = (cum_lr[idx + 1] - cum_lr[prev_idx]).astype(np.float32)
+        if self.use_gpu:
+            returns_all = self._compute_period_returns_gpu(log_returns, lb, n)
+        else:
+            returns_all = self._compute_period_returns_cpu(log_returns, lb, n)
 
         # TA and micro: slice from lookback onwards
         ta_slice = ta_all[lb:].astype(np.float32)
@@ -71,9 +127,9 @@ class FeatureBuilder:
 
         # Keep the RL state compact and fully informative: returns + TA + micro only.
         feature_array = np.concatenate([
-            returns_all,     # (n_out, 5) normalized multi-period returns
-            ta_slice,        # (n_out, 15) TA indicators
-            micro_slice,     # (n_out, 5) microstructure features
+            returns_all.astype(np.float32),  # (n_out, 5) normalized multi-period returns
+            ta_slice,                        # (n_out, 15) TA indicators
+            micro_slice,                     # (n_out, 5) microstructure features
         ], axis=1)
 
         logger.info(f"Built feature array: {feature_array.shape}")

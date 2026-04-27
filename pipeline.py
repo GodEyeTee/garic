@@ -313,13 +313,13 @@ def _combine_supervised_validation_scores(
     penalty += max(-worst_alpha, 0.0) * walkforward_worst_alpha_penalty_scale
     penalty += max(worst_dom_ratio - max_dominant_action_ratio, 0.0) * walkforward_dominance_penalty_scale
 
-    bonus = active_ratio * 0.15
+    bonus = active_ratio * 0.50
     bonus += max(float(walkforward_metrics.get("walkforward_positive_net_ratio", 0.0)) - 0.50, 0.0) * 0.25
     bonus += max(float(walkforward_metrics.get("walkforward_positive_alpha_ratio", 0.0)) - 0.50, 0.0) * 0.15
 
     combined_score = (
         float(episodic_score)
-        + (float(np.clip(walkforward_soft_score, -2.0, 2.0)) * walkforward_score_weight)
+        + (float(np.clip(walkforward_soft_score, -5.0, 5.0)) * walkforward_score_weight)
         + bonus
         - penalty
     )
@@ -407,7 +407,11 @@ def _score_anchor_supervised_probe_candidate(metrics: dict) -> float:
         return float("-inf")
     if net_return < -0.0040 or worst_net_return < -0.0080:
         return float("-inf")
-    if avg_trades > 2.0:
+    # Was: avg_trades > 2.0 → -inf. That cap was too tight: it excluded
+    # legitimately active anchor probes whose Nautilus validation might
+    # still be informative. 8 trades / episode keeps the "conservative
+    # anchor" intent without hard-blocking selective active models.
+    if avg_trades > 8.0:
         return float("-inf")
 
     return float(
@@ -1491,18 +1495,20 @@ def _score_nautilus_summary(
     if net_return < -0.10:
         return float("-inf")
 
-    profit_bonus = max(net_return, 0.0) * 15.0
-    gross_bonus = max(gross_return, 0.0) * 8.0
+    # Sharpe-priority: previously sharpe weight was 0.20 vs net_return*10 → net_return dominated.
+    # Boost sharpe + alpha so we reward consistent risk-adjusted profitability over raw P&L.
+    profit_bonus = max(net_return, 0.0) * 8.0
+    gross_bonus = max(gross_return, 0.0) * 5.0
     turnover_penalty = max(trade_density - 0.02, 0.0) * 8.0
     turnover_penalty += max(trade_density - 0.05, 0.0) * 18.0
     return (
-        net_return * 10.0
-        + gross_return * 6.0
-        + worst_net_return * 6.0
-        + worst_gross_return * 4.0
+        sharpe * 3.0                    # 0.20 → 3.0 (PRIMARY)
+        + alpha * 3.0                   # 1.5 → 3.0  (must beat passive)
         + worst_alpha * 1.5
-        + sharpe * 0.20
-        + alpha * 1.5
+        + net_return * 5.0              # 10 → 5
+        + gross_return * 3.0            # 6 → 3
+        + worst_net_return * 4.0        # 6 → 4
+        + worst_gross_return * 2.5      # 4 → 2.5
         + profit_bonus
         + gross_bonus
         + win_rate * 0.50
@@ -1515,7 +1521,7 @@ def _score_nautilus_summary(
         - max(-worst_net_return, 0.0) * 8.0
         - max(flat_ratio - 0.95, 0.0) * 2.0
         - max(dominant_ratio - 0.85, 0.0) * 1.5
-        - max(max_drawdown - 0.15, 0.0) * 2.5
+        - max(max_drawdown - 0.15, 0.0) * 5.0   # 2.5 → 5.0 (survival first)
         - wrong_side_penalty
         - turnover_penalty
     )
@@ -2191,16 +2197,6 @@ def train_rl_agent(
             "Primary model strategy '%s' -> skipping PPO training and selecting from supervised candidates only.",
             primary_model or "hybrid",
         )
-        if any(str(model_type).strip().lower() == "catboost" for model_type in supervised_config.get("model_types", [])):
-            logger.warning(
-                "Current training path is validation/backtest bound. CUDA will be used mainly during CatBoost fitting, "
-                "not during the slower walk-forward and Nautilus validation stages."
-            )
-        else:
-            logger.warning(
-                "Current training path is CPU-bound (scikit-learn + validation backtests). "
-                "CUDA will stay mostly idle unless RL, CryptoMamba, or a GPU-capable supervised model is enabled."
-            )
 
     _log_gpu_memory()
 
@@ -2212,8 +2208,8 @@ def train_rl_agent(
         try:
             from stable_baselines3 import PPO, SAC
             ModelClass = PPO if algo == "PPO" else SAC
-            ppo_model = ModelClass.load(str(ppo_model_path))
-            logger.info("Loaded trained model for evaluation")
+            ppo_model = ModelClass.load(str(ppo_model_path), device=training_device)
+            logger.info(f"Loaded trained model for evaluation on device: {training_device}")
         except Exception as e:
             logger.warning(f"Could not load model: {e}")
     selected_model = ppo_model
@@ -2419,6 +2415,7 @@ def train_rl_agent(
                     slippage_bps=trading_config.get("slippage_bps", 1.0),
                     leverage=trading_config.get("leverage", 1.0),
                     random_state=training_config.get("seed", 42),
+                    dashboard=dashboard,
                 )
 
                 post_cost_calibration = sup_meta.get("post_cost_calibration", {})
@@ -3010,7 +3007,7 @@ def train_rl_agent(
 
     force_safe_flat_after_nautilus_rejection = False
     nautilus_config = training_config.get("nautilus_validation", {})
-    nautilus_enabled = bool(nautilus_config.get("enabled", False))
+    nautilus_enabled = False  # Completely abandoned Nautilus in favor of custom vectorized execution
     has_non_safe_flat_candidate = any(
         str(candidate.get("family", "")) != "safe_flat"
         for candidate in candidate_records
@@ -3375,14 +3372,11 @@ def backtest_with_model(
     config: dict | None = None,
     data_ranges: dict[str, tuple[int, int]] | None = None,
 ) -> dict:
-    """Run backtest using trained RL model via BacktestRunner.
-
-    *** เนเธเน cost model เน€เธ”เธตเธขเธงเธเธฑเธเธเธฑเธ CryptoFuturesEnv ***
-    *** เนเธเน last 200K steps เธชเธณเธซเธฃเธฑเธ eval (เนเธกเนเธ•เนเธญเธเธฃเธฑเธ 3.2M เธ—เธฑเนเธเธซเธกเธ”) ***
-    """
+    """Run backtest using trained RL model via standardized RLTrainer evaluation."""
+    from models.rl.trainer import RLTrainer
+    
     trading_config = (config or {}).get("trading", {})
     validation_config = (config or {}).get("training", {}).get("validation", {})
-    min_trade = trading_config.get("min_trade_pct", 0.05)
     ranges = data_ranges or (config or {}).get("_data_ranges")
     if ranges is None:
         ranges = _compute_data_ranges(
@@ -3390,115 +3384,55 @@ def backtest_with_model(
             test_ratio=validation_config.get("holdout_test_ratio", 0.20),
             validation_ratio_within_train=validation_config.get("validation_ratio_within_train", 0.10),
         )
-    test_start, test_end = ranges["test"]
-    fa_eval = feature_array[test_start:test_end]
-    pr_eval = prices[test_start:test_end]
+    test_range = ranges["test"]
 
-    n = len(pr_eval)
-    signals = np.zeros(n)
+    if model is None:
+        # For tests or scenarios with no model, return a baseline
+        from models.rl.supervised import build_constant_action_model
+        model = build_constant_action_model(action=1, feature_dim=int(feature_array.shape[1])) # FLAT (Stay in cash/safe)
+        logger.warning("backtest_with_model called with model=None, defaulting to Constant FLAT model.")
 
-    if model is not None:
-        position = 0.0
-        entry_price = 0.0
-        flat_steps = 0
-        pos_steps = 0
-        last_turnover = 0.0
-        initial_balance = 10_000.0
-        balance = initial_balance
-        peak_balance = initial_balance
-        leverage = float(trading_config.get("leverage", 1.0))
-        fee_rate = float(trading_config.get("taker_fee", 0.0005)) + float(trading_config.get("slippage_bps", 1.0)) / 10000.0
-        server_cost_usd_per_step = (
-            float(trading_config.get("monthly_server_cost_usd", 100.0))
-            / max(float(trading_config.get("periods_per_day", 96)) * 30.0, 1.0)
-        )
-        for i in range(n):
-            price_now = pr_eval[i]
-            upnl = 0.0
-            if position != 0 and entry_price > 0:
-                upnl = position * (price_now / entry_price - 1.0) * leverage
-            drawdown = max((peak_balance - balance) / max(peak_balance, 1e-9), 0.0)
-            vol_start = max(0, i - 32)
-            price_window = np.maximum(pr_eval[vol_start:i + 1], 1e-9)
-            rolling_vol = float(np.std(np.diff(np.log(price_window)))) if price_window.size >= 2 else 0.0
-
-            obs = np.concatenate(
-                [
-                    fa_eval[i],
-                    build_agent_state(
-                        position=position,
-                        upnl=upnl,
-                        equity_ratio=(balance / max(initial_balance, 1e-9)) - 1.0,
-                        drawdown=drawdown,
-                        rolling_volatility=rolling_vol,
-                        turnover_last_step=last_turnover,
-                        flat_steps=flat_steps,
-                        pos_steps=pos_steps,
-                    ),
-                ]
-            )
-            action, _ = model.predict(obs, deterministic=True)
-            if isinstance(action, np.ndarray):
-                a = int(action.item()) if action.ndim == 0 else int(action[0])
-            else:
-                a = int(action)
-            old_position = position
-            if a == 0:
-                position = -1.0
-            elif a == 2:
-                position = 1.0
-            else:
-                position = 0.0
-            turnover = abs(position - old_position)
-            last_turnover = float(turnover)
-
-            if i > 0:
-                prev_price = pr_eval[i - 1]
-                price_ret = (price_now / prev_price - 1.0) if prev_price > 0 else 0.0
-                gross_step_return = old_position * price_ret * leverage - turnover * fee_rate
-                server_cost_pct = server_cost_usd_per_step / max(balance, 1.0)
-                balance *= (1.0 + gross_step_return - server_cost_pct)
-                balance = max(balance, 0.0)
-                peak_balance = max(peak_balance, balance)
-
-            prev_position = signals[i - 1] if i > 0 else 0.0
-            if position == 0:
-                entry_price = 0.0
-                flat_steps += 1
-                pos_steps = 0
-            else:
-                if prev_position != position:
-                    entry_price = price_now
-                flat_steps = 0
-                pos_steps += 1
-            signals[i] = position
-    else:
-        signals[:] = 1.0
-
-    bt_config = BacktestConfig(
-        taker_fee=0.0005,
-        slippage_bps=1.0,
-        leverage=trading_config.get("leverage", 1.0),
-        maintenance_margin=trading_config.get("maintenance_margin", 0.005),
-        min_trade_pct=min_trade,
-        monthly_server_cost_usd=trading_config.get("monthly_server_cost_usd", 100.0),
-        periods_per_day=trading_config.get("periods_per_day", 96),
+    trainer = RLTrainer(
+        feature_arrays=feature_array,
+        price_series=prices,
+        train_range=ranges["train"],
+        test_range=test_range,
+        taker_fee=float(trading_config.get("taker_fee", 0.0005)),
+        leverage=float(trading_config.get("leverage", 1.0)),
+        min_trade_pct=float(trading_config.get("min_trade_pct", 0.02)),
+        monthly_server_cost_usd=float(trading_config.get("monthly_server_cost_usd", 100.0)),
+        periods_per_day=int(trading_config.get("periods_per_day", 96)),
     )
-    runner = BacktestRunner(bt_config)
-    result = runner.run(pr_eval, signals)
-    logger.info(
-        "Backtest on held-out test range [%d:%d) -> %d candles",
-        test_start,
-        test_end,
-        n,
-    )
-
+    # Global 'dash' variable from run_training_pipeline
+    try:
+        from monitoring.display import Dashboard
+        # Attempt to find the active dashboard instance if not passed
+        trainer._dashboard = config.get("_dashboard")
+    except:
+        pass
+    
+    metrics = trainer._eval_full_segment(model, segment_range=test_range)
+    
     return {
-        "backtest_metrics": result.metrics,
-        "n_trades": len(result.trades),
-        "test_range": [test_start, test_end],
+        "backtest_metrics": metrics,
+        "n_bars": test_range[1] - test_range[0],
+        "test_range": list(test_range),
     }
 
+
+def backtest_baseline(prices: np.ndarray, ta_slice: np.ndarray) -> dict:
+    """Run naive RSI baseline backtest for comparison."""
+    rsi_values = ta_slice[:, 0]
+    signals = np.where(rsi_values < 30, 0.5, np.where(rsi_values > 70, -0.5, 0.0))
+
+    bt_config = BacktestConfig(maker_fee=0.0002, taker_fee=0.0005, slippage_bps=1.0)
+    runner = BacktestRunner(bt_config)
+    result = runner.run(prices, signals)
+    return result.metrics
+
+# =============================================================================
+# Phase 7: Validation (CPCV, DSR)
+# =============================================================================
 
 def backtest_baseline(prices: np.ndarray, ta_slice: np.ndarray) -> dict:
     """Run naive RSI baseline backtest for comparison."""
@@ -4275,6 +4209,7 @@ def run_training_pipeline(config_path: str | None = None, no_cache: bool = False
 
     dash = Dashboard()
     dash.update(gpu=gpu_name, gpu_vram=gpu_vram, cuda=cuda_ver)
+    config["_dashboard"] = dash
 
     pairs = data_config["pairs"]
     raw_dir = Path(data_config["paths"]["raw"])

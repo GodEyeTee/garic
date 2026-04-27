@@ -722,14 +722,13 @@ class SupervisedActionModel:
                 )
             )
             if pos_steps < float(self.min_hold_steps):
-                strong_reverse = reverse_signal and opposite_prob >= current_prob + reversal_margin + 0.05
+                strong_reverse = reverse_signal and opposite_prob >= current_prob + reversal_margin + 0.15
                 protective_flat = (
-                    upnl <= min(stop_loss_threshold * 0.50, -0.0035)
-                    and flat_prob >= current_prob - 0.01
+                    upnl <= min(stop_loss_threshold * 0.50, -0.0050)
                 )
                 if strong_reverse:
                     return opposite_action, None
-                if protective_flat:
+                elif protective_flat:
                     return ACTION_FLAT, None
                 return current_action, None
             if max_hold_steps > 0 and pos_steps >= max_hold_steps:
@@ -908,7 +907,10 @@ def train_supervised_action_model(
     calibration_window_min_samples: int | None = None,
     calibration_min_active_window_ratio: float = 0.50,
     random_state: int = 42,
+    dashboard=None,
 ) -> tuple[SupervisedActionModel, dict]:
+    if dashboard:
+        dashboard.update(status_msg=f"Training Supervised Model ({model_type})...")
     feature_dim = int(feature_array.shape[1])
     train_idx, _, train_future_returns = _build_action_labels(
         prices, train_range, horizon=horizon, threshold=min_return_threshold,

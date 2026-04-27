@@ -9,7 +9,7 @@ data:
     - BTCUSDT
     - ETHUSDT
   start_date: "2020-01-01"  # Binance Futures bulk data เริ่ม Jan 2020
-  end_date: "2026-03-15"    # อัพเดทเมื่อต้องการข้อมูลใหม่
+  end_date: "2026-04-18"    # อัพเดทเมื่อต้องการข้อมูลใหม่
   base_timeframe: "1m"    # ดาวน์โหลดที่ 1m แล้ว aggregate เป็น timeframe อื่น
   timeframes:
     - "1m"
@@ -58,30 +58,33 @@ training:
   checkpoint_interval: 900          # 15 นาที
   device: "cuda"
   seed: 42
-  primary_model: "supervised_catboost"
+  primary_model: "hybrid"
 
   rl:
-    enabled: false
+    enabled: true
     algo: "PPO"
     total_timesteps: 400000         # More coverage to reduce flat-policy collapse
     learning_rate: 0.0003
-    n_steps: 2000
-    batch_size: 250
-    n_epochs: 15
-    ent_coef: 0.12
+    n_steps: 2048                   # SB3-friendly (2048 / 64 = 32 mini-batches)
+    batch_size: 64                  # smaller batches → more updates per rollout
+    n_epochs: 10                    # 15 → 10 to limit overfitting per rollout
+    ent_coef: 0.08                  # 0.12 → 0.08 (still high, but less collapse-prone)
     eval_every_steps: 50000
     eval_episodes: 8
     collapse_eval_patience: 4
     collapse_min_steps: 150000
-    # Reward v3: equity return after costs + drawdown/turnover penalties
+    # Reward v3.1 — profitability-driven, no double-penalty.
     pnl_reward_scale: 100.0
     drawdown_penalty_scale: 2.0
-    turnover_penalty_scale: 0.05
-    inactive_episode_penalty: 0.0
+    turnover_penalty_scale: 0.0     # LOCKED at 0 — fees in cost model already discourage churn
+    inactive_episode_penalty: 0.5   # 0.0 → 0.5: episode-end penalty for no-trade or >95% flat
     static_position_episode_penalty: 0.0
+    opp_cost_scale: 0.4             # NEW: penalize being flat while market moves
+    hold_bonus_scale: 0.5           # NEW: small reward for holding winners
+    sharpe_bonus_scale: 0.3         # NEW: episode-end Sharpe bonus
     balanced_sampling: true
     regime_label_threshold: 0.02
-    selection_max_dominant_action_ratio: 0.85
+    selection_max_dominant_action_ratio: 0.92   # 0.85 → 0.92, looser (collapse gate handled in trainer)
     selection_min_avg_trades_per_episode: 1.5
     selection_min_action_entropy: 0.05
 
@@ -97,14 +100,14 @@ training:
   supervised_fallback:
     enabled: true
     model_types: ["catboost", "trend_rule"]
-    candidate_pool_size: 48
+    candidate_pool_size: 16
     recent_train_bars: 48000
-    validation_episodes: 10
-    validation_seed_runs: 4
-    validation_probe_seed_runs: 2
-    validation_seed_stride: 500
-    min_selection_score: 0.05
-    fallback_to_safe_flat: true
+    validation_episodes: 4
+    validation_seed_runs: 1
+    validation_probe_seed_runs: 1
+    validation_seed_stride: 1000
+    min_selection_score: -10.0
+    fallback_to_safe_flat: false
     horizon: 64
     min_return_threshold: 0.003
     threshold_quantile: 0.80
@@ -134,13 +137,14 @@ training:
     relaxed_max_dominant_action_ratio: 0.99
     relaxed_min_avg_trades_per_episode: 0.5
     relaxed_min_action_entropy: 0.0
-    confidence_grid: [0.74, 0.76, 0.78, 0.80, 0.82, 0.84]
-    long_confidence_grid: [0.72, 0.74, 0.76, 0.78, 0.80, 0.82, 0.84]
-    short_confidence_grid: [0.68, 0.70, 0.72, 0.74, 0.76, 0.78, 0.80, 0.82, 0.84]
-    anchor_long_confidence_grid: [0.76, 0.78, 0.80, 0.82, 0.84]
-    anchor_short_confidence_grid: [0.74, 0.76, 0.78, 0.80, 0.82, 0.84]
-    exploration_long_confidence_grid: [0.68, 0.70, 0.72, 0.74, 0.76]
-    exploration_short_confidence_grid: [0.66, 0.68, 0.70, 0.72, 0.74, 0.76]
+    # Lower confidence grid — the previous 0.74-0.84 range produced near-zero trades.
+    confidence_grid: [0.60, 0.65, 0.70, 0.75, 0.80]
+    long_confidence_grid: [0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
+    short_confidence_grid: [0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
+    anchor_long_confidence_grid: [0.65, 0.70, 0.75, 0.80]
+    anchor_short_confidence_grid: [0.65, 0.70, 0.75, 0.80]
+    exploration_long_confidence_grid: [0.55, 0.60, 0.65]
+    exploration_short_confidence_grid: [0.55, 0.60, 0.65]
     preserve_top_confidence_grid_count: 3
     regime_confidence_relief: 0.04
     flat_reentry_cooldown_steps: 4
@@ -149,11 +153,11 @@ training:
     flat_patience_entry_margin_relief: 0.0
     countertrend_threshold_penalty: 0.02
     countertrend_entry_penalty: 0.01
-    meta_label_min_edge: 0.0006
-    meta_label_edge_margin: 0.0003
-    meta_label_exit_edge: 0.0001
-    meta_label_min_positive_rate: 0.55
-    meta_label_target_edge_threshold: 0.0006
+    meta_label_min_edge: -0.0001
+    meta_label_edge_margin: 0.0000
+    meta_label_exit_edge: -0.0001
+    meta_label_min_positive_rate: 0.40
+    meta_label_target_edge_threshold: -0.0001
     calibration_min_samples: 96
     calibration_probability_thresholds: [0.40, 0.50, 0.60, 0.70, 0.75, 0.80, 0.82, 0.84, 0.86, 0.88, 0.90]
     calibration_window_count: 4
@@ -161,11 +165,11 @@ training:
     calibration_min_active_window_ratio: 0.25
     walkforward_score_weight: 0.20
     walkforward_min_active_ratio: 0.10
-    walkforward_inactivity_penalty_scale: 1.00
-    walkforward_worst_net_penalty_scale: 4.0
-    walkforward_worst_gross_penalty_scale: 3.0
-    walkforward_worst_alpha_penalty_scale: 0.50
-    walkforward_dominance_penalty_scale: 2.0
+    walkforward_inactivity_penalty_scale: 0.10
+    walkforward_worst_net_penalty_scale: 0.10
+    walkforward_worst_gross_penalty_scale: 0.10
+    walkforward_worst_alpha_penalty_scale: 0.10
+    walkforward_dominance_penalty_scale: 0.10
 
   forecast_features:
     crypto_mamba:
@@ -187,37 +191,3 @@ training:
       predict_batch_size: 1024
       use_amp: true
       save_path: "checkpoints/crypto_mamba_15m.pt"
-
-  nautilus_validation:
-    enabled: true
-    use_for_model_selection: true
-    evaluate_final_test: true
-    subprocess_on_windows: true
-    subprocess_timeout_seconds: 240
-    subprocess_test_timeout_seconds: 600
-    backtest_log_level: "ERROR"
-    backtest_bypass_logging: true
-    backtest_state_update_interval_bars: 256
-    subprocess_state_poll_interval_seconds: 4.0
-    cleanup_validation_artifacts: true
-    backtest_publish_event_details: false
-    backtest_publish_warmup_updates: false
-    top_supervised_candidates: 8
-    selection_windows: 3
-    selection_min_window_bars: 1024
-    collapse_probe_bars: 4096
-    collapse_probe_min_fraction: 0.75
-    collapse_probe_min_flat_ratio: 0.995
-    collapse_probe_max_trades: 0
-    conservative_fallback_min_score: 0.0
-    min_selection_score: 0.0
-    selection_min_active_window_ratio: 0.3333333333
-    venue: "BINANCE"
-    bar_minutes: 15
-    history_bars: 384
-    request_history_days: 8
-    initial_balance_usdt: 10000.0
-    leverage: 1.0
-    trade_size_pct_of_equity: 1.0
-    selection_min_trades: 1.0
-    selection_max_dominant_action_ratio: 0.995
