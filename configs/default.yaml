@@ -110,7 +110,7 @@ training:
     fallback_to_safe_flat: false
     horizon: 64
     min_return_threshold: 0.003
-    threshold_quantile: 0.80
+    threshold_quantile: 0.70                 # was 0.80 — only top-20% signals fired; loosen so the model gets enough Long/Short labels.
     max_train_samples: 120000
     logistic_c: 0.35
     logistic_target_mode: "binary_meta"
@@ -156,7 +156,7 @@ training:
     meta_label_min_edge: -0.0001
     meta_label_edge_margin: 0.0000
     meta_label_exit_edge: -0.0001
-    meta_label_min_positive_rate: 0.40
+    meta_label_min_positive_rate: 0.45         # was 0.40 — let fewer noise signals through.
     meta_label_target_edge_threshold: -0.0001
     calibration_min_samples: 96
     calibration_probability_thresholds: [0.40, 0.50, 0.60, 0.70, 0.75, 0.80, 0.82, 0.84, 0.86, 0.88, 0.90]

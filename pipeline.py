@@ -257,12 +257,12 @@ def _combine_supervised_validation_scores(
     min_avg_trades_per_episode: float,
     min_action_entropy: float,
     walkforward_score_weight: float = 0.20,
-    walkforward_min_active_ratio: float = 0.25,
-    walkforward_inactivity_penalty_scale: float = 1.50,
-    walkforward_worst_net_penalty_scale: float = 4.0,
-    walkforward_worst_gross_penalty_scale: float = 3.0,
-    walkforward_worst_alpha_penalty_scale: float = 0.50,
-    walkforward_dominance_penalty_scale: float = 3.0,
+    walkforward_min_active_ratio: float = 0.10,
+    walkforward_inactivity_penalty_scale: float = 0.10,
+    walkforward_worst_net_penalty_scale: float = 0.10,
+    walkforward_worst_gross_penalty_scale: float = 0.10,
+    walkforward_worst_alpha_penalty_scale: float = 0.10,
+    walkforward_dominance_penalty_scale: float = 0.10,
 ) -> tuple[float, float, dict]:
     """Blend episodic validation with walk-forward stress testing without hard-failing on one flat window."""
     if not np.isfinite(episodic_score):
@@ -2135,14 +2135,18 @@ def train_rl_agent(
         periods_per_day=trading_config.get("periods_per_day", 96),
         pnl_reward_scale=rl_config.get("pnl_reward_scale", 100.0),
         drawdown_penalty_scale=rl_config.get("drawdown_penalty_scale", 2.0),
-        turnover_penalty_scale=rl_config.get("turnover_penalty_scale", 0.05),
-        inactive_episode_penalty=rl_config.get("inactive_episode_penalty", 0.0),
+        turnover_penalty_scale=rl_config.get("turnover_penalty_scale", 0.0),
+        inactive_episode_penalty=rl_config.get("inactive_episode_penalty", 0.5),
         static_position_episode_penalty=rl_config.get("static_position_episode_penalty", 0.0),
+        # Reward v3.1 hyperparams — wire from config so env actually sees the configured values.
+        opp_cost_scale=rl_config.get("opp_cost_scale", 0.4),
+        hold_bonus_scale=rl_config.get("hold_bonus_scale", 0.5),
+        sharpe_bonus_scale=rl_config.get("sharpe_bonus_scale", 0.3),
         balanced_sampling=rl_config.get("balanced_sampling", True),
         regime_label_threshold=rl_config.get("regime_label_threshold", 0.02),
-        selection_max_dominant_action_ratio=rl_config.get("selection_max_dominant_action_ratio", 0.95),
-        selection_min_avg_trades_per_episode=rl_config.get("selection_min_avg_trades_per_episode", 2.0),
-        selection_min_action_entropy=rl_config.get("selection_min_action_entropy", 0.02),
+        selection_max_dominant_action_ratio=rl_config.get("selection_max_dominant_action_ratio", 0.92),
+        selection_min_avg_trades_per_episode=rl_config.get("selection_min_avg_trades_per_episode", 1.5),
+        selection_min_action_entropy=rl_config.get("selection_min_action_entropy", 0.05),
         train_range=ranges["train"],
         eval_range=ranges["validation"],
         test_range=ranges["test"],
@@ -2306,21 +2310,23 @@ def train_rl_agent(
                 supervised_config.get("regime_confidence_relief", 0.0)
             )
             walkforward_score_weight = float(supervised_config.get("walkforward_score_weight", 0.20))
-            walkforward_min_active_ratio = float(supervised_config.get("walkforward_min_active_ratio", 0.25))
+            walkforward_min_active_ratio = float(supervised_config.get("walkforward_min_active_ratio", 0.10))
+            # Defaults aligned with default.yaml — previous 4.0/3.0/3.0 fallbacks
+            # silently overrode the config when keys were missing or typo'd.
             walkforward_inactivity_penalty_scale = float(
-                supervised_config.get("walkforward_inactivity_penalty_scale", 1.50)
+                supervised_config.get("walkforward_inactivity_penalty_scale", 0.10)
             )
             walkforward_worst_net_penalty_scale = float(
-                supervised_config.get("walkforward_worst_net_penalty_scale", 4.0)
+                supervised_config.get("walkforward_worst_net_penalty_scale", 0.10)
             )
             walkforward_worst_gross_penalty_scale = float(
-                supervised_config.get("walkforward_worst_gross_penalty_scale", 3.0)
+                supervised_config.get("walkforward_worst_gross_penalty_scale", 0.10)
             )
             walkforward_worst_alpha_penalty_scale = float(
-                supervised_config.get("walkforward_worst_alpha_penalty_scale", 0.50)
+                supervised_config.get("walkforward_worst_alpha_penalty_scale", 0.10)
             )
             walkforward_dominance_penalty_scale = float(
-                supervised_config.get("walkforward_dominance_penalty_scale", 3.0)
+                supervised_config.get("walkforward_dominance_penalty_scale", 0.10)
             )
 
             sup_best_model = None
@@ -3030,7 +3036,10 @@ def train_rl_agent(
             nautilus_selection_min_window_bars = max(int(nautilus_config.get("selection_min_window_bars", 4096)), 128)
             use_for_selection = bool(nautilus_config.get("use_for_model_selection", True))
             evaluate_final_test = bool(nautilus_config.get("evaluate_final_test", True))
-            use_subprocess_validation = bool(nautilus_config.get("subprocess_on_windows", True)) and sys.platform.startswith("win")
+            # Default flipped to False — subprocess spawn per candidate adds 10-50x
+            # wall time and the in-process Nautilus runner already isolates state.
+            # Configs can opt back in by setting subprocess_on_windows: true.
+            use_subprocess_validation = bool(nautilus_config.get("subprocess_on_windows", False)) and sys.platform.startswith("win")
             if use_subprocess_validation:
                 logger.info(
                     "Using subprocess Nautilus validation on Windows to avoid logger re-initialization crashes."

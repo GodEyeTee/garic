@@ -190,7 +190,7 @@ training:
     enabled: false
     use_for_model_selection: true
     evaluate_final_test: true
-    subprocess_on_windows: true
+    subprocess_on_windows: false   # was true — subprocess spawn per candidate is 10-50x slower
     subprocess_timeout_seconds: 240
     subprocess_test_timeout_seconds: 300
     backtest_log_level: "ERROR"

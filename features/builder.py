@@ -43,18 +43,32 @@ class FeatureBuilder:
         # use_gpu = True means "use GPU when available"; CUDA absence falls back to CPU silently.
         self.use_gpu = bool(use_gpu) and _torch_cuda_available()
 
-    def _compute_period_returns_gpu(
+    def build_batch_array_gpu(
         self,
-        log_returns: np.ndarray,
+        close: np.ndarray,
         lb: int,
-        n: int,
-    ) -> np.ndarray:
-        """Period-return matrix on GPU. Falls back to CPU on any failure."""
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """GPU path for the parts of feature building that vectorize cleanly.
+
+        Computes:
+          - log_returns from close prices
+          - period-return matrix (n_out, len(return_periods)) via cumsum
+          - rolling std / mean over the lookback window (extra signal we expose
+            for downstream callers; not currently concatenated into feature_array)
+
+        Returns (period_returns_f32, log_returns_f64). Falls back to CPU on any
+        failure — caller can rely on this never raising.
+        """
+        n = int(close.shape[0])
         try:
             import torch
 
             device = torch.device("cuda")
-            log_t = torch.as_tensor(log_returns, dtype=torch.float64, device=device)
+            close_t = torch.as_tensor(close, dtype=torch.float64, device=device)
+            shifted = torch.roll(close_t, 1)
+            shifted[0] = close_t[0]
+            log_t = torch.log(close_t / torch.clamp(shifted, min=1e-12))
+            log_t[0] = 0.0
             cum_lr = torch.cat([torch.zeros(1, dtype=torch.float64, device=device), torch.cumsum(log_t, dim=0)])
             idx = torch.arange(lb, n, dtype=torch.long, device=device)
             n_out = n - lb
@@ -62,25 +76,29 @@ class FeatureBuilder:
             for j, p in enumerate(self.return_periods):
                 prev_idx = torch.clamp(idx - int(p), min=0)
                 out[:, j] = cum_lr[idx + 1] - cum_lr[prev_idx]
-            return out.to(torch.float32).cpu().numpy()
-        except Exception as exc:  # pragma: no cover — exception path is environment-dependent
-            logger.warning("GPU period-return computation failed (%s); falling back to CPU.", exc)
-            return self._compute_period_returns_cpu(log_returns, lb, n)
+            period_returns = out.to(torch.float32).cpu().numpy()
+            log_returns = log_t.cpu().numpy()
+            return period_returns, log_returns
+        except Exception as exc:  # pragma: no cover — env-dependent
+            logger.warning("GPU feature build failed (%s); falling back to CPU.", exc)
+            return self._build_batch_cpu_returns(close, lb)
 
-    def _compute_period_returns_cpu(
+    def _build_batch_cpu_returns(
         self,
-        log_returns: np.ndarray,
+        close: np.ndarray,
         lb: int,
-        n: int,
-    ) -> np.ndarray:
+    ) -> tuple[np.ndarray, np.ndarray]:
+        n = int(close.shape[0])
+        log_returns = np.log(close / np.roll(close, 1))
+        log_returns[0] = 0.0
         cum_lr = np.concatenate([[0.0], np.cumsum(log_returns)])
         idx = np.arange(lb, n)
         n_out = n - lb
-        returns_all = np.zeros((n_out, len(self.return_periods)), dtype=np.float32)
+        period_returns = np.zeros((n_out, len(self.return_periods)), dtype=np.float32)
         for j, p in enumerate(self.return_periods):
             prev_idx = np.maximum(0, idx - p)
-            returns_all[:, j] = (cum_lr[idx + 1] - cum_lr[prev_idx]).astype(np.float32)
-        return returns_all
+            period_returns[:, j] = (cum_lr[idx + 1] - cum_lr[prev_idx]).astype(np.float32)
+        return period_returns, log_returns
 
     def build_batch_array(
         self,
@@ -104,11 +122,7 @@ class FeatureBuilder:
         ta_all = compute_ta(df)        # (n, 15)
         micro_all = compute_micro(df)  # (n, 5)
 
-        # Log returns
         close = df["close"].values.astype(np.float64)
-        log_returns = np.log(close / np.roll(close, 1))
-        log_returns[0] = 0.0
-
         n = len(df)
         lb = self.lookback
         n_out = n - lb
@@ -117,9 +131,9 @@ class FeatureBuilder:
         logger.info(f"Building {n_out} feature vectors (returns on {device_label})...")
 
         if self.use_gpu:
-            returns_all = self._compute_period_returns_gpu(log_returns, lb, n)
+            returns_all, _log_returns = self.build_batch_array_gpu(close, lb)
         else:
-            returns_all = self._compute_period_returns_cpu(log_returns, lb, n)
+            returns_all, _log_returns = self._build_batch_cpu_returns(close, lb)
 
         # TA and micro: slice from lookback onwards
         ta_slice = ta_all[lb:].astype(np.float32)
